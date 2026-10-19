@@ -174,15 +174,19 @@ final class AppModel {
         Task { await autoUpdateIfDue() }
     }
 
-    /// Developer switches for unattended testing: `--import-gptk <dmg>` and `--run-setup`.
+    /// Developer switches for unattended testing: `--import-gptk <dmg>`, `--run-setup`, `--install-update`.
     private func runTestSwitches() {
         let args = CommandLine.arguments
         var gptk: URL?
         if let i = args.firstIndex(of: "--import-gptk"), i + 1 < args.count { gptk = URL(fileURLWithPath: args[i + 1]) }
-        guard args.contains("--run-setup") || gptk != nil else { return }
+        guard args.contains("--run-setup") || args.contains("--install-update") || gptk != nil else { return }
         Task {
             if let gptk { await importGPTK(gptk) }
             if args.contains("--run-setup") && !showsLibrary { await runSetup() }
+            if args.contains("--install-update") {
+                await appUpdater.checkAndStage()
+                if case .readyToInstall = appUpdater.status { appUpdater.installAndRelaunch() }
+            }
         }
     }
 
