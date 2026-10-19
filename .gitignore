@@ -1,0 +1,9 @@
+.build/
+dist/
+*.o
+*.elf
+.DS_Store
+.swiftpm/
+# Scripts that change Steam.app stay out of the repo.
+tools/steamplay/enable-steamplay.sh
+tools/steamplay/disable-steamplay.sh
