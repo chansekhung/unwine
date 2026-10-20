@@ -479,7 +479,9 @@ final class AppModel {
     // MARK: GPTK 4
 
     func importGPTK(_ url: URL) async {
-        steps[.gptk] = .running(nil, ["Opening Apple's file…", "Checking Apple's signature…", "Copying D3DMetal…"])
+        // One at a time: a second click while one runs would open Apple's file twice.
+        guard steps[.gptk]?.isRunning != true else { return }
+        steps[.gptk] = .running(nil, ["Opening Apple's file…", "Checking Apple's signature…", "Copying D3DMetal…", "Setting up your games…"])
         do {
             let item = try await D3DMetalStore.importToolkit(from: url, log: log)
             d3dmetal = D3DMetalStore.installed().first ?? item
@@ -488,6 +490,7 @@ final class AppModel {
             }
             writeAllProfiles()
             steps[.gptk] = .done(d3dmetal?.label ?? item.label)
+            if showsLibrary { banner = "\(d3dmetal?.label ?? item.label) is added. DirectX 12 games use it the next time they start." }
         } catch {
             fail(.gptk, error)
         }
@@ -496,6 +499,7 @@ final class AppModel {
     /// Returns true when a toolkit file was found and imported.
     @discardableResult
     func findGPTKInDownloads() async -> Bool {
+        guard steps[.gptk]?.isRunning != true else { return false }
         guard let dmg = D3DMetalStore.findInDownloads().first else {
             steps[.gptk] = .needsUser("No Game Porting Toolkit file in Downloads yet. Get it from Apple first.")
             return false
@@ -749,20 +753,34 @@ final class AppModel {
             setReopenMacSteam(true)
         }
         do {
-            onlineWords = game == nil ? ["Starting Windows Steam…", "The sign-in window opens soon"]
-                                      : ["Starting Windows Steam…", "Starting \(game!.name)…", "VAC checks the game"]
+            let opens = online.signedIn ? "Your Steam library opens soon" : "The sign-in window opens soon"
+            onlineWords = game == nil ? ["Starting Windows Steam…", "Steam checks for its own updates…", "Loading Steam's window…",
+                                         "Windows programs start slowly on a Mac", opens]
+                                      : ["Starting Windows Steam…", "Steam checks for its own updates…", "Starting \(game!.name)…",
+                                         "VAC checks the game", "The game window opens soon"]
             if !steamUp { try OnlineSteam.shareGames(onlineGames(adding: game)) }
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
             if !steamUp { stored.onlineEnvHash = hash; save() }
             onlineStartedAt = Date()
-            // Wait for Windows Steam to show up, so a second click cannot start it twice.
-            for _ in 0..<45 {
-                if await Task.detached(priority: .userInitiated, operation: { OnlineSteam.isRunning }).value { break }
+            // Wait until a window shows. Steam runs through Wine and Rosetta, and its window is a
+            // built-in web browser, so this takes up to a minute or more. The words keep moving all
+            // that time, and a second click cannot start Steam twice.
+            var shown = false, stopped = false
+            for second in 0..<240 {
+                if await Task.detached(priority: .userInitiated, operation: { OnlineSteam.hasWindow }).value { shown = true; break }
+                if second >= 10, !(await Task.detached(priority: .userInitiated, operation: { OnlineSteam.isInUse }).value) { stopped = true; break }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
             let back = willReopenMacSteam ? " Mac Steam comes back by itself." : ""
-            banner = game.map { "Windows Steam is starting \($0.name) online. Quit Windows Steam when you finish.\(back)" }
-                ?? "Windows Steam is opening. Sign in once and tick \u{201C}Remember me\u{201D}."
+            if stopped {
+                banner = "Windows Steam closed while it started. Try again. If it happens again, the log in Settings says why."
+                log.line("online start: Windows Steam quit before it showed a window")
+            } else if !shown {
+                banner = "Windows Steam is still starting. Its window shows soon."
+            } else {
+                banner = game.map { "\($0.name) is starting online in Windows Steam. Quit Windows Steam when you finish.\(back)" }
+                    ?? (online.signedIn ? "Windows Steam is open.\(back)" : "Windows Steam is open. Sign in once and tick \u{201C}Remember me\u{201D}.")
+            }
         } catch {
             banner = "Windows Steam did not start: \(error.localizedDescription)"
             log.line("online start failed: \(error)")

@@ -1,3 +1,4 @@
+import CoreGraphics
 import CryptoKit
 import Darwin
 import Foundation
@@ -45,7 +46,23 @@ enum OnlineSteam {
     /// Reads the process table, so call it off the main thread.
     static var isRunning: Bool {
         guard !isInstalling, isInUse else { return false }
-        return bottleCommandLines().contains(where: isSteamClient)
+        return bottleProcesses().map(\.commandLine).contains(where: isSteamClient)
+    }
+
+    /// True once something of the bottle shows a real window: Steam's sign-in or main window, or a
+    /// game. Steam's window belongs to steamwebhelper, a Wine process of its own, and it shows up to a
+    /// minute after steam.exe starts. Window owners and sizes need no screen-recording permission.
+    static var hasWindow: Bool {
+        let pids = Set(bottleProcesses().map(\.pid))
+        guard !pids.isEmpty else { return false }
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return windows.contains { w in
+            guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
+                  w[kCGWindowLayer as String] as? Int == 0,
+                  let bounds = w[kCGWindowBounds as String] as? [String: Double] else { return false }
+            // Wine also keeps hidden helper windows and a thin menu-bar strip. A real window is bigger.
+            return (bounds["Width"] ?? 0) >= 300 && (bounds["Height"] ?? 0) >= 200
+        }
     }
 
     /// Anything of the bottle is running: Steam, a game, or a helper that is still quitting. Cheap.
@@ -980,24 +997,24 @@ enum OnlineSteam {
         return !rest.split(separator: " ").contains { $0.caseInsensitiveCompare("-shutdown") == .orderedSame }
     }
 
-    /// The command lines of this bottle's processes. Only the Online bottle runs Wine from Unwine's own
+    /// This bottle's processes and their command lines. Only the Online bottle runs Wine from Unwine's own
     /// engines or from its Game Mode app (Steam Play games run from the runner's copy), so a process's
     /// executable says which bottle it belongs to. Wine rewrites a process's arguments to its Windows
     /// command line.
-    private static func bottleCommandLines() -> [String] {
+    private static func bottleProcesses() -> [(pid: pid_t, commandLine: String)] {
         // Wine starts its processes from real paths, so links on the way are resolved first.
         let engines = (try? FileManager.default.contentsOfDirectory(at: Paths.engines, includingPropertiesForKeys: nil)) ?? []
         let homes = ([Paths.engines, appBundle] + engines).flatMap { [$0.path + "/", $0.resolvingSymlinksInPath().path + "/"] }
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
         var path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
-        var out: [String] = []
+        var out: [(pid: pid_t, commandLine: String)] = []
         for pid in pids.prefix(max(0, count)) where pid > 0 {
             // Cheap first look: Wine's processes all run a file named wine.
             let length = Int(proc_pidpath(pid, &path, UInt32(path.count)))
             guard length > 0, String(decoding: path.prefix(length), as: UTF8.self).split(separator: "/").last?.hasPrefix("wine") == true,
                   let info = processArguments(pid), homes.contains(where: info.executable.hasPrefix) else { continue }
-            out.append(info.arguments.filter { !$0.isEmpty }.joined(separator: " "))
+            out.append((pid, info.arguments.filter { !$0.isEmpty }.joined(separator: " ")))
         }
         return out
     }

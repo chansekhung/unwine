@@ -49,13 +49,22 @@ struct SettingsView: View {
                     }
 
                     group("GPTK (Apple D3DMetal)") {
-                        row("Installed", model.d3dmetal?.label ?? "Not added")
+                        row("Installed", addingGPTK ? "Adding…" : model.d3dmetal?.label ?? "Not added")
                         Text("Apple only lets you get GPTK with your own Apple ID. When Apple ships a newer one, download it and add it here.")
                             .font(.system(size: 11)).foregroundStyle(Palette.muted)
                         HStack(spacing: 8) {
                             Button("Get GPTK from Apple") { NSWorkspace.shared.open(D3DMetalStore.appleDownloadPage) }.buttonStyle(QuietButtonStyle())
                             Button("Add from Downloads") { Task { await model.findGPTKInDownloads() } }.buttonStyle(QuietButtonStyle())
+                                .disabled(addingGPTK).help(addingGPTK ? "GPTK is being added. Wait for it to finish." : "Adds the newest GPTK file in your Downloads folder")
                             Button("Choose file…") { pickingGPTK = true }.buttonStyle(QuietButtonStyle())
+                                .disabled(addingGPTK).help(addingGPTK ? "GPTK is being added. Wait for it to finish." : "Pick a GPTK file from anywhere")
+                        }
+                        if case .running(let progress, let words) = model.steps[.gptk] {
+                            HStack(spacing: 10) {
+                                UnwineMark(progress: nil, size: 20)
+                                PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
+                            }
+                            ProgressTrack(progress: progress)
                         }
                         if case .failed(let why) = model.steps[.gptk] { Text(why).font(.system(size: 11)).foregroundStyle(Palette.warn) }
                         if case .needsUser(let why) = model.steps[.gptk] { Text(why).font(.system(size: 11)).foregroundStyle(Palette.warn) }
@@ -156,6 +165,8 @@ struct SettingsView: View {
         }
     }
 
+    private var addingGPTK: Bool { model.steps[.gptk]?.isRunning == true }
+
     private var removeMessage: String {
         let f = { (b: Int64) in ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }
         var text = "Windows Steam and its sign-in go to the Trash. Games in your Mac Steam library stay: Online mode only links to them."
@@ -169,6 +180,7 @@ struct SettingsView: View {
     private var onlineText: String {
         let o = model.online
         if model.onlineStep.isRunning { return "Setting up…" }
+        if let words = model.onlineWords { return words.first ?? "Working…" }
         if o.running { return "Windows Steam is open" }
         if o.inUse { return "Windows programs still running" }
         if o.installed { return o.signedIn ? "Ready, signed in" : "Installed, not signed in" }

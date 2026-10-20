@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="${VERSION:-1.0.1}"
-BUILD="${BUILD:-2}"
+VERSION="${VERSION:-1.0.2}"
+BUILD="${BUILD:-3}"
 APP="dist/Unwine.app"
 
 # The macOS 27 SDK turns SwiftUI's @State into a compiler plugin that the Command Line
