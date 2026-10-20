@@ -22,6 +22,7 @@ struct StoredState: Codable {
     var onlineGameMode = false          // experimental: macOS Game Mode for the games Windows Steam starts
     var onlineHighResolution = false    // CrossOver's High Resolution Mode for the Windows Steam bottle
     var presetChoice: [Int: String] = [:]   // the preset last clicked per game, to break ties
+    var localGames: [LocalGameRecord] = []  // Windows games the user added by their .exe
 
     init() {}
 
@@ -45,6 +46,7 @@ struct StoredState: Codable {
         onlineGameMode = (try? c.decodeIfPresent(Bool.self, forKey: .onlineGameMode)) ?? false
         onlineHighResolution = (try? c.decodeIfPresent(Bool.self, forKey: .onlineHighResolution)) ?? false
         presetChoice = (try? c.decodeIfPresent([Int: String].self, forKey: .presetChoice)) ?? [:]
+        localGames = (try? c.decodeIfPresent([LocalGameRecord].self, forKey: .localGames)) ?? []
     }
 }
 
@@ -159,6 +161,8 @@ final class AppModel {
     var mappings: [Int: String] = [:]
     var gameRunning = false             // any game or helper running through Unwine
     var busyGame: Int?                  // a game whose Steam setting is being changed
+    var localRunning = Set<Int>()       // added games whose bottle is running
+    var localStarting: [Int: String] = [:]  // added games starting now, with the step for the waiting screen
     var banner: String?                 // short notice shown at the top
 
     // Advice and Online mode
@@ -251,13 +255,23 @@ final class AppModel {
         Task { await autoUpdateIfDue() }
     }
 
-    /// Developer switches for unattended testing: `--import-gptk <dmg>`, `--run-setup`, `--install-update`.
+    /// Developer switches for unattended testing: `--import-gptk <dmg>`, `--run-setup`, `--install-update`,
+    /// `--play-exe <path>` (adds that .exe as a game if needed and starts it).
     private func runTestSwitches() {
         let args = CommandLine.arguments
         var gptk: URL?
         if let i = args.firstIndex(of: "--import-gptk"), i + 1 < args.count { gptk = URL(fileURLWithPath: args[i + 1]) }
-        guard args.contains("--run-setup") || args.contains("--install-update") || gptk != nil else { return }
+        var exe: URL?
+        if let i = args.firstIndex(of: "--play-exe"), i + 1 < args.count { exe = URL(fileURLWithPath: args[i + 1]) }
+        guard args.contains("--run-setup") || args.contains("--install-update") || gptk != nil || exe != nil else { return }
         Task {
+            if let exe {
+                if !stored.localGames.contains(where: { $0.exePath == exe.path }) { addLocalGame(exe: exe) }
+                if let record = stored.localGames.first(where: { $0.exePath == exe.path }) {
+                    await analyze(LocalGames.game(from: record))
+                    await playLocal(LocalGames.game(from: record))
+                }
+            }
             if let gptk { await importGPTK(gptk) }
             if args.contains("--run-setup") && !showsLibrary { await runSetup() }
             if args.contains("--install-update") {
@@ -307,7 +321,8 @@ final class AppModel {
         steamPlay = snap.play
         steamVersion = snap.version
         mappings = snap.mappings
-        games = snap.games
+        games = snap.games + stored.localGames.map(LocalGames.game(from:))
+        localRunning = Set(games.filter { $0.localExe != nil && LocalGames.isRunning($0) }.map(\.id))
         gameRunning = snap.runnerInUse
         online = snap.online
         // A closed bottle has no settings left to compare with, so the next start sets them fresh.
@@ -667,6 +682,7 @@ final class AppModel {
     }
 
     func play(_ game: SteamGame) {
+        if game.localExe != nil { Task { await playLocal(game) }; return }
         guard macSteamAllowed() else { return }
         writeProfile(for: game.id)
         MacSteam.play(game.id)
@@ -699,10 +715,110 @@ final class AppModel {
             for marker in ["notproton-build", "notproton-game-drive", "notproton-hidden-controllers"] {
                 try? FileManager.default.removeItem(at: game.compatData.appendingPathComponent(marker))
             }
-            banner = "Windows bottle for \(game.name) moved to the Trash. Steam builds a fresh one on next Play."
+            banner = "Windows bottle for \(game.name) moved to the Trash. \(game.localExe == nil ? "Steam" : "Unwine") builds a fresh one on next Play."
         } catch {
             banner = "Could not move the bottle to the Trash: \(error.localizedDescription)"
         }
+    }
+
+    // MARK: Games added by their .exe
+
+    /// Adds a Windows game or program by its .exe. It shows in the library like a Steam game.
+    func addLocalGame(exe: URL) {
+        if let known = stored.localGames.first(where: { $0.exePath == exe.path }) {
+            banner = "\(known.name) is already in your library."
+            return
+        }
+        let id = max(LocalGames.idBase, (stored.localGames.map(\.id).max() ?? LocalGames.idBase)) + 1
+        let record = LocalGameRecord(id: id, name: LocalGames.suggestedName(for: exe), exePath: exe.path, addedAt: Date())
+        stored.localGames.append(record)
+        save()
+        let game = LocalGames.game(from: record)
+        games.append(game)
+        banner = "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
+        Task { await analyze(game) }
+    }
+
+    /// Takes an added game out of the library. Its files stay where they are; its Windows bottle
+    /// (settings and saves the game kept inside it) goes to the Trash.
+    func removeLocalGame(_ game: SteamGame) {
+        guard game.localExe != nil else { return }
+        guard !localRunning.contains(game.id) else { banner = "\(game.name) is running. Quit it first."; return }
+        stored.localGames.removeAll { $0.id == game.id }
+        stored.games[game.id] = nil
+        stored.analyses[game.id] = nil
+        stored.presetChoice[game.id] = nil
+        save()
+        Profiles.remove(appID: game.id)
+        if FileManager.default.fileExists(atPath: game.compatData.path) {
+            try? FileManager.default.trashItem(at: game.compatData, resultingItemURL: nil)
+        }
+        games.removeAll { $0.id == game.id }
+        banner = "\(game.name) is out of your library. Its files stay in \(game.installDir.path)."
+    }
+
+    func renameLocalGame(_ id: Int, to name: String) {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, let i = stored.localGames.firstIndex(where: { $0.id == id }) else { return }
+        stored.localGames[i].name = clean
+        save()
+        if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
+    }
+
+    private func playLocal(_ game: SteamGame) async {
+        guard let engine else { banner = "Unwine's engine is not set up yet."; return }
+        guard localStarting[game.id] == nil else { return }
+        if localRunning.contains(game.id) { banner = "\(game.name) is already running."; return }
+        localStarting[game.id] = "Getting \(game.name) ready…"
+        defer { localStarting[game.id] = nil }
+        writeProfile(for: game.id)
+        let log = LogFile(LocalGames.logName(game.id))
+        do {
+            try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: game.id), log: log,
+                                       phase: { [weak self] words in self?.localStarting[game.id] = words },
+                                       onExit: { status in log.line("The game's process ended with status \(status)") })
+            // Wait for the game to show a window, so the waiting screen covers the slow part.
+            for _ in 0..<90 {
+                if await Task.detached(operation: { LocalGames.isRunning(game) }).value { localRunning.insert(game.id) }
+                if Self.hasWindow(prefix: LocalGames.prefix(game)) { break }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        } catch {
+            banner = "\(game.name) did not start: \(error.localizedDescription)"
+            log.line("start failed: \(error)")
+        }
+        await refreshSteam()
+    }
+
+    func stopLocal(_ game: SteamGame) async {
+        guard let engine else { return }
+        localStarting[game.id] = "Closing \(game.name)…"
+        defer { localStarting[game.id] = nil }
+        await LocalGames.stop(game, engine: engine, log: LogFile(LocalGames.logName(game.id)))
+        await refreshSteam()
+    }
+
+    /// True once a process of this bottle shows a real window.
+    private static func hasWindow(prefix: URL) -> Bool {
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let path = prefix.path
+        return windows.contains { w in
+            guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, w[kCGWindowLayer as String] as? Int == 0,
+                  let b = w[kCGWindowBounds as String] as? [String: Double], (b["Width"] ?? 0) >= 300, (b["Height"] ?? 0) >= 200
+            else { return false }
+            return processUsesPrefix(pid, path)
+        }
+    }
+
+    /// A Wine process carries its bottle in WINEPREFIX.
+    private static func processUsesPrefix(_ pid: pid_t, _ prefix: String) -> Bool {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return false }
+        var buffer = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 else { return false }
+        // The environment strings end with NUL, so the match cannot run into a longer path.
+        return String(decoding: buffer.prefix(size), as: UTF8.self).contains("WINEPREFIX=" + prefix + "\u{0}")
     }
 
     // MARK: Online mode
@@ -740,7 +856,7 @@ final class AppModel {
     /// games are never shown to it, so it can never "update" them with Windows files.
     private func onlineGames(adding game: SteamGame?) -> [OnlineSteam.SharedGame] {
         var list = windowsGames.filter { g in
-            guard g.isWindowsBuild else { return false }
+            guard g.isWindowsBuild, g.localExe == nil else { return false }
             if case .needsOnlineMode = advice(for: g).online { return true }
             return false
         }
@@ -979,7 +1095,7 @@ final class AppModel {
         guard let folder = stored.stagedEngine,
               let next = EngineStore.installed().first(where: { $0.folder == folder }) else { stored.stagedEngine = nil; return }
         // Online mode's bottle runs on the engine itself, so it must be closed as well.
-        guard !Runner.isInUse(), !OnlineSteam.isInUse else { return }
+        guard !Runner.isInUse(), !OnlineSteam.isInUse, localRunning.isEmpty else { return }
         do {
             RendererPatches.prepare(engine: next, log: log)
             try await Runner.build(engine: next, d3dmetal: d3dmetal, log: log)

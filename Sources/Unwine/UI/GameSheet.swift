@@ -6,6 +6,7 @@ struct GameSheet: View {
     let gameID: Int
     @State private var confirmReset = false
     @State private var confirmOnlineSetup = false
+    @State private var confirmRemove = false
 
     private var game: SteamGame? { model.games.first { $0.id == gameID } }
 
@@ -26,7 +27,9 @@ struct GameSheet: View {
         let analysis = model.analysis(for: game)
         let resolved = model.resolvedRenderer(for: game)
         let advice = model.advice(for: game)
-        let needsOnline: String? = { if case .needsOnlineMode(let ac) = advice.online { return ac }; return nil }()
+        let isLocal = game.localExe != nil
+        // Online mode is Windows Steam: it has nothing to offer a game added by its .exe.
+        let needsOnline: String? = { if !isLocal, case .needsOnlineMode(let ac) = advice.online { return ac }; return nil }()
         // DLSS becomes MetalFX through D3DMetal or DXMT; DXVK and Wine's own layer have no MetalFX.
         let canMetalFX = (analysis.map { $0.api == .dx11 || $0.api == .dx12 } ?? false) && (resolved == .d3dmetal || resolved == .dxmt)
         let canSharpen = model.canSharpen(game)
@@ -53,12 +56,24 @@ struct GameSheet: View {
                             .disabled(playOnlineBlocker(game) != nil)
                             .help(playOnlineBlocker(game) ?? "Starts the game in Windows Steam, so online servers accept it")
                     }
-                    Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
-                        .buttonStyle(PrimaryButtonStyle())
-                        .disabled(game.state != .installed || model.macSteamBlocked)
-                        .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason
-                              : game.state == .installed ? (needsOnline != nil ? "Single player and offline, through Mac Steam" : "Starts in Steam with these settings")
-                              : "Finish the download in Steam first")
+                    if isLocal && model.localRunning.contains(game.id) {
+                        Button { Task { await model.stopLocal(game) } } label: { Label("Quit game", systemImage: "stop.fill") }
+                            .buttonStyle(QuietButtonStyle())
+                            .disabled(model.localStarting[game.id] != nil)
+                            .help("Ends everything running in this game's Windows bottle. Save in the game first.")
+                    } else if isLocal {
+                        Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
+                            .buttonStyle(PrimaryButtonStyle())
+                            .disabled(model.localStarting[game.id] != nil)
+                            .help(model.localStarting[game.id] ?? "Starts the game with these settings, without Steam")
+                    } else {
+                        Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
+                            .buttonStyle(PrimaryButtonStyle())
+                            .disabled(game.state != .installed || model.macSteamBlocked)
+                            .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason
+                                  : game.state == .installed ? (needsOnline != nil ? "Single player and offline, through Mac Steam" : "Starts in Steam with these settings")
+                                  : "Finish the download in Steam first")
+                    }
                 }
                 .padding(18)
             }
@@ -70,6 +85,17 @@ struct GameSheet: View {
                             Button { model.banner = nil } label: { Image(systemName: "xmark") }
                                 .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Hide this message")
                         }
+                    }
+                    if let step = model.localStarting[game.id] {
+                        HStack(spacing: 10) {
+                            UnwineMark(progress: nil, size: 22)
+                            PhaseWords(words: [step, "Windows games start slowly on a Mac", "The game's window opens soon"])
+                                .font(.system(size: 12)).foregroundStyle(Palette.glow)
+                        }
+                    }
+                    if isLocal, let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {
+                        NoticeRow(color: Palette.warn, icon: "questionmark.folder",
+                                  text: "Unwine cannot find \(exe.lastPathComponent) in \(exe.deletingLastPathComponent().path) anymore. Remove the game here, then add it again from where it is now.")
                     }
                     if game.bottleIncomplete {
                         NoticeRow(color: Palette.warn, icon: "wrench.and.screwdriver",
@@ -85,7 +111,7 @@ struct GameSheet: View {
                         NoticeRow(color: Palette.warn, icon: "shield.lefthalf.filled",
                                   text: "Uses \(names.joined(separator: ", ")). Online play with this anti-cheat does not work on any Mac Wine tool, CrossOver too. Offline modes may work.")
                     }
-                    if !usesDecant && (mappedElsewhere || neverRun) {
+                    if !isLocal && !usesDecant && (mappedElsewhere || neverRun) {
                         NoticeRow(color: Palette.warn, icon: "hand.point.right.fill",
                                   text: mappedElsewhere
                                     ? "Steam runs this game with another tool (\(model.mappings[game.id] ?? "")), so these settings do nothing. Switch it to Unwine? Steam restarts for a few seconds."
@@ -193,9 +219,15 @@ struct GameSheet: View {
                             .help("Logs appear after the first Play")
                         }
                         HStack(spacing: 8) {
-                            Button("Show in Steam") { model.showInSteam(game.id) }.buttonStyle(QuietButtonStyle())
-                                .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens this game's page in Mac Steam")
-                            Button("Show game files") { NSWorkspace.shared.activateFileViewerSelecting([game.installDir]) }.buttonStyle(QuietButtonStyle())
+                            if isLocal {
+                                Button("Remove from Unwine…") { confirmRemove = true }.buttonStyle(QuietButtonStyle())
+                                    .disabled(model.localRunning.contains(game.id))
+                                    .help(model.localRunning.contains(game.id) ? "Quit the game first" : "Asks first. The game's own files stay where they are.")
+                            } else {
+                                Button("Show in Steam") { model.showInSteam(game.id) }.buttonStyle(QuietButtonStyle())
+                                    .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens this game's page in Mac Steam")
+                            }
+                            Button("Show game files") { NSWorkspace.shared.activateFileViewerSelecting([game.localExe ?? game.installDir]) }.buttonStyle(QuietButtonStyle())
                             if usesDecant {
                                 Button("Stop using Unwine") { Task { await model.useDecant(false, for: game) } }
                                     .buttonStyle(QuietButtonStyle()).disabled(model.busyGame != nil || model.gameRunning)
@@ -244,7 +276,14 @@ struct GameSheet: View {
         .confirmationDialog("Start this game with a fresh Windows bottle?", isPresented: $confirmReset) {
             Button("Move bottle to Trash", role: .destructive) { model.resetBottle(game) }
         } message: {
-            Text("Your game files and Steam Cloud saves stay. Saves kept only inside the bottle go to the Trash with it.")
+            Text(game.localExe == nil
+                 ? "Your game files and Steam Cloud saves stay. Saves kept only inside the bottle go to the Trash with it."
+                 : "Your game files stay. Settings and saves the game kept inside its bottle go to the Trash with it. Unwine makes a new bottle on the next Play.")
+        }
+        .confirmationDialog("Remove \(game.name) from Unwine?", isPresented: $confirmRemove) {
+            Button("Remove", role: .destructive) { model.removeLocalGame(game); dismiss() }
+        } message: {
+            Text("The game's own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the game kept inside it, goes to the Trash.")
         }
     }
 

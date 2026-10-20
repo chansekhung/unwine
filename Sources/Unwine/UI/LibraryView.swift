@@ -1,9 +1,11 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct LibraryView: View {
     @Environment(AppModel.self) private var model
     @State private var selected: SteamGame?
     @State private var showSettings = false
+    @State private var addingGame = false
 
     private let columns = [GridItem(.adaptive(minimum: 150, maximum: 190), spacing: 18)]
 
@@ -33,6 +35,9 @@ struct LibraryView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView().environment(model)
         }
+        .fileImporter(isPresented: $addingGame, allowedContentTypes: [UTType(filenameExtension: "exe") ?? .data]) { result in
+            if case .success(let url) = result { model.addLocalGame(exe: url) }
+        }
     }
 
     private var topBar: some View {
@@ -45,6 +50,9 @@ struct LibraryView: View {
                 .buttonStyle(QuietButtonStyle())
                 .disabled(model.macSteamBlocked)
                 .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens Mac Steam")
+            Button { addingGame = true } label: { Label("Add game", systemImage: "plus") }
+                .buttonStyle(QuietButtonStyle())
+                .help("Add a Windows game or program by its .exe. It runs without Steam.")
             Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 .buttonStyle(QuietButtonStyle())
                 .help("Settings, updates and GPTK")
@@ -134,6 +142,8 @@ struct LibraryView: View {
                     .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens the store in Mac Steam")
                 Button("Open Steam") { model.openMacSteam() }.buttonStyle(QuietButtonStyle())
                     .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens Mac Steam")
+                Button("Add a game by its .exe") { addingGame = true }.buttonStyle(QuietButtonStyle())
+                    .help("For Windows games from outside Steam. They run without Steam.")
             }
             Spacer()
         }
@@ -193,8 +203,10 @@ struct GameTile: View {
             if hovering {
                 Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(model.macSteamBlocked)
-                    .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Starts in Steam with this game's settings")
+                    .disabled(game.localExe == nil ? model.macSteamBlocked : (model.localStarting[game.id] != nil || model.localRunning.contains(game.id)))
+                    .help(game.localExe == nil
+                          ? (model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Starts in Steam with this game's settings")
+                          : (model.localRunning.contains(game.id) ? "Already running" : model.localStarting[game.id] ?? "Starts the game without Steam"))
                     .padding(12)
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))
             }
@@ -249,7 +261,8 @@ struct GameArt: View {
             image = img
             return
         }
-        for url in SteamLibrary.remoteArt(kind, appID: appID) {
+        // A game added by its .exe has no Steam art: it gets the lettered tile.
+        for url in LocalGames.isLocal(appID) ? [] : SteamLibrary.remoteArt(kind, appID: appID) {
             if let (data, response) = try? await URLSession.shared.data(from: url),
                (response as? HTTPURLResponse)?.statusCode == 200, let img = NSImage(data: data) {
                 image = img

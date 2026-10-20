@@ -16,9 +16,13 @@ struct SteamGame: Identifiable, Hashable, Sendable {
     let lastPlayed: Date?
     /// Steam installed the Windows version (it runs through Steam Play).
     let isWindowsBuild: Bool
+    /// Set for a game the user added by its .exe (it runs without Steam).
+    var localExe: URL? = nil
 
     var compatData: URL { steamapps.appendingPathComponent("compatdata/\(id)", isDirectory: true) }
-    var runLog: URL { compatData.appendingPathComponent("notproton-run.log") }
+    var runLog: URL {
+        localExe == nil ? compatData.appendingPathComponent("notproton-run.log") : Paths.logs.appendingPathComponent(LocalGames.logName(id))
+    }
     var wineLog: URL { SteamPlayPaths.launchers.appendingPathComponent("\(id)/notproton-wine.log") }
 
     /// The game's Windows bottle has no 32-bit half (its first start was cut short, or it was copied
