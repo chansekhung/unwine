@@ -17,7 +17,7 @@ enum Runner {
     static let build = "decant-1"
 
     /// Bump when the wrappers or engine.env change shape, so existing runners get rewritten.
-    static let format = 5      // 5: Vulkan driver is Unwine's fixed copy when ready
+    static let format = 6      // 6: processes a game starts run from its Game Mode bundle too
 
     static var base: URL { SteamPlayPaths.runners.appendingPathComponent("crossover-\(build)", isDirectory: true) }
     static var root: URL { base.appendingPathComponent("CrossOver", isDirectory: true) }
@@ -251,6 +251,16 @@ enum Runner {
             /usr/bin/plutil -replace GCSupportsGameMode -bool YES "$plist" 2>/dev/null
             /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "${here%/Contents/MacOS}" >/dev/null 2>&1
           fi
+        fi
+        # Wine starts each process a game starts (the game behind a launcher, its helpers) from the
+        # runner's loader, outside the game's bundle, so macOS never sees them as the game. When the
+        # game was started from its bundle, WINELOADER still names it: run that bundle's copy.
+        if [ "$here" = "$DECANT_RUNNER/lib/wine/x86_64-unix" ]; then
+          case "${WINELOADER:-}" in
+            */notproton/launchers/*.app/Contents/MacOS/wine)
+              bundled="${WINELOADER%/*}/wine.decant-real"
+              if [ -f "$bundled" ] && [ ! -L "$bundled" ] && [ -x "$bundled" ]; then real="$bundled"; fi ;;
+          esac
         fi
         [ -x "$real" ] || real="$real_src"
         exec "$real" "$@"

@@ -107,6 +107,9 @@ enum Advisor {
             let lower = half.map { ", for example to \($0.w)x\($0.h)" } ?? ""
             tips.append(Tip(kind: .fix, text: "This is a 32-bit game, so it has less memory to work with. If it crashes at full Retina size or on big maps, lower the in-game resolution\(lower)."))
         }
+        if is32Bit, api == .dx10 || api == .dx11, renderer == .dxmt {
+            tips.append(Tip(kind: .fix, text: "If this 32-bit game freezes for a second or more at a time while the Metal HUD still shows a frame rate, pick DXVK as the graphics layer. It looks a little softer, but it does not freeze."))
+        }
         let withCap = battery.fpsCap.map { " with a \($0) fps cap" } ?? ""
         let sharpen = renderer == .dxmt && (api == .dx10 || api == .dx11) ? " MetalFX sharpening, in Apple extras, keeps it sharp." : ""
         if let half {

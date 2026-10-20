@@ -178,6 +178,7 @@ final class AppModel {
     private var onlineStartedAt = Date.distantPast
     private var onlineGoneTicks = 0
     private var tickCount = 0
+    private var fontsChecked = Set<String>()    // bottles already given the font stand-ins this run
     private var lastHighballCheck = Date()
     private var runnerNeedsRefresh = false  // the runner is from an older Unwine and was in use at launch
 
@@ -300,6 +301,7 @@ final class AppModel {
                 runnerNeedsRefresh = (try? Runner.refresh(engine: engine, d3dmetal: d3dmetal)) == nil
             }
             flushProfiles()
+            addBottleFonts()
             // Windows Steam runs on the engine too, so an engine switch waits for it as well.
             if stored.stagedEngine != nil, !isCheckingUpdates, !online.inUse, !onlineStep.isRunning { await activateStagedEngine() }
         }
@@ -992,6 +994,18 @@ final class AppModel {
         if !online.running, stored.onlineReopenMacSteam {
             setReopenMacSteam(false)
             if !MacSteam.isRunning { MacSteam.start() }
+        }
+    }
+
+    /// Gives every closed Windows bottle the font stand-ins (see BottleFonts), once per run.
+    private func addBottleFonts() {
+        var prefixes = games.filter(\.isWindowsBuild).map { $0.compatData.appendingPathComponent("pfx") }
+        if online.installed { prefixes.append(OnlineSteam.prefix) }
+        for pfx in prefixes where !fontsChecked.contains(pfx.path) {
+            guard FileManager.default.fileExists(atPath: pfx.appendingPathComponent("user.reg").path) else { continue }
+            guard !OnlineSteam.serverIsAlive(pfx) else { continue }   // try again once it closes
+            fontsChecked.insert(pfx.path)
+            if BottleFonts.ensure(prefix: pfx) { log.line("Added font stand-ins to \(pfx.deletingLastPathComponent().lastPathComponent)") }
         }
     }
 

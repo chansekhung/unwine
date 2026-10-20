@@ -89,6 +89,7 @@ enum LocalGames {
             guard FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) else {
                 throw LocalGamesError.bottle("Wine made no bottle. The log has the details.")
             }
+            BottleFonts.ensure(prefix: pfx)
         }
 
         // The game runs from an app bundle that says "game", so macOS can give it Game Mode. A
