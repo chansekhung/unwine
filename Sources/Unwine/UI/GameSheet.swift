@@ -103,12 +103,17 @@ struct GameSheet: View {
                     section("Graphics") {
                         Picker("Graphics layer", selection: binding(game.id, \.renderer)) {
                             ForEach(Renderer.allCases) { r in
-                                Text(r == .auto ? "Automatic (\(advice.renderer.short))" : r.title)
+                                Text(r == .auto ? "Automatic (\(oldDirectX(analysis) && advice.renderer != .wined3d ? "DXVK for DirectX 9" : advice.renderer.short))" : r.title)
                                     .tag(r)
                             }
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
+                        if let a = analysis, oldDirectX(a), resolved != .wined3d {
+                            // Say what really draws: the picker's names are for DirectX 10 to 12.
+                            Text("\(a.api.label) game: DXMT and D3DMetal only draw DirectX 10 to 12. On DXMT, DXVK, D3DMetal or Automatic, this game draws with DXVK's DirectX 9 part. Only WineD3D draws it another way.")
+                                .font(.system(size: 12)).foregroundStyle(Palette.glow)
+                        }
                         Text(s.renderer == .auto ? (analysis == nil ? "Unwine is reading the game's files to pick the best layer." : advice.rendererReason) : s.renderer.blurb)
                             .font(.system(size: 12)).foregroundStyle(Palette.muted)
                         if s.renderer == .d3dmetal && model.d3dmetal == nil {
@@ -243,6 +248,9 @@ struct GameSheet: View {
         }
     }
 
+    /// DirectX 8 and 9 games draw with DXVK's DirectX 9 part under every layer but WineD3D.
+    private func oldDirectX(_ a: GameAnalysis?) -> Bool { a?.api == .dx9 || a?.api == .dx8 }
+
     private func restartMessage(_ ask: OnlineRestartAsk) -> String {
         let what = ask.changes.isEmpty ? "settings Windows Steam did not start with"
                                        : "settings Windows Steam did not start with: " + ask.changes.joined(separator: ", ")
@@ -265,7 +273,7 @@ struct GameSheet: View {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: "wand.and.stars").foregroundStyle(Palette.glow)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Best layer: \(advice.renderer.title)").font(.system(size: 13, weight: .semibold))
+                    Text("Best layer: \(oldDirectX(model.analysis(for: game)) && advice.renderer != .wined3d ? "DXVK (DirectX 9 part)" : advice.renderer.title)").font(.system(size: 13, weight: .semibold))
                     Text(advice.rendererReason).font(.system(size: 12)).foregroundStyle(Palette.muted)
                 }
             }
