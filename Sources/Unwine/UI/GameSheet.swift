@@ -32,6 +32,8 @@ struct GameSheet: View {
         let resolved = model.resolvedRenderer(for: game)
         let advice = model.advice(for: game)
         let isLocal = game.localExe != nil
+        // A launcher runs with its game's settings (the game it starts inherits them).
+        let followed = model.settingsSource(for: game)
         // Online mode is Windows Steam: it has nothing to offer a game added by its .exe.
         let needsOnline: String? = { if !isLocal, case .needsOnlineMode(let ac) = advice.online { return ac }; return nil }()
         // DLSS becomes MetalFX through D3DMetal or DXMT; DXVK and Wine's own layer have no MetalFX.
@@ -130,6 +132,10 @@ struct GameSheet: View {
                         }
                     }
 
+                    if let followed {
+                        NoticeRow(color: Palette.accent, icon: "arrow.triangle.branch",
+                                  text: "This \(LocalGames.role(of: game.localExe!)?.lowercased() ?? "program") starts with the settings of \(followed.name), because the game it opens gets everything the \(LocalGames.role(of: game.localExe!)?.lowercased() ?? "program") got. To change graphics, speed or Apple extras, close this page and open \(followed.name).")
+                    } else {
                     adviceSection(game, advice)
 
                     if let ac = needsOnline { onlineSection(game, anticheat: ac) }
@@ -213,6 +219,7 @@ struct GameSheet: View {
                              warn: s.metalFX && !canMetalFX)
                         Toggle("Metal 4 mode (GPTK 4)", isOn: binding(game.id, \.metal4))
                         note(metal4Note(resolved), warn: false)
+                    }
                     }
 
                     section("Fix things") {
@@ -299,9 +306,7 @@ struct GameSheet: View {
         .confirmationDialog("Remove \(game.name) from Unwine?", isPresented: $confirmRemove) {
             Button("Remove", role: .destructive) { model.removeLocalGame(game); dismiss() }
         } message: {
-            Text(game.installDir.path.hasPrefix(game.compatData.path)
-                 ? "This game was installed inside its Windows bottle, so the game itself goes to the Trash with the bottle."
-                 : "The game's own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the game kept inside it, goes to the Trash.")
+            Text(model.removeNote(for: game))
         }
         .fileImporter(isPresented: $locating, allowedContentTypes: [UTType(filenameExtension: "exe") ?? .data]) { result in
             if case .success(let url) = result { model.relocateLocalGame(game.id, exe: url) }

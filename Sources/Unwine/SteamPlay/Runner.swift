@@ -50,18 +50,9 @@ enum Runner {
         return r.engineFolder == engine.folder && r.format == format && r.supportPath == Paths.support.path
     }
 
-    /// Any game (or Wine helper) currently running through Unwine's runner. The wineserver
-    /// keeps its full path as its name, unlike game processes, which Wine renames.
-    static func isInUse() -> Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-f", "wineserver.decant-real"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        do { try p.run() } catch { return false }
-        p.waitUntilExit()
-        return p.terminationStatus == 0
-    }
+    /// Any game (or Wine helper) currently running through Unwine's runner: its wineserver runs the
+    /// runner's own file, which no other program has.
+    static func isInUse() -> Bool { Processes.anyRunning(file: "wineserver.decant-real") }
 
     /// Is this game's Windows bottle open right now? Wine keeps one server socket per prefix
     /// at /tmp/.wine-<uid>/server-<dev>-<inode>/socket.

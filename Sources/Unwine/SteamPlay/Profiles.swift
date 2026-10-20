@@ -75,10 +75,10 @@ enum Profiles {
 
     /// Writes the profile for one game (or the default one when `appID` is nil). `gameDir` lets a
     /// dxvk.conf or dxmt.conf that ships with the game keep working: Unwine's file starts with it.
-    static func write(appID: Int?, settings: GameSettings, renderer: Renderer,
+    static func write(appID: Int?, settings: GameSettings, renderer: Renderer, api: GraphicsAPI? = nil,
                       engine: InstalledEngine, d3dmetal: D3DMetalInstall?, gameDir: URL? = nil) throws {
         try Paths.ensure(Runner.profiles)
-        let (dxvk, dxmt) = configs(settings: settings, renderer: renderer, gameDir: gameDir)
+        let (dxvk, dxmt) = configs(settings: settings, renderer: renderer, api: api, gameDir: gameDir)
         try writeOrRemove(dxvk, at: dxvkConfig(for: appID))
         try writeOrRemove(dxmt, at: dxmtConfig(for: appID))
         let text = render(appID: appID, settings: settings, renderer: renderer, engine: engine, d3dmetal: d3dmetal,
@@ -100,7 +100,7 @@ enum Profiles {
     static var screenHz: Int { NSScreen.screens.first?.maximumFramesPerSecond ?? 60 }
 
     /// The DXVK and DXMT config files a game needs, or nil when Unwine has nothing to set.
-    static func configs(settings s: GameSettings, renderer: Renderer, gameDir: URL?,
+    static func configs(settings s: GameSettings, renderer: Renderer, api: GraphicsAPI? = nil, gameDir: URL?,
                         screenHz: Int = Profiles.screenHz) -> (dxvk: String?, dxmt: String?) {
         func shipped(_ name: String) -> String {
             guard let dir = gameDir, let text = try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8) else { return "" }
@@ -113,6 +113,11 @@ enum Profiles {
             if s.lowLatency { dxvk.append("dxvk.latencySleep = True") }
             // Background shader builds, said out loud so no build default decides it.
             dxvk.append(s.asyncShaders ? "dxvk.enableAsync = True" : "dxvk.enableAsync = False")
+            // A DirectX 10/11/12 game can open a DirectX 9 device on its own window only to decode
+            // videos (Romance of the Three Kingdoms XIV). On a Mac every swap chain adds its own layer
+            // to the window, and the DirectX 9 one never draws, so it hid the whole game: a black
+            // screen with music. With this, DXVK makes that layer only when DirectX 9 really presents.
+            if api != .dx9 && api != .dx8 { dxvk.append("d3d9.deferSurfaceCreation = True") }
         }
         var dxmt: [String] = []
         // DXMT runs every layer choice except DXVK, WineD3D and a real D3DMetal (which has its own cap).
@@ -148,8 +153,10 @@ enum Profiles {
 
         // DirectX 9 and DirectDraw helpers ride along with every modern layer.
         if renderer != .wined3d {
-            // Unwine's copy lets DXVK's background shader builds reach the game's main picture too.
-            let d9vk = s.asyncShaders ? RendererPatches.asyncDir("d9vk", engine: engine)?.path : nil
+            // Unwine's copy lets DXVK's background shader builds reach the game's main picture too, and
+            // keeps a texture the Mac cannot share from closing the game. It is used with async shaders
+            // off as well: the crash fix applies either way, and the async fix then does nothing.
+            let d9vk = RendererPatches.fixedDir("d9vk", engine: engine)?.path
             if engine.supports("WINEDLLPATH_D9VK") { export("WINEDLLPATH_D9VK", d9vk ?? dir("d9vk")) }
             if engine.supports("WINEDLLPATH_CNCD") { export("WINEDLLPATH_CNCD", dir("cnc_ddraw")) }
             // DXVK (also behind the DirectX 9 helper) reads the frame cap and latency sleep from its file.
@@ -170,7 +177,7 @@ enum Profiles {
             }
         case .dxvk:
             let three = engine.renderer("dxvk3")
-            let patched = s.asyncShaders ? RendererPatches.asyncDir("dxvk3", engine: engine) : nil
+            let patched = RendererPatches.fixedDir("dxvk3", engine: engine)
             export("WINEDLLPATH_DXVK", patched?.path ?? (FileManager.default.fileExists(atPath: three.path) ? three.path : dir("dxvk")))
             export("DXVK_ASYNC", s.asyncShaders ? "1" : "0")
             if let cap = s.fpsCap { export("DXVK_FRAME_RATE", String(cap)) }   // DXVK 1.x; 3.x reads the config file
