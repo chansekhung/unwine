@@ -879,7 +879,7 @@ enum OnlineSteam {
         let lib = engine.wineDir.appendingPathComponent("lib/wine", isDirectory: true)
         return [("Contents/MacOS/x86_64-unix", "."),
                 ("Contents/MacOS/x86_64-windows", lib.appendingPathComponent("x86_64-windows").path),
-                ("Contents/MacOS/i386-windows", lib.appendingPathComponent("i386-windows").path),
+                ("Contents/MacOS/i386-windows", RendererPatches.windowsDir("i386-windows", engine: engine).path),
                 ("bin", engine.wineDir.appendingPathComponent("bin").path),
                 ("share", engine.wineDir.appendingPathComponent("share").path)]
     }

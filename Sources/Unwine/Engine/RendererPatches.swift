@@ -47,7 +47,7 @@ enum RendererPatches {
         return copy.appendingPathComponent("wine", isDirectory: true)
     }
 
-    // MARK: DEP for 32-bit games, decided by the game's .exe (Steam Play runner)
+    // MARK: DEP for 32-bit games, decided by the game's .exe
 
     /// Wine turns DEP off for a whole 32-bit game as soon as it loads any DLL built without the
     /// NX_COMPAT flag. Windows decides from the game's .exe only. With DEP off, Wine marks every
@@ -56,7 +56,9 @@ enum RendererPatches {
     /// The fix does what Windows does: a DLL without the flag no longer turns DEP off; a .exe without
     /// it still does, so old games that need it keep working. The check moves into padding at the end
     /// of the code ('testb $1,0x5f(%edi); jne' becomes a jump there, which also compares the module
-    /// with the .exe's base address). It patches the runner's ntdll after the Steam bridge recipe.
+    /// with the .exe's base address). This recipe patches the Steam Play runner's ntdll after the
+    /// Steam bridge recipe; `exeDecidesDEPEngine` makes the same change in a copy of the engine's
+    /// 32-bit folder, for Online mode and games outside Steam.
     static let exeDecidesDEP = Recipe(
         path: "i386-windows/ntdll.dll",
         cleanSHA256: "2b4b4beb0c2c2db3507ae72869b2b2f3573c6998639c1516e5d6022afc01e6c9",
@@ -83,6 +85,52 @@ enum RendererPatches {
             log?.line("Runner: 32-bit games keep DEP on unless their own .exe asks for it off, as on Windows")
         } catch {
             log?.line("Could not apply the DEP fix: \(error.localizedDescription)")
+        }
+    }
+
+    /// The same edits on the engine's own 32-bit ntdll (no Steam bridge in it).
+    static let exeDecidesDEPEngine = Recipe(
+        path: "i386-windows/ntdll.dll",
+        cleanSHA256: "ae3ce87f0744ea9180fc91371a2ca5a6ddb5e045e7469480b447c8cd0365c20c",
+        patchedSHA256: "117ad3de04812a1d0508cb90879c85a0ca3f86eddbf814bd4ab88a4b6690aed3",
+        edits: exeDecidesDEP.edits)
+
+    /// wine/lib/wine-unwine/i386-windows: a clone of the engine's 32-bit Windows folder with that fix.
+    private static func windowsCopy(engine: InstalledEngine) -> URL {
+        engine.wineDir.appendingPathComponent("lib/wine-unwine/i386-windows", isDirectory: true)
+    }
+
+    /// The folder Unwine's own Wine bundles (Online mode, games outside Steam) should load this
+    /// arch's Windows files from: the fixed 32-bit copy when it is ready, else the engine's own.
+    static func windowsDir(_ arch: String, engine: InstalledEngine) -> URL {
+        let own = engine.wineDir.appendingPathComponent("lib/wine/\(arch)", isDirectory: true)
+        guard arch == "i386-windows" else { return own }
+        let copy = windowsCopy(engine: engine)
+        guard (try? String(contentsOf: copy.appendingPathComponent(markerName), encoding: .utf8)) == marker([exeDecidesDEPEngine]) else { return own }
+        return copy
+    }
+
+    private static func prepareWindowsCopy(engine: InstalledEngine, log: LogFile) {
+        let fm = FileManager.default
+        let source = engine.wineDir.appendingPathComponent("lib/wine/i386-windows", isDirectory: true)
+        let copy = windowsCopy(engine: engine)
+        guard fm.fileExists(atPath: source.path) else { return }
+        guard (try? Downloader.sha256(of: source.appendingPathComponent("ntdll.dll"))) == exeDecidesDEPEngine.cleanSHA256 else {
+            log.line("i386-windows: not the ntdll build Unwine's DEP fix was made for, so Online mode and games outside Steam use it unchanged")
+            return
+        }
+        let stage = copy.deletingLastPathComponent().appendingPathComponent(".i386-windows-\(UUID().uuidString)", isDirectory: true)
+        do {
+            try fm.createDirectory(at: copy.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try clone(source, to: stage)
+            try apply(exeDecidesDEPEngine, to: stage.appendingPathComponent("ntdll.dll"))
+            try marker([exeDecidesDEPEngine]).write(to: stage.appendingPathComponent(markerName), atomically: true, encoding: .utf8)
+            try? fm.removeItem(at: copy)
+            try fm.moveItem(at: stage, to: copy)
+            log.line("Made wine-unwine/i386-windows: in Online mode and games outside Steam, only a 32-bit game's .exe can turn DEP off")
+        } catch {
+            try? fm.removeItem(at: stage)
+            log.line("Could not make wine-unwine/i386-windows: \(error.localizedDescription)")
         }
     }
 
@@ -123,6 +171,7 @@ enum RendererPatches {
             prepareCopy(of: engine.rendererRoot.appendingPathComponent(name, isDirectory: true),
                         to: engine.rendererRoot.appendingPathComponent("\(name)-unwine", isDirectory: true), log: log)
         }
+        if windowsDir("i386-windows", engine: engine) != windowsCopy(engine: engine) { prepareWindowsCopy(engine: engine, log: log) }
         prepareDriver(engine: engine, log: log)
     }
 
