@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @State private var pickingGPTK = false
     @State private var confirmRemoveOnline = false
     @State private var removeSizes: (games: Int64, saves: Int64)?
@@ -33,7 +34,12 @@ struct SettingsView: View {
                                 .font(.system(size: 11)).foregroundStyle(Palette.warn)
                         }
                         row("Steam Play files", model.stored.kitVersion.map { "NotProton \($0)" } ?? "Not installed")
-                        row("Unwine", appVersionText)
+                        HStack(spacing: 10) {
+                            row("Unwine", appVersionText)
+                            Button("What's new") { openWindow(id: WhatsNewView.windowID) }
+                                .buttonStyle(.link).font(.system(size: 12))
+                                .help("What each Unwine version changed, in plain words")
+                        }
                         HStack(spacing: 10) {
                             Button(model.isCheckingUpdates ? "Checking…" : "Check now") { Task { await model.checkForUpdates() } }
                                 .buttonStyle(QuietButtonStyle()).disabled(model.isCheckingUpdates || !model.showsLibrary)

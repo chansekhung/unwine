@@ -25,6 +25,7 @@ struct StoredState: Codable {
     var presetChoice: [Int: String] = [:]   // the preset last clicked per game, to break ties
     var localGames: [LocalGameRecord] = []  // Windows games the user added by their .exe
     var lastLocalID = 0                     // the highest id ever given to an added game, so none is reused
+    var lastSeenVersion: String?            // the Unwine whose "What's new" the user has seen; nil on a fresh install
 
     init() {}
 
@@ -51,6 +52,8 @@ struct StoredState: Codable {
         presetChoice = (try? c.decodeIfPresent([Int: String].self, forKey: .presetChoice)) ?? [:]
         localGames = (try? c.decodeIfPresent([LocalGameRecord].self, forKey: .localGames)) ?? []
         lastLocalID = (try? c.decodeIfPresent(Int.self, forKey: .lastLocalID)) ?? 0
+        // Unwine 1.0.2 and older did not keep this. Someone who set one of them up sees what came after 1.0.2.
+        lastSeenVersion = (try? c.decodeIfPresent(String.self, forKey: .lastSeenVersion)) ?? (setupComplete ? "1.0.2" : nil)
     }
 }
 
@@ -164,6 +167,7 @@ final class AppModel {
     var games: [SteamGame] = []
     var mappings: [Int: String] = [:]
     var gameRunning = false             // any game or helper running through Unwine
+    var steamChecked = false            // the first look at Steam and at what runs is done
     var busyGame: Int?                  // a game whose Steam setting is being changed
     var localRunning = Set<Int>()       // added games whose bottle is running
     var localStarting: [Int: String] = [:]  // added games starting now, with the step for the waiting screen
@@ -201,6 +205,7 @@ final class AppModel {
     var stored = StoredState()
     let log = LogFile("unwine.log")
     private var started = false
+    private(set) var loaded = false     // state.json is read; a save before that would replace it with defaults
     private var refreshing = false
     private var pendingProfiles = Set<Int?>()
 
@@ -337,6 +342,7 @@ final class AppModel {
         // A closed bottle has no settings left to compare with, so the next start sets them fresh.
         if !online.inUse, stored.onlineEnvHash != nil, !onlineBusy { stored.onlineEnvHash = nil; stored.onlineEnv = nil; save() }
         reopenMacSteamIfOnlineEnded()
+        steamChecked = true
     }
 
     /// Brings Mac Steam back once Windows Steam is gone. Waits three reads in a row,
@@ -1275,6 +1281,7 @@ final class AppModel {
     // MARK: Persistence
 
     func load() {
+        loaded = true
         guard let data = try? Data(contentsOf: Self.storeURL) else { return }
         if let s = try? JSONDecoder.unwine.decode(StoredState.self, from: data) {
             stored = s

@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Unwine",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS(.v15)],   // the same as LSMinimumSystemVersion in scripts/build.sh
     targets: [
         .executableTarget(
             name: "Unwine",
