@@ -22,7 +22,7 @@ enum LocalGamesError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .missing(let path): return "The game's file is gone from \(path). Add it again from where it is now."
+        case .missing(let path): return "Its program is not in \(path) now. Press Locate… and pick it where it is now. Its bottle and saves stay."
         case .bottle(let why): return "Unwine could not make the game's Windows bottle: \(why)"
         }
     }

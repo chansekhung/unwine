@@ -20,6 +20,10 @@ struct SteamGame: Identifiable, Hashable, Sendable {
     var localExe: URL? = nil
     /// An added game that shares another added game's bottle (one game folder, one bottle).
     var bottleID: Int? = nil
+    /// Minutes played in all, from Steam's own count. Nil when Unwine does not know it.
+    var playtimeMinutes: Int? = nil
+    /// When the game came into the library: for a Steam game, when its install folder was made.
+    var addedAt: Date? = nil
 
     var compatData: URL { steamapps.appendingPathComponent("compatdata/\(bottleID ?? id)", isDirectory: true) }
     var runLog: URL {
@@ -63,6 +67,7 @@ enum SteamLibrary {
     static func scan(unwineMapped: Set<Int> = []) -> [SteamGame] {
         let fm = FileManager.default
         var games: [Int: SteamGame] = [:]
+        let played = playtimes()
         for apps in steamappsFolders() {
             guard let files = try? fm.contentsOfDirectory(atPath: apps.path) else { continue }
             for file in files where file.hasPrefix("appmanifest_") && file.hasSuffix(".acf") {
@@ -76,6 +81,7 @@ enum SteamLibrary {
                 let flags = st["StateFlags"]?.string.flatMap(Int.init) ?? 0
                 let size = st["SizeOnDisk"]?.string.flatMap(Int64.init) ?? 0
                 let lastPlayed = st["LastPlayed"]?.string.flatMap(Double.init).flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
+                    ?? played[id]?.lastPlayed
 
                 let state: SteamGame.State
                 let updating = flags & 1024 != 0 || flags & 1_048_576 != 0
@@ -92,7 +98,9 @@ enum SteamLibrary {
                 let compat = fm.fileExists(atPath: apps.appendingPathComponent("compatdata/\(id)").path)
                 let windows = compat || unwineMapped.contains(id) || looksLikeWindowsBuild(dir)
                 games[id] = SteamGame(id: id, name: name, installDir: dir, steamapps: apps, sizeOnDisk: size,
-                                      state: state, lastPlayed: lastPlayed, isWindowsBuild: windows)
+                                      state: state, lastPlayed: lastPlayed, isWindowsBuild: windows,
+                                      playtimeMinutes: played[id]?.minutes,
+                                      addedAt: try? dir.resourceValues(forKeys: [.creationDateKey]).creationDate)
             }
         }
         return games.values.sorted {
@@ -120,6 +128,58 @@ enum SteamLibrary {
             if inner.contains(where: { $0.lowercased().hasSuffix(".exe") }) { return true }
         }
         return false
+    }
+
+    // MARK: Play time
+
+    /// Minutes played and the last start per app, from the Steam user's localconfig.vdf
+    /// (UserLocalConfigStore > Software > Valve > Steam > apps > <appid>). Steam does not document
+    /// this file, so Unwine only reads it, and anything it cannot read just leaves the numbers out.
+    /// A read is kept until the file changes: the library scan asks every few seconds.
+    static func playtimes() -> [Int: (minutes: Int?, lastPlayed: Date?)] {
+        guard let file = localConfig(),
+              let a = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let size = (a[.size] as? NSNumber)?.intValue, let date = a[.modificationDate] as? Date else { return [:] }
+        playLock.lock()
+        defer { playLock.unlock() }
+        if let c = playCache, c.file == file, c.size == size, c.date == date { return c.times }
+        var times: [Int: (minutes: Int?, lastPlayed: Date?)] = [:]
+        if let apps = VDF.parse(contentsOf: file)?["UserLocalConfigStore", "Software", "Valve", "Steam", "apps"] {
+            for (key, app) in apps.entries {
+                guard let id = Int(key) else { continue }
+                let minutes = app["Playtime"]?.string.flatMap(Int.init)
+                let last = app["LastPlayed"]?.string.flatMap(Double.init).flatMap { $0 > 0 ? Date(timeIntervalSince1970: $0) : nil }
+                if minutes != nil || last != nil { times[id] = (minutes, last) }
+            }
+        }
+        playCache = (file, size, date, times)
+        return times
+    }
+    private static let playLock = NSLock()
+    private static var playCache: (file: URL, size: Int, date: Date, times: [Int: (minutes: Int?, lastPlayed: Date?)])?
+
+    /// The localconfig.vdf of the Steam user who signed in last (loginusers.vdf), else the one Steam
+    /// wrote last.
+    private static func localConfig() -> URL? {
+        let fm = FileManager.default
+        let userdata = SteamPlayPaths.steamData.appendingPathComponent("userdata", isDirectory: true)
+        func file(_ account: String) -> URL { userdata.appendingPathComponent("\(account)/config/localconfig.vdf") }
+        if let users = VDF.parse(contentsOf: SteamPlayPaths.steamData.appendingPathComponent("config/loginusers.vdf"))?["users"] {
+            let latest = users.entries.max { a, b in
+                let mostRecent = { (u: VDF) in u["MostRecent"]?.string == "1" }
+                if mostRecent(a.value) != mostRecent(b.value) { return !mostRecent(a.value) }
+                return (a.value["Timestamp"]?.string.flatMap(Int.init) ?? 0) < (b.value["Timestamp"]?.string.flatMap(Int.init) ?? 0)
+            }
+            // The folder name is the account number: the low 32 bits of the 64-bit Steam ID.
+            if let id64 = latest.flatMap({ UInt64($0.key) }), fm.fileExists(atPath: file(String(id64 & 0xFFFF_FFFF)).path) {
+                return file(String(id64 & 0xFFFF_FFFF))
+            }
+        }
+        let accounts = (try? fm.contentsOfDirectory(atPath: userdata.path)) ?? []
+        return accounts.map(file).filter { fm.fileExists(atPath: $0.path) }.max { a, b in
+            let date = { (u: URL) in (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast }
+            return date(a) < date(b)
+        }
     }
 
     // MARK: Artwork
