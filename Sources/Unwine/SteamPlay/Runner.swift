@@ -17,7 +17,7 @@ enum Runner {
     static let build = "decant-1"
 
     /// Bump when the wrappers or engine.env change shape, so existing runners get rewritten.
-    static let format = 6      // 6: processes a game starts run from its Game Mode bundle too
+    static let format = 7      // 7: a 32-bit game's DLLs no longer turn DEP off (only its .exe can)
 
     static var base: URL { SteamPlayPaths.runners.appendingPathComponent("crossover-\(build)", isDirectory: true) }
     static var root: URL { base.appendingPathComponent("CrossOver", isDirectory: true) }
@@ -90,6 +90,7 @@ enum Runner {
         for arch in ["x86_64-windows", "i386-windows"] {
             try NtdllPatcher.patch(lib.appendingPathComponent("\(arch)/ntdll.dll"), arch: arch)
         }
+        RendererPatches.applyExeDecidesDEP(wineLib: lib, log: log)
         for (arch, name) in [("x86_64-windows", "lsteamclient.dll"), ("i386-windows", "lsteamclient.dll"), ("x86_64-unix", "lsteamclient.so")] {
             let src = SteamPlayPaths.bridge.appendingPathComponent("\(arch)/\(name)")
             guard fm.fileExists(atPath: src.path) else { throw SteamPlayError.badKit("bridge is missing \(arch)/\(name)") }
@@ -124,6 +125,8 @@ enum Runner {
     /// (after an Unwine update changes them, or GPTK is added). Cheap; no engine copy.
     static func refresh(engine: InstalledEngine, d3dmetal: D3DMetalInstall?) throws {
         try writeGeneratedFiles(into: root, engine: engine, d3dmetal: d3dmetal)
+        // Before staging: NotProton compares the runner's ntdll with the staged copy.
+        RendererPatches.applyExeDecidesDEP(wineLib: root.appendingPathComponent("lib/wine", isDirectory: true), log: nil)
         try stageBridgeNtdll()
         try writeToolList()
     }

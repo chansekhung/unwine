@@ -47,6 +47,45 @@ enum RendererPatches {
         return copy.appendingPathComponent("wine", isDirectory: true)
     }
 
+    // MARK: DEP for 32-bit games, decided by the game's .exe (Steam Play runner)
+
+    /// Wine turns DEP off for a whole 32-bit game as soon as it loads any DLL built without the
+    /// NX_COMPAT flag. Windows decides from the game's .exe only. With DEP off, Wine marks every
+    /// readable page executable, and DXMT then waits up to a second at a time for macOS to hand back
+    /// a frame to draw into: Age of Mythology froze about 100 times a minute until DEP stayed on.
+    /// The fix does what Windows does: a DLL without the flag no longer turns DEP off; a .exe without
+    /// it still does, so old games that need it keep working. The check moves into padding at the end
+    /// of the code ('testb $1,0x5f(%edi); jne' becomes a jump there, which also compares the module
+    /// with the .exe's base address). It patches the runner's ntdll after the Steam bridge recipe.
+    static let exeDecidesDEP = Recipe(
+        path: "i386-windows/ntdll.dll",
+        cleanSHA256: "2b4b4beb0c2c2db3507ae72869b2b2f3573c6998639c1516e5d6022afc01e6c9",
+        patchedSHA256: "6841711c24e16af6d1d317ce65bc74ac00e92fc0a5e6dda159c70aca9c75f231",
+        edits: [
+            Edit(offset: 0x2f2ad, old: [0xf6, 0x47, 0x5f, 0x01, 0x75, 0x41],
+                 new: [0xe9, 0x53, 0x38, 0x03, 0x00, 0x90]),
+            Edit(offset: 0x62b05, old: [UInt8](repeating: 0xcc, count: 30),
+                 new: [0xf6, 0x47, 0x5f, 0x01, 0x75, 0x13, 0x64, 0xa1, 0x30, 0x00, 0x00, 0x00, 0x8b, 0x40, 0x08,
+                       0x3b, 0x46, 0x18, 0x75, 0x05, 0xe9, 0x95, 0xc7, 0xfc, 0xff, 0xe9, 0xd1, 0xc7, 0xfc, 0xff]),
+        ])
+
+    /// Patches the runner's 32-bit ntdll in place (`wineLib` is the runner's lib/wine). A file that
+    /// is already patched, or is not the build the recipe was made for, is left as it is.
+    static func applyExeDecidesDEP(wineLib: URL, log: LogFile?) {
+        let file = wineLib.appendingPathComponent(exeDecidesDEP.path)
+        guard let sha = try? Downloader.sha256(of: file), sha != exeDecidesDEP.patchedSHA256 else { return }
+        guard sha == exeDecidesDEP.cleanSHA256 else {
+            log?.line("ntdll: not the build Unwine's DEP fix was made for, so DLLs can still turn DEP off")
+            return
+        }
+        do {
+            try apply(exeDecidesDEP, to: file)
+            log?.line("Runner: 32-bit games keep DEP on unless their own .exe asks for it off, as on Windows")
+        } catch {
+            log?.line("Could not apply the DEP fix: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: Vulkan memory budget (KosmicKrisp under Rosetta)
 
     /// Mesa counts free memory as pages × PAGE_SIZE. Under Rosetta PAGE_SIZE is 4 KiB, but macOS counts
