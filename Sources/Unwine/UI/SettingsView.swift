@@ -98,11 +98,20 @@ struct SettingsView: View {
                             HStack(spacing: 10) {
                                 UnwineMark(progress: nil, size: 20)
                                 PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
+                                if model.onlineClosing {
+                                    Spacer()
+                                    Button("Close now") { model.hurryOnlineQuit() }.buttonStyle(QuietButtonStyle())
+                                        .help("Ends Windows Steam without waiting. Steam Cloud may not finish saving this session.")
+                                }
                             }
                         } else if model.online.installed {
                             Toggle("High Resolution Mode", isOn: $model.stored.onlineHighResolution)
                                 .onChange(of: model.stored.onlineHighResolution) { OnlineSteam.highResolution = model.stored.onlineHighResolution; model.save() }
                             Text("On: games and Windows Steam use your screen's full pixels, like CrossOver's switch of the same name. Set a game to your screen's full size (\(fullScreenPixels)). Off: everything draws at half size and macOS scales it up, which is lighter on the GPU; set games to \(halfScreenPixels). Applies the next time Windows Steam starts.")
+                                .font(.system(size: 11)).foregroundStyle(Palette.muted)
+                            Toggle("Games fill the whole screen", isOn: $model.stored.onlineFillScreen)
+                                .onChange(of: model.stored.onlineFillScreen) { OnlineSteam.fillScreen = model.stored.onlineFillScreen; model.save() }
+                            Text("On: a full-screen game takes the whole display, so the Dock and menu bar cannot cover it, and macOS can turn on Game Mode. Other windows and notifications stay hidden while the game is in front; Cmd-Tab leaves it. Applies the next time Windows Steam starts.")
                                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
                             Toggle("Game Mode for games in Windows Steam (experimental)", isOn: $model.stored.onlineGameMode)
                                 .onChange(of: model.stored.onlineGameMode) { OnlineSteam.gameModeForGames = model.stored.onlineGameMode; model.save() }
@@ -154,6 +163,11 @@ struct SettingsView: View {
         }
         .frame(width: 560, height: 640)
         .background(AppBackground())
+        .confirmationDialog("Quit the game too?", isPresented: Binding(get: { model.onlineForceQuit != nil }, set: { if !$0 { model.onlineForceQuit = nil } })) {
+            Button("Quit game and Windows Steam", role: .destructive) { Task { await model.stopOnline(force: true) } }
+        } message: {
+            Text("\((model.onlineForceQuit ?? []).joined(separator: ", ")) is still running in Windows Steam. Unwine asks it to close first. Progress you have not saved can be lost.")
+        }
         .confirmationDialog("Remove Online mode?", isPresented: $confirmRemoveOnline) {
             Button("Move to Trash", role: .destructive) { model.removeOnline() }
         } message: {

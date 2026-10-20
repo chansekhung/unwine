@@ -82,6 +82,10 @@ struct LibraryView: View {
                 if let words = model.onlineWords {
                     UnwineMark(progress: nil, size: 20)
                     PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
+                    if model.onlineClosing {
+                        Button("Close now") { model.hurryOnlineQuit() }.buttonStyle(QuietButtonStyle())
+                            .help("Ends Windows Steam without waiting. Steam Cloud may not finish saving this session.")
+                    }
                 } else {
                     Button("Quit Windows Steam") { Task { await model.stopOnline() } }.buttonStyle(PrimaryButtonStyle())
                         .help("Steam Cloud saves sync first.")

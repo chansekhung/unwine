@@ -21,6 +21,7 @@ struct StoredState: Codable {
     var onlineEnv: [String: String]?    // those settings, to name what changed when a game needs others
     var onlineGameMode = false          // experimental: macOS Game Mode for the games Windows Steam starts
     var onlineHighResolution = false    // CrossOver's High Resolution Mode for the Windows Steam bottle
+    var onlineFillScreen = false        // games in Windows Steam take the whole display (no Dock over them)
     var presetChoice: [Int: String] = [:]   // the preset last clicked per game, to break ties
     var localGames: [LocalGameRecord] = []  // Windows games the user added by their .exe
 
@@ -45,6 +46,7 @@ struct StoredState: Codable {
         onlineEnv = try? c.decodeIfPresent([String: String].self, forKey: .onlineEnv)
         onlineGameMode = (try? c.decodeIfPresent(Bool.self, forKey: .onlineGameMode)) ?? false
         onlineHighResolution = (try? c.decodeIfPresent(Bool.self, forKey: .onlineHighResolution)) ?? false
+        onlineFillScreen = (try? c.decodeIfPresent(Bool.self, forKey: .onlineFillScreen)) ?? false
         presetChoice = (try? c.decodeIfPresent([Int: String].self, forKey: .presetChoice)) ?? [:]
         localGames = (try? c.decodeIfPresent([LocalGameRecord].self, forKey: .localGames)) ?? []
     }
@@ -172,6 +174,7 @@ final class AppModel {
     var onlineWords: [String]?          // phase words while Unwine opens, restarts or closes Windows Steam
     var onlineRestartAsk: OnlineRestartAsk?   // a game needs settings Windows Steam did not start with
     var onlineForceQuit: [String]?      // games still running when the user asked to quit Windows Steam
+    var onlineClosing = false           // Windows Steam is closing (it syncs Steam Cloud saves first)
     private var onlineStartedAt = Date.distantPast
     private var onlineGoneTicks = 0
     private var tickCount = 0
@@ -221,6 +224,7 @@ final class AppModel {
         if let engine { RendererPatches.prepare(engine: engine, log: log) }
         OnlineSteam.gameModeForGames = stored.onlineGameMode
         OnlineSteam.highResolution = stored.onlineHighResolution
+        OnlineSteam.fillScreen = stored.onlineFillScreen
         if let engine {
             if Runner.matches(engine) {
                 runnerReady = true
@@ -686,6 +690,18 @@ final class AppModel {
         guard macSteamAllowed() else { return }
         writeProfile(for: game.id)
         MacSteam.play(game.id)
+        // Steam starts the game in the background; bring its window to the front once it shows,
+        // so the keyboard and mouse go to the game at once.
+        let pfx = game.compatData.appendingPathComponent("pfx")
+        Task { [weak self] in
+            for _ in 0..<120 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if let pid = await Task.detached(operation: { Self.windowOwner(prefix: pfx) }).value {
+                    self?.bringToFront(pid)
+                    return
+                }
+            }
+        }
     }
 
     /// Sets this game to use Unwine in Steam. Steam must restart for that.
@@ -780,7 +796,7 @@ final class AppModel {
             // Wait for the game to show a window, so the waiting screen covers the slow part.
             for _ in 0..<90 {
                 if await Task.detached(operation: { LocalGames.isRunning(game) }).value { localRunning.insert(game.id) }
-                if Self.hasWindow(prefix: LocalGames.prefix(game)) { break }
+                if let pid = Self.windowOwner(prefix: LocalGames.prefix(game)) { bringToFront(pid); break }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
         } catch {
@@ -798,20 +814,21 @@ final class AppModel {
         await refreshSteam()
     }
 
-    /// True once a process of this bottle shows a real window.
-    private static func hasWindow(prefix: URL) -> Bool {
+    /// The process of this bottle that shows a real window, once there is one.
+    nonisolated private static func windowOwner(prefix: URL) -> pid_t? {
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let path = prefix.path
-        return windows.contains { w in
+        for w in windows {
             guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, w[kCGWindowLayer as String] as? Int == 0,
                   let b = w[kCGWindowBounds as String] as? [String: Double], (b["Width"] ?? 0) >= 300, (b["Height"] ?? 0) >= 200
-            else { return false }
-            return processUsesPrefix(pid, path)
+            else { continue }
+            if processUsesPrefix(pid, path) { return pid }
         }
+        return nil
     }
 
     /// A Wine process carries its bottle in WINEPREFIX.
-    private static func processUsesPrefix(_ pid: pid_t, _ prefix: String) -> Bool {
+    nonisolated private static func processUsesPrefix(_ pid: pid_t, _ prefix: String) -> Bool {
         var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
         var size = 0
         guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 4 else { return false }
@@ -913,7 +930,7 @@ final class AppModel {
                                       : ["Starting Windows Steam…", "Steam checks for its own updates…", "Starting \(game!.name)…",
                                          "VAC checks the game", "The game window opens soon"]
             if !steamUp {
-                await OnlineSteam.applyHighResolution(engine: engine)
+                await OnlineSteam.applyDisplaySettings(engine: engine)
                 try OnlineSteam.shareGames(onlineGames(adding: game))
             }
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
@@ -927,8 +944,13 @@ final class AppModel {
             // built-in web browser, so this takes up to a minute or more. The words keep moving all
             // that time, and a second click cannot start Steam twice.
             var shown = false, stopped = false
+            let gameOnly = game != nil
             for second in 0..<240 {
-                if await Task.detached(priority: .userInitiated, operation: { OnlineSteam.hasWindow }).value { shown = true; break }
+                if let pid = await Task.detached(priority: .userInitiated, operation: { OnlineSteam.windowOwner(gameOnly: gameOnly) }).value {
+                    shown = true
+                    bringToFront(pid)
+                    break
+                }
                 if second >= 10, !(await Task.detached(priority: .userInitiated, operation: { OnlineSteam.isInUse }).value) { stopped = true; break }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -956,7 +978,9 @@ final class AppModel {
         onlineForceQuit = nil
         onlineWords = force ? ["Asking the game to close…", "Closing Windows Steam…", "Syncing Steam Cloud saves…"]
                             : ["Closing Windows Steam…", "Syncing Steam Cloud saves…", "This can take a minute"]
+        onlineClosing = true
         let result = await OnlineSteam.shutdown(engine: engine, force: force)
+        onlineClosing = false
         onlineWords = nil
         if case .gamesRunning(let names) = result {
             onlineForceQuit = names
@@ -969,6 +993,21 @@ final class AppModel {
             setReopenMacSteam(false)
             if !MacSteam.isRunning { MacSteam.start() }
         }
+    }
+
+    /// Closes Windows Steam now instead of waiting for Steam Cloud to finish syncing.
+    func hurryOnlineQuit() {
+        guard onlineClosing else { return }
+        onlineWords = ["Closing Windows Steam now…"]
+        OnlineSteam.hurryShutdown()
+    }
+
+    /// Brings a game's window to the front, so the keyboard and mouse go to it at once. A Windows
+    /// game started in the background otherwise shows its window without getting the keyboard.
+    func bringToFront(_ pid: pid_t) {
+        guard let app = NSRunningApplication(processIdentifier: pid) else { return }
+        NSApp.yieldActivation(to: app)
+        _ = app.activate(from: NSRunningApplication.current, options: [])
     }
 
     func removeOnline() {
