@@ -113,11 +113,11 @@ struct SettingsView: View {
                                 .onChange(of: model.stored.onlineFillScreen) { OnlineSteam.fillScreen = model.stored.onlineFillScreen; model.save() }
                             Text("On: a full-screen game takes over the display, so the Dock and menu bar cannot cover it, and macOS can more often turn on Game Mode. While the game is in front, other windows, notifications and any other displays go dark; Cmd-Tab leaves it. Applies the next time Windows Steam starts.")
                                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
-                            Toggle("Game Mode for games in Windows Steam (experimental)", isOn: $model.stored.onlineGameMode)
+                            Toggle("Game Mode for games in Windows Steam", isOn: $model.stored.onlineGameMode)
                                 .onChange(of: model.stored.onlineGameMode) { OnlineSteam.gameModeForGames = model.stored.onlineGameMode; model.save() }
                             Text(model.online.inUse
                                  ? "Takes effect the next time Windows Steam starts. macOS Game Mode gives the game more of the CPU and quiets background work."
-                                 : "macOS Game Mode gives the game more of the CPU and quiets background work. If Windows Steam does not start after you turn this on, turn it off again.")
+                                 : "macOS Game Mode gives the game more of the CPU and quiets background work. Windows Steam and its games then show as games to macOS.")
                                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
                             HStack(spacing: 8) {
                                 if model.online.running {

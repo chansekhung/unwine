@@ -862,16 +862,17 @@ enum OnlineSteam {
     /// says "game".
     ///
     /// Wine 11 starts each new process from the loader next to the real ntdll.so (`init_paths` in
-    /// ntdll's unix/loader.c) and never reads WINELOADER. With only the loader in the bundle (the
-    /// default), steam.exe runs from the bundle and the games Steam starts run from the engine. With
-    /// `gameModeForGames` (the user's switch, experimental), every unix file of Wine is cloned into
-    /// the bundle, so Steam's games run from it too and macOS sees them as games. Wine then finds its
-    /// Windows files, programs and data through links next to the clones. Clones, never hard links:
-    /// a hard-linked program can report its other path, and then macOS loses track of it.
+    /// ntdll's unix/loader.c) and never reads WINELOADER. So every unix file of Wine is cloned into
+    /// the bundle, and Steam's games run from it too. Wine finds its Windows files, programs and data
+    /// through links next to the clones. Its 32-bit Windows files are Unwine's fixed copy, so a
+    /// 32-bit game keeps DEP on as on Windows (with DEP off, DXMT froze Age of Mythology about 100
+    /// times a minute). Clones, never hard links: a hard-linked program can report its other path,
+    /// and then macOS loses track of it. `gameModeForGames` (the user's switch) only decides whether
+    /// the bundle's Info.plist says "game", so macOS gives the games Game Mode.
     static var appBundle: URL { root.appendingPathComponent("Steam (Unwine).app", isDirectory: true) }
     private static var bundleLoader: URL { appBundle.appendingPathComponent("Contents/MacOS/wine") }
 
-    /// Clone all of Wine's unix files into the bundle (Game Mode for the games Steam starts).
+    /// The bundle says "game", so macOS can give Game Mode to the games Steam starts.
     /// Takes effect the next time the bottle starts.
     static var gameModeForGames: Bool {
         get { state.wholeBundle }
@@ -891,8 +892,14 @@ enum OnlineSteam {
     private static let lsregister = URL(fileURLWithPath:
         "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
 
-    /// Wine's own Info.plist keys (a background app until it shows a window), plus the game ones.
-    private static let bundleInfo = Data("""
+    /// Wine's own Info.plist keys (a background app until it shows a window), plus the game ones
+    /// when the Game Mode switch is on.
+    private static var bundleInfo: Data { gameModeForGames ? gameInfo : plainInfo }
+    private static let plainInfo = Data(String(decoding: gameInfo, as: UTF8.self)
+        .replacingOccurrences(of: "\t<key>GCSupportsGameMode</key>\n\t<true/>\n", with: "")
+        .replacingOccurrences(of: "\t<key>LSApplicationCategoryType</key>\n\t<string>public.app-category.games</string>\n", with: "")
+        .replacingOccurrences(of: "\t<key>LSSupportsGameMode</key>\n\t<true/>\n", with: "").utf8)
+    private static let gameInfo = Data("""
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
@@ -956,30 +963,19 @@ enum OnlineSteam {
         guard let want = try? fm.contentsOfDirectory(atPath: source.path), want.contains("wine"),
               let have = try? fm.contentsOfDirectory(atPath: macOS.path),
               (try? Data(contentsOf: appBundle.appendingPathComponent("Contents/Info.plist"))) == bundleInfo else { return false }
-        if gameModeForGames {
-            let links = bundleLinks(engine)
-            guard Set(have) == Set(want).union(links.compactMap { $0.path.hasPrefix("Contents/MacOS/") ? String($0.path.dropFirst(15)) : nil }) else { return false }
-            for link in links {
-                guard (try? fm.destinationOfSymbolicLink(atPath: appBundle.appendingPathComponent(link.path).path)) == link.target else { return false }
-            }
-            // Each file a clone of the engine's: its own file, same size and date.
-            for name in want {
-                var a = stat(), b = stat()
-                guard lstat(macOS.appendingPathComponent(name).path, &a) == 0, lstat(source.appendingPathComponent(name).path, &b) == 0,
-                      a.st_mode & S_IFMT == S_IFREG, a.st_ino != b.st_ino, a.st_size == b.st_size,
-                      a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec else { return false }
-            }
-            return true
+        let links = bundleLinks(engine)
+        guard Set(have) == Set(want).union(links.compactMap { $0.path.hasPrefix("Contents/MacOS/") ? String($0.path.dropFirst(15)) : nil }) else { return false }
+        for link in links {
+            guard (try? fm.destinationOfSymbolicLink(atPath: appBundle.appendingPathComponent(link.path).path)) == link.target else { return false }
         }
-        guard Set(want) == Set(have) else { return false }
-        for name in want where name != "wine" {
-            let target = try? fm.destinationOfSymbolicLink(atPath: macOS.appendingPathComponent(name).path)
-            guard target == source.appendingPathComponent(name).path else { return false }
+        // Each file a clone of the engine's: its own file, same size and date.
+        for name in want {
+            var a = stat(), b = stat()
+            guard lstat(macOS.appendingPathComponent(name).path, &a) == 0, lstat(source.appendingPathComponent(name).path, &b) == 0,
+                  a.st_mode & S_IFMT == S_IFREG, a.st_ino != b.st_ino, a.st_size == b.st_size,
+                  a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec else { return false }
         }
-        let loader = macOS.appendingPathComponent("wine"), original = source.appendingPathComponent("wine")
-        var a = stat(), b = stat()
-        guard lstat(loader.path, &a) == 0, stat(original.path, &b) == 0, a.st_mode & S_IFMT == S_IFREG else { return false }
-        return (try? Data(contentsOf: loader)) == (try? Data(contentsOf: original))
+        return true
     }
 
     /// Builds the bundle in a staging folder and swaps it in, then tells Launch Services about it.
@@ -992,29 +988,21 @@ enum OnlineSteam {
         let macOS = stage.appendingPathComponent("Contents/MacOS", isDirectory: true)
         try Paths.ensure(macOS)
         try bundleInfo.write(to: stage.appendingPathComponent("Contents/Info.plist"))
-        let whole = gameModeForGames
         for name in try fm.contentsOfDirectory(atPath: source.path) {
             let from = source.appendingPathComponent(name), to = macOS.appendingPathComponent(name)
-            if name == "wine" || whole {
-                // A real file: macOS finds a process's app from where its executable lives. A clone
-                // keeps its own path (APFS, no extra space); a plain copy elsewhere.
-                if clonefile(from.path, to.path, 0) != 0 { try fm.copyItem(at: from, to: to) }
-            } else {
-                // Links, so the loader finds the engine's ntdll.so and Wine its other folders.
-                try fm.createSymbolicLink(at: to, withDestinationURL: from)
-            }
+            // Real files: macOS finds a process's app from where its executable lives. A clone keeps
+            // its own path (APFS, no extra space); a plain copy elsewhere.
+            if clonefile(from.path, to.path, 0) != 0 { try fm.copyItem(at: from, to: to) }
         }
-        if whole {
-            for link in bundleLinks(engine) {
-                try fm.createSymbolicLink(atPath: stage.appendingPathComponent(link.path).path, withDestinationPath: link.target)
-            }
+        for link in bundleLinks(engine) {
+            try fm.createSymbolicLink(atPath: stage.appendingPathComponent(link.path).path, withDestinationPath: link.target)
         }
         if (try? appBundle.checkResourceIsReachable()) == true || (try? fm.destinationOfSymbolicLink(atPath: appBundle.path)) != nil {
             try fm.removeItem(at: appBundle)
         }
         try fm.moveItem(at: stage, to: appBundle)
         let registered = runAndWait(lsregister, ["-f", appBundle.path], env: nil, timeout: 20).status
-        log.line("Made the Game Mode app for \(engine.folder)" + (whole ? ", with Game Mode for the games Steam starts" : "")
+        log.line("Made the Windows Steam app for \(engine.folder)" + (gameModeForGames ? ", with Game Mode for the games Steam starts" : "")
                  + (registered == 0 ? "" : " (Launch Services did not take it)"))
     }
 
