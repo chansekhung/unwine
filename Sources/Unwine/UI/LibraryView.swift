@@ -18,6 +18,12 @@ struct LibraryView: View {
                 BannerView(text: banner) { model.banner = nil }
             }
             steamPlayNotice
+                .confirmationDialog("Quit the game too?", isPresented: Binding(get: { model.onlineForceQuit != nil && selected == nil && !showSettings },
+                                                                             set: { if !$0 { model.onlineForceQuit = nil } })) {
+                    Button("Quit game and Windows Steam", role: .destructive) { Task { await model.stopOnline(force: true) } }
+                } message: {
+                    Text("\((model.onlineForceQuit ?? []).joined(separator: ", ")) is still running in Windows Steam. Unwine asks it to close first. Progress you have not saved can be lost.")
+                }
             if model.windowsGames.isEmpty {
                 emptyState
             } else {
@@ -112,12 +118,6 @@ struct LibraryView: View {
                     Button("Quit Windows Steam") { Task { await model.stopOnline() } }.buttonStyle(PrimaryButtonStyle())
                         .help("Steam Cloud saves sync first.")
                 }
-            }
-            .confirmationDialog("Quit the game too?", isPresented: Binding(get: { model.onlineForceQuit != nil && selected == nil && !showSettings },
-                                                                         set: { if !$0 { model.onlineForceQuit = nil } })) {
-                Button("Quit game and Windows Steam", role: .destructive) { Task { await model.stopOnline(force: true) } }
-            } message: {
-                Text("\((model.onlineForceQuit ?? []).joined(separator: ", ")) is still running in Windows Steam. Unwine asks it to close first. Progress you have not saved can be lost.")
             }
         } else if model.online.inUse && !model.onlineStep.isRunning {
             NoticeCard(icon: "globe", color: Palette.warn,
@@ -226,13 +226,21 @@ struct GameTile: View {
             Text("Update in Steam").font(.system(size: 11, weight: .medium)).padding(8)
                 .background(.ultraThinMaterial, in: Capsule()).padding(8)
         case .installed:
-            if hovering {
+            if let step = model.localStarting[game.id] {
+                HStack(spacing: 8) {
+                    UnwineMark(progress: nil, size: 18)
+                    PhaseWords(words: [step, "Windows games start slowly on a Mac"]).font(.system(size: 11, weight: .medium))
+                }
+                .padding(10)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
+                .padding(8)
+            } else if hovering {
                 Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
                     .buttonStyle(PrimaryButtonStyle())
                     .disabled(game.localExe == nil ? model.macSteamBlocked : (model.localStarting[game.id] != nil || model.localRunning.contains(game.id)))
                     .help(game.localExe == nil
                           ? (model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Starts in Steam with this game's settings")
-                          : (model.localRunning.contains(game.id) ? "Already running" : model.localStarting[game.id] ?? "Starts the game without Steam"))
+                          : (model.localRunning.contains(game.id) ? "\(game.name) is running. Open its page to quit it." : model.localStarting[game.id] ?? "Starts the game without Steam"))
                     .padding(12)
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))
             }

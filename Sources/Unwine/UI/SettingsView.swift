@@ -111,7 +111,7 @@ struct SettingsView: View {
                                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
                             Toggle("Games fill the whole screen", isOn: $model.stored.onlineFillScreen)
                                 .onChange(of: model.stored.onlineFillScreen) { OnlineSteam.fillScreen = model.stored.onlineFillScreen; model.save() }
-                            Text("On: a full-screen game takes the whole display, so the Dock and menu bar cannot cover it, and macOS can turn on Game Mode. Other windows and notifications stay hidden while the game is in front; Cmd-Tab leaves it. Applies the next time Windows Steam starts.")
+                            Text("On: a full-screen game takes over the display, so the Dock and menu bar cannot cover it, and macOS can more often turn on Game Mode. While the game is in front, other windows, notifications and any other displays go dark; Cmd-Tab leaves it. Applies the next time Windows Steam starts.")
                                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
                             Toggle("Game Mode for games in Windows Steam (experimental)", isOn: $model.stored.onlineGameMode)
                                 .onChange(of: model.stored.onlineGameMode) { OnlineSteam.gameModeForGames = model.stored.onlineGameMode; model.save() }

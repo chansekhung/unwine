@@ -39,8 +39,14 @@ enum LocalGames {
 
     /// A readable name from the game's folder ("Romance_of_X_14" becomes "Romance of X 14").
     static func suggestedName(for exe: URL) -> String {
-        let folder = exe.deletingLastPathComponent().lastPathComponent
-        let base = folder.isEmpty || folder == "/" ? exe.deletingPathExtension().lastPathComponent : folder
+        // Folders like bin, x64 or Binaries say nothing about the game: look further up.
+        let generic: Set<String> = ["bin", "bin32", "bin64", "x64", "x86", "win32", "win64", "binaries", "game", "games",
+                                    "release", "retail", "shipping", "debug", "system", "data", "downloads", "desktop", "documents"]
+        var dir = exe.deletingLastPathComponent()
+        for _ in 0..<3 where generic.contains(dir.lastPathComponent.lowercased()) { dir = dir.deletingLastPathComponent() }
+        let folder = dir.lastPathComponent
+        let base = folder.isEmpty || folder == "/" || generic.contains(folder.lowercased())
+            ? exe.deletingPathExtension().lastPathComponent : folder
         return base.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
     }
 
@@ -109,14 +115,20 @@ enum LocalGames {
                 try await Shell.run(engine.wine, ["wineboot", "--init"], env: env, log: log)
                 try await Shell.run(engine.wineserver, ["-w"], env: env, log: log, check: false)
             } catch {
-                throw LocalGamesError.bottle(error.localizedDescription)
+                // A half-made bottle would be used as it is next time: it goes to the Trash.
+                _ = try? await Shell.run(engine.wineserver, ["-k"], env: env, log: log, check: false)
+                try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
+                throw LocalGamesError.bottle("Wine stopped while it set up the bottle. Press Play to try again; if it fails again, Show logs on the game's page says why.")
             }
             guard FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) else {
-                throw LocalGamesError.bottle("Wine made no bottle. The log has the details.")
+                try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
+                throw LocalGamesError.bottle("Wine made no bottle. Press Play to try again; Show logs on the game's page says why.")
             }
             BottleFonts.ensure(prefix: pfx)
         }
 
+        // Read the profile again now: the user may have changed settings while the bottle was made.
+        env = environment(engine: engine, prefix: pfx, profile: profile)
         // The game runs from an app bundle that says "game", so macOS can give it Game Mode. A
         // bundle is only rebuilt while the bottle is closed: running processes use its files.
         await phase("Starting \(game.name)…")

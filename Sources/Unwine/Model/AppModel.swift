@@ -24,6 +24,7 @@ struct StoredState: Codable {
     var onlineFillScreen = false        // games in Windows Steam take the whole display (no Dock over them)
     var presetChoice: [Int: String] = [:]   // the preset last clicked per game, to break ties
     var localGames: [LocalGameRecord] = []  // Windows games the user added by their .exe
+    var lastLocalID = 0                     // the highest id ever given to an added game, so none is reused
 
     init() {}
 
@@ -49,6 +50,7 @@ struct StoredState: Codable {
         onlineFillScreen = (try? c.decodeIfPresent(Bool.self, forKey: .onlineFillScreen)) ?? false
         presetChoice = (try? c.decodeIfPresent([Int: String].self, forKey: .presetChoice)) ?? [:]
         localGames = (try? c.decodeIfPresent([LocalGameRecord].self, forKey: .localGames)) ?? []
+        lastLocalID = (try? c.decodeIfPresent(Int.self, forKey: .lastLocalID)) ?? 0
     }
 }
 
@@ -179,6 +181,7 @@ final class AppModel {
     private var onlineGoneTicks = 0
     private var tickCount = 0
     private var fontsChecked = Set<String>()    // bottles already given the font stand-ins this run
+    private var localLogs: [Int: LogFile] = [:]   // one writer per added game's log
     private var lastHighballCheck = Date()
     private var runnerNeedsRefresh = false  // the runner is from an older Unwine and was in use at launch
 
@@ -566,8 +569,9 @@ final class AppModel {
         guard case .installed = game.state else { return }
         // A newer analyzer reads games better, so its results replace older ones at once.
         if let a = stored.analyses[game.id], a.isCurrent, Date().timeIntervalSince(a.analyzedAt) < 7 * 86_400 { return }
-        let dir = game.installDir
-        let result = await Task.detached(priority: .utility) { GameAnalyzer.analyze(installDir: dir) }.value
+        let dir = game.installDir, exe = game.localExe
+        let result = await Task.detached(priority: .utility) { GameAnalyzer.analyze(installDir: dir, mainExe: exe) }.value
+        guard games.contains(where: { $0.id == game.id }) else { return }   // removed while it was being read
         stored.analyses[game.id] = result
         save()
         writeProfile(for: game.id)
@@ -600,14 +604,15 @@ final class AppModel {
 
     /// Applies one of the advisor's setting sets. The layer goes back to Automatic (which is the
     /// advised layer), and the Metal overlay stays as the user set it: it is a display choice.
-    /// The Metal overlay, Low latency and background shader building stay as the user set them:
-    /// they are the user's choices, not speed or battery settings.
+    /// The Metal overlay, Low latency, background shader building and 120 fps mode stay as the user
+    /// set them: they are the user's choices, not speed or battery settings.
     func apply(_ preset: Preset, to game: SteamGame) {
         let now = settings(for: game.id)
         var s = settings(preset, for: game, advice: advice(for: game))
         s.metalHUD = now.metalHUD
         s.lowLatency = now.lowLatency
         s.asyncShaders = now.asyncShaders
+        s.fps120 = now.fps120
         stored.games[game.id] = s
         stored.presetChoice[game.id] = preset.rawValue
         save()
@@ -629,6 +634,7 @@ final class AppModel {
             s.metalHUD = false
             s.lowLatency = false
             s.asyncShaders = true
+            s.fps120 = false
             if !(real == .d3dmetal && gptk4) { s.metal4 = true }
             if real == .wined3d || (real == .d3dmetal && !gptk4) || (real == .dxvk && api == .dx12) { s.fpsCap = nil }
             if !((api == .dx11 || api == .dx12) && (real == .d3dmetal || real == .dxmt)) { s.metalFX = false }
@@ -747,7 +753,8 @@ final class AppModel {
             banner = "\(known.name) is already in your library."
             return
         }
-        let id = max(LocalGames.idBase, (stored.localGames.map(\.id).max() ?? LocalGames.idBase)) + 1
+        let id = max(LocalGames.idBase, stored.lastLocalID, stored.localGames.map(\.id).max() ?? 0) + 1
+        stored.lastLocalID = id
         // Named after the folder the user picked, else the folder the program sits in.
         let name = folder.map { $0.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces) }
             .flatMap { $0.isEmpty ? nil : $0 } ?? LocalGames.suggestedName(for: exe)
@@ -756,7 +763,10 @@ final class AppModel {
         save()
         let game = LocalGames.game(from: record)
         games.append(game)
-        banner = "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
+        let lower = exe.lastPathComponent.lowercased()
+        banner = ["setup", "install", "unins"].contains(where: lower.contains)
+            ? "\(record.name) looks like an installer. Play runs it inside the game's own bottle. When it finishes, use Add game again and pick the installed program (Unwine's LocalGames folder holds the bottle)."
+            : "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
         Task { await analyze(game) }
     }
 
@@ -778,6 +788,17 @@ final class AppModel {
         banner = "\(game.name) is out of your library. Its files stay in \(game.installDir.path)."
     }
 
+    /// Points an added game at its program's new place (moved folder, other drive), keeping its bottle.
+    func relocateLocalGame(_ id: Int, exe: URL) {
+        guard let i = stored.localGames.firstIndex(where: { $0.id == id }) else { return }
+        stored.localGames[i].exePath = exe.path
+        stored.analyses[id] = nil
+        save()
+        if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
+        banner = "\(stored.localGames[i].name) now starts \(exe.lastPathComponent) from \(exe.deletingLastPathComponent().path)."
+        if let g = games.first(where: { $0.id == id }) { Task { await analyze(g) } }
+    }
+
     func renameLocalGame(_ id: Int, to name: String) {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, let i = stored.localGames.firstIndex(where: { $0.id == id }) else { return }
@@ -786,23 +807,44 @@ final class AppModel {
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
     }
 
+    private func localLog(_ id: Int) -> LogFile {
+        if let log = localLogs[id] { return log }
+        let log = LogFile(LocalGames.logName(id))
+        localLogs[id] = log
+        return log
+    }
+
     private func playLocal(_ game: SteamGame) async {
         guard let engine else { banner = "Unwine's engine is not set up yet."; return }
         guard localStarting[game.id] == nil else { return }
         if localRunning.contains(game.id) { banner = "\(game.name) is already running."; return }
         localStarting[game.id] = "Getting \(game.name) ready…"
         defer { localStarting[game.id] = nil }
+        // The first start waits for the file check, so the settings fit the game.
+        if stored.analyses[game.id] == nil { await analyze(game) }
         writeProfile(for: game.id)
-        let log = LogFile(LocalGames.logName(game.id))
+        let log = localLog(game.id)
         do {
             try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: game.id), log: log,
                                        phase: { [weak self] words in self?.localStarting[game.id] = words },
                                        onExit: { status in log.line("The game's process ended with status \(status)") })
-            // Wait for the game to show a window, so the waiting screen covers the slow part.
-            for _ in 0..<90 {
-                if await Task.detached(operation: { LocalGames.isRunning(game) }).value { localRunning.insert(game.id) }
-                if let pid = Self.windowOwner(prefix: LocalGames.prefix(game)) { bringToFront(pid); break }
+            // Wait for the game to show a window, so the waiting screen covers the slow part. Stop
+            // when the bottle closes (the game ended), and after 15 s accept a small window too: it
+            // can be a question or an error the user must see.
+            var seenAlive = false, ended = false, shown = false
+            for second in 0..<90 {
+                let alive = await Task.detached(operation: { LocalGames.isRunning(game) }).value
+                if alive { seenAlive = true; localRunning.insert(game.id) }
+                if let pid = Self.windowOwner(prefix: LocalGames.prefix(game), small: second >= 15) { bringToFront(pid); shown = true; break }
+                if !alive && (seenAlive || second >= 10) { ended = true; break }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            if ended {
+                localRunning.remove(game.id)
+                banner = "\(game.name) closed before it showed a window. On its page, Show logs says why."
+                log.line("The game closed before it showed a window")
+            } else if !shown {
+                banner = "\(game.name) is still starting. Its window shows soon, or Show logs on its page says what it is doing."
             }
         } catch {
             banner = "\(game.name) did not start: \(error.localizedDescription)"
@@ -815,17 +857,19 @@ final class AppModel {
         guard let engine else { return }
         localStarting[game.id] = "Closing \(game.name)…"
         defer { localStarting[game.id] = nil }
-        await LocalGames.stop(game, engine: engine, log: LogFile(LocalGames.logName(game.id)))
+        await LocalGames.stop(game, engine: engine, log: localLog(game.id))
         await refreshSteam()
     }
 
-    /// The process of this bottle that shows a real window, once there is one.
-    nonisolated private static func windowOwner(prefix: URL) -> pid_t? {
+    /// The process of this bottle that shows a real window, once there is one. With `small`, a small
+    /// window (a question or an error box) counts too.
+    nonisolated private static func windowOwner(prefix: URL, small: Bool = false) -> pid_t? {
         let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         let path = prefix.path
         for w in windows {
             guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, w[kCGWindowLayer as String] as? Int == 0,
-                  let b = w[kCGWindowBounds as String] as? [String: Double], (b["Width"] ?? 0) >= 300, (b["Height"] ?? 0) >= 200
+                  let b = w[kCGWindowBounds as String] as? [String: Double],
+                  (b["Width"] ?? 0) >= (small ? 120 : 300), (b["Height"] ?? 0) >= (small ? 80 : 200)
             else { continue }
             if processUsesPrefix(pid, path) { return pid }
         }
@@ -915,7 +959,10 @@ final class AppModel {
         }
         if steamUp, let last = stored.onlineEnvHash, last != hash, restart == true {
             onlineWords = ["Restarting Windows Steam with this game's settings…", "Steam Cloud saves sync first"]
-            if case .gamesRunning(let names) = await OnlineSteam.shutdown(engine: engine, force: false) {
+            onlineClosing = true
+            let result = await OnlineSteam.shutdown(engine: engine, force: false)
+            onlineClosing = false
+            if case .gamesRunning(let names) = result {
                 banner = "\(names.joined(separator: ", ")) is still running in Windows Steam. Quit it first, then press Play online again."
                 return
             }
@@ -935,9 +982,12 @@ final class AppModel {
                                       : ["Starting Windows Steam…", "Steam checks for its own updates…", "Starting \(game!.name)…",
                                          "VAC checks the game", "The game window opens soon"]
             if !steamUp {
-                await OnlineSteam.applyDisplaySettings(engine: engine)
+                if !(await OnlineSteam.applyDisplaySettings(engine: engine)) {
+                    banner = "Something still ran in Windows Steam's bottle, so High Resolution Mode and full screen apply the next time it fully closes."
+                }
                 try OnlineSteam.shareGames(onlineGames(adding: game))
             }
+            let before = await Task.detached(priority: .userInitiated, operation: { OnlineSteam.windowOwners() }).value
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
             if !steamUp {
                 stored.onlineEnvHash = hash
@@ -949,9 +999,17 @@ final class AppModel {
             // built-in web browser, so this takes up to a minute or more. The words keep moving all
             // that time, and a second click cannot start Steam twice.
             var shown = false, stopped = false
-            let gameOnly = game != nil
             for second in 0..<240 {
-                if let pid = await Task.detached(priority: .userInitiated, operation: { OnlineSteam.windowOwner(gameOnly: gameOnly) }).value {
+                // A window from a process that had none before. For a game, Steam's own windows count
+                // after 20 s: Steam may be asking something (a launch option, a cloud conflict, a sign-in).
+                let now = await Task.detached(priority: .userInitiated, operation: { OnlineSteam.windowOwners() }).value
+                let fresh = now.subtracting(before)
+                let pick = await Task.detached(priority: .userInitiated, operation: { () -> pid_t? in
+                    let games = fresh.filter { !OnlineSteam.isSteamProcess($0) }
+                    if let g = games.first { return g }
+                    return (game == nil || second >= 20) ? fresh.first : nil
+                }).value
+                if let pid = pick {
                     shown = true
                     bringToFront(pid)
                     break
@@ -1015,7 +1073,7 @@ final class AppModel {
     /// Closes Windows Steam now instead of waiting for Steam Cloud to finish syncing.
     func hurryOnlineQuit() {
         guard onlineClosing else { return }
-        onlineWords = ["Closing Windows Steam now…"]
+        onlineWords = ["Closing Windows Steam now…", "Ending its last programs…"]
         OnlineSteam.hurryShutdown()
     }
 
@@ -1023,8 +1081,19 @@ final class AppModel {
     /// game started in the background otherwise shows its window without getting the keyboard.
     func bringToFront(_ pid: pid_t) {
         guard let app = NSRunningApplication(processIdentifier: pid) else { return }
-        NSApp.yieldActivation(to: app)
-        _ = app.activate(from: NSRunningApplication.current, options: [])
+        if NSApp.isActive {
+            NSApp.yieldActivation(to: app)
+            _ = app.activate(from: NSRunningApplication.current, options: [])
+        } else if let bundle = app.bundleURL, bundle.path.contains("/notproton/launchers/") {
+            // Another app (Mac Steam) is in front, and only the front app may hand over the keyboard.
+            // Opening the game's own launcher app asks macOS to bring it forward instead.
+            let config = NSWorkspace.OpenConfiguration()
+            config.activates = true
+            config.createsNewApplicationInstance = false
+            NSWorkspace.shared.openApplication(at: bundle, configuration: config) { _, _ in }
+        } else {
+            _ = app.activate(options: [])
+        }
     }
 
     func removeOnline() {
@@ -1119,8 +1188,8 @@ final class AppModel {
                 if NtdllPatcher.supports(wineLib: next.wineDir.appendingPathComponent("lib/wine")) {
                     stored.stagedEngine = next.folder
                     save()
-                    if gameRunning || OnlineSteam.isInUse {
-                        notes.append("New engine \(next.wineVersion) is ready. Unwine switches to it after your game and Windows Steam close.")
+                    if gameRunning || OnlineSteam.isInUse || !localRunning.isEmpty {
+                        notes.append("New engine \(next.wineVersion) is ready. Unwine switches to it after your games and Windows Steam close.")
                     } else {
                         await activateStagedEngine()
                         notes.append(updateNote ?? "")
@@ -1151,7 +1220,7 @@ final class AppModel {
         guard let folder = stored.stagedEngine,
               let next = EngineStore.installed().first(where: { $0.folder == folder }) else { stored.stagedEngine = nil; return }
         // Online mode's bottle runs on the engine itself, so it must be closed as well.
-        guard !Runner.isInUse(), !OnlineSteam.isInUse, localRunning.isEmpty else { return }
+        guard !Runner.isInUse(), !OnlineSteam.isInUse, localRunning.isEmpty else { return }   // waits for every game
         do {
             RendererPatches.prepare(engine: next, log: log)
             try await Runner.build(engine: next, d3dmetal: d3dmetal, log: log)

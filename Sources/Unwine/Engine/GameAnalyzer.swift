@@ -119,7 +119,9 @@ enum GameAnalyzer {
         folders.contains { $0 == "redist" || $0 == "_commonredist" || $0.hasPrefix("directx") }
     }
 
-    static func analyze(installDir: URL) -> GameAnalysis {
+    /// `mainExe` is the program the user picked for a game added by its .exe: it is read first, so
+    /// the facts and advice describe it rather than the biggest .exe nearby.
+    static func analyze(installDir: URL, mainExe: URL? = nil) -> GameAnalysis {
         let fm = FileManager.default
         var exes: [(url: URL, size: Int)] = []
         var rendererDLLs: [URL] = []
@@ -174,7 +176,12 @@ enum GameAnalyzer {
 
         // The biggest real executable is almost always the game.
         exes.sort { $0.size > $1.size }
-        let candidates = Array(exes.prefix(3))
+        var candidates = Array(exes.prefix(3))
+        if let mainExe {
+            let size = ((try? mainExe.resourceValues(forKeys: [.fileSizeKey]))?.fileSize) ?? 0
+            candidates.removeAll { $0.url.standardizedFileURL == mainExe.standardizedFileURL }
+            candidates.insert((mainExe, size), at: 0)
+        }
         var imports = Set<String>()
         var is64 = true
         for (i, c) in candidates.enumerated() {

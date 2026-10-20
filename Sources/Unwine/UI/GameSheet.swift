@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct GameSheet: View {
     @Environment(AppModel.self) private var model
@@ -7,6 +8,9 @@ struct GameSheet: View {
     @State private var confirmReset = false
     @State private var confirmOnlineSetup = false
     @State private var confirmRemove = false
+    @State private var locating = false
+    @State private var renaming = false
+    @State private var newName = ""
 
     private var game: SteamGame? { model.games.first { $0.id == gameID } }
 
@@ -60,7 +64,7 @@ struct GameSheet: View {
                         Button { Task { await model.stopLocal(game) } } label: { Label("Quit game", systemImage: "stop.fill") }
                             .buttonStyle(QuietButtonStyle())
                             .disabled(model.localStarting[game.id] != nil)
-                            .help("Ends everything running in this game's Windows bottle. Save in the game first.")
+                            .help(model.localStarting[game.id] ?? "Ends everything running in this game's Windows bottle. Save in the game first.")
                     } else if isLocal {
                         Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
                             .buttonStyle(PrimaryButtonStyle())
@@ -89,17 +93,21 @@ struct GameSheet: View {
                     if let step = model.localStarting[game.id] {
                         HStack(spacing: 10) {
                             UnwineMark(progress: nil, size: 22)
-                            PhaseWords(words: [step, "Windows games start slowly on a Mac", "The game's window opens soon"])
+                            PhaseWords(words: step.hasPrefix("Closing") ? [step, "Ending the game's programs…"]
+                                                                       : [step, "Windows games start slowly on a Mac", "The game's window opens soon"])
                                 .font(.system(size: 12)).foregroundStyle(Palette.glow)
                         }
                     }
                     if isLocal, let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {
                         NoticeRow(color: Palette.warn, icon: "questionmark.folder",
-                                  text: "Unwine cannot find \(exe.lastPathComponent) in \(exe.deletingLastPathComponent().path) anymore. Remove the game here, then add it again from where it is now.")
+                                  text: "Unwine cannot find \(exe.lastPathComponent) in \(exe.deletingLastPathComponent().path). If the game moved, or its drive is not connected, point Unwine at it again. Its bottle and saves stay.") {
+                            Button("Locate…") { locating = true }.buttonStyle(QuietButtonStyle())
+                                .help("Pick the game's program where it is now")
+                        }
                     }
                     if game.bottleIncomplete {
                         NoticeRow(color: Palette.warn, icon: "wrench.and.screwdriver",
-                                  text: "This game's Windows bottle is incomplete: its 32-bit part is missing, so the game and its launcher quit at once. A fresh bottle fixes it. Steam Cloud saves stay.") {
+                                  text: "This game's Windows bottle is incomplete: its 32-bit part is missing, so the game and its launcher quit at once. A fresh bottle fixes it.\(isLocal ? " Saves the game keeps in its own folder stay." : " Steam Cloud saves stay.")") {
                             Button("Fresh bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
                         }
                     }
@@ -172,6 +180,8 @@ struct GameSheet: View {
                         } else {
                             hint("Off lets the game run as fast as it can. A cap saves battery and heat; pick a value that divides your screen's refresh rate.")
                         }
+                        Toggle("120 fps mode (DirectX 10 and 11)", isOn: binding(game.id, \.fps120))
+                        note(fps120Note(game, s, analysis, resolved), warn: s.fps120 && !fps120Works(game, s))
                         Toggle("Low latency (DXVK)", isOn: binding(game.id, \.lowLatency))
                         let lowers = model.canLowerLatency(game)
                         note(lowers
@@ -210,7 +220,10 @@ struct GameSheet: View {
                             Button("Reset settings") { model.resetSettings(game.id) }.buttonStyle(QuietButtonStyle())
                                 .help("Back to Unwine's defaults for new games")
                             Button("Fresh Windows bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
-                                .help("Moves this game's Windows bottle to the Trash. Steam builds a new one on next Play.")
+                                .disabled(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id)))
+                                .help(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
+                                      ? "Quit the game first"
+                                      : "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
                             Button("Show logs") {
                                 NSWorkspace.shared.activateFileViewerSelecting([game.runLog, game.wineLog].filter { FileManager.default.fileExists(atPath: $0.path) })
                             }
@@ -220,9 +233,12 @@ struct GameSheet: View {
                         }
                         HStack(spacing: 8) {
                             if isLocal {
+                                Button("Rename…") { newName = game.name; renaming = true }.buttonStyle(QuietButtonStyle())
+                                    .help("Change the name Unwine shows for this game")
                                 Button("Remove from Unwine…") { confirmRemove = true }.buttonStyle(QuietButtonStyle())
-                                    .disabled(model.localRunning.contains(game.id))
-                                    .help(model.localRunning.contains(game.id) ? "Quit the game first" : "Asks first. The game's own files stay where they are.")
+                                    .disabled(model.localRunning.contains(game.id) || model.localStarting[game.id] != nil)
+                                    .help(model.localRunning.contains(game.id) || model.localStarting[game.id] != nil
+                                          ? "Quit the game first" : "Asks first. The game's own files stay where they are.")
                             } else {
                                 Button("Show in Steam") { model.showInSteam(game.id) }.buttonStyle(QuietButtonStyle())
                                     .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens this game's page in Mac Steam")
@@ -283,7 +299,17 @@ struct GameSheet: View {
         .confirmationDialog("Remove \(game.name) from Unwine?", isPresented: $confirmRemove) {
             Button("Remove", role: .destructive) { model.removeLocalGame(game); dismiss() }
         } message: {
-            Text("The game's own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the game kept inside it, goes to the Trash.")
+            Text(game.installDir.path.hasPrefix(game.compatData.path)
+                 ? "This game was installed inside its Windows bottle, so the game itself goes to the Trash with the bottle."
+                 : "The game's own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the game kept inside it, goes to the Trash.")
+        }
+        .fileImporter(isPresented: $locating, allowedContentTypes: [UTType(filenameExtension: "exe") ?? .data]) { result in
+            if case .success(let url) = result { model.relocateLocalGame(game.id, exe: url) }
+        }
+        .alert("Rename \(game.name)", isPresented: $renaming) {
+            TextField("Name", text: $newName)
+            Button("Rename") { model.renameLocalGame(game.id, to: newName) }
+            Button("Cancel", role: .cancel) {}
         }
     }
 
@@ -348,6 +374,22 @@ struct GameSheet: View {
             return "Works only with the D3DMetal layer. This game uses \(resolved.title) now, so this switch does nothing."
         }
         return "GPTK 4's newest path. Usually faster; turn off if this game crashes."
+    }
+
+    /// 120 fps mode sets DXMT's DirectX 10/11 pacing, so it reaches the games MetalFX sharpening
+    /// reaches. The user's own frame cap wins, and a 60 Hz screen has nothing more to show.
+    private func fps120Works(_ game: SteamGame, _ s: GameSettings) -> Bool {
+        model.canSharpen(game) && s.fpsCap == nil && Profiles.screenHz > 60
+    }
+
+    private func fps120Note(_ game: SteamGame, _ s: GameSettings, _ a: GameAnalysis?, _ resolved: Renderer) -> String {
+        let hz = Profiles.screenHz
+        if !model.canSharpen(game) {
+            return "Works only where DXMT draws DirectX 10 and 11. This game uses \(resolved.title)\(a.map { " for \($0.api.label)" } ?? ""), so this switch does nothing."
+        }
+        if hz <= 60 { return "Your screen shows at most \(hz) frames a second, so this switch does nothing here." }
+        if let cap = s.fpsCap { return "Your frame rate cap (\(cap) fps) wins, so this switch does nothing. Set the cap to Off to use it." }
+        return "Some games ask for a 60 Hz full screen. Your screen stays at \(hz) Hz, but DXMT then holds the game at 60 fps. On: DXMT paces to \(hz) Hz instead. It only helps if the game can make more than 60 frames a second, and it costs battery and heat. A game in a window, or set to \(hz) Hz in its own menu, gets \(hz) already. It also holds games with V-Sync off at \(hz). If the game runs too fast, turn this off."
     }
 
     /// Why Play online cannot start now, or nil when it can.
@@ -445,6 +487,11 @@ struct GameSheet: View {
                 HStack(spacing: 10) {
                     UnwineMark(progress: nil, size: 20)
                     PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
+                    if model.onlineClosing {
+                        Spacer()
+                        Button("Close now") { model.hurryOnlineQuit() }.buttonStyle(QuietButtonStyle())
+                            .help("Ends Windows Steam without waiting. Steam Cloud may not finish saving this session.")
+                    }
                 }
             }
         }
@@ -548,7 +595,7 @@ private struct PresetCard: View {
         .buttonStyle(.plain)
         .foregroundStyle(Palette.text)
         .help(active ? "Already in use"
-              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your Metal overlay and Low latency choices stay. Applies the next time the game starts.")
+              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your Metal overlay, Low latency and 120 fps mode choices stay. Applies the next time the game starts.")
     }
 }
 

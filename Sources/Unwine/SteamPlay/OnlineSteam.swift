@@ -54,6 +54,29 @@ enum OnlineSteam {
     /// minute after steam.exe starts. Window owners and sizes need no screen-recording permission.
     static var hasWindow: Bool { windowOwner(gameOnly: false) != nil }
 
+    /// Every process of the bottle that shows a real window now.
+    static func windowOwners() -> Set<pid_t> {
+        let pids = Set(bottleProcesses().map(\.pid))
+        guard !pids.isEmpty else { return [] }
+        let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        var out = Set<pid_t>()
+        for w in windows {
+            guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
+                  w[kCGWindowLayer as String] as? Int == 0,
+                  let bounds = w[kCGWindowBounds as String] as? [String: Double],
+                  (bounds["Width"] ?? 0) >= 300, (bounds["Height"] ?? 0) >= 200 else { continue }
+            out.insert(pid)
+        }
+        return out
+    }
+
+    /// True for the bottle's own Steam processes (client, web views, overlay, helpers).
+    static func isSteamProcess(_ pid: pid_t) -> Bool {
+        let steamParts = ["steamwebhelper", "gameoverlayui", "steamerrorreporter", "steamservice", "explorer.exe"]
+        guard let line = bottleProcesses().first(where: { $0.pid == pid })?.commandLine else { return false }
+        return isSteamClient(line) || steamParts.contains { line.lowercased().contains($0) }
+    }
+
     /// The process of the bottle that shows a real window, or nil. With `gameOnly`, Windows Steam's
     /// own windows (its client, web views, overlay, crash reporter) do not count, so a game started
     /// in a Steam that is already open is found when the game itself shows up.
@@ -226,26 +249,29 @@ enum OnlineSteam {
 
     /// Writes the High Resolution Mode choice into the bottle when it differs. Only while the bottle
     /// is closed: Wine reads it when a process starts, and saves the registry when its server quits.
-    static func applyDisplaySettings(engine: InstalledEngine) async {
+    /// Returns false when the bottle was busy and the settings could not be written yet.
+    @discardableResult
+    static func applyDisplaySettings(engine: InstalledEngine) async -> Bool {
         let want = highResolution ? "y" : "n"
         let userReg = prefix.appendingPathComponent("user.reg")
         let saved = (try? Data(contentsOf: userReg)).map { String(decoding: $0, as: UTF8.self) } ?? ""
         let fills = saved.contains("\"CaptureDisplaysForFullscreen\"=\"y\"")
-        guard isInstalled, !saved.contains("\"RetinaMode\"=\"\(want)\"") || fills != fillScreen else { return }
+        guard isInstalled, !saved.contains("\"RetinaMode\"=\"\(want)\"") || fills != fillScreen else { return true }
         // Just after Steam quits, Wine's server can take a few seconds to go.
         for _ in 0..<15 where isInUse { await pause(1000) }
-        guard !isInUse else { log.line("High Resolution Mode changes the next time the bottle closes."); return }
+        guard !isInUse else { log.line("The display settings change the next time the bottle closes."); return false }
         var env = makeEnvironment(engine: engine, profile: nil).env
         env["WINELOADER"] = engine.wine.path
         let regFile = prefix.appendingPathComponent("drive_c/unwine-display.reg")
-        do { try displaySettings(highResolution: highResolution, fillScreen: fillScreen).write(to: regFile) } catch { return }
+        do { try displaySettings(highResolution: highResolution, fillScreen: fillScreen).write(to: regFile) } catch { return false }
         defer { try? FileManager.default.removeItem(at: regFile) }
         await run(engine.wine, ["regedit", "/S", #"C:\unwine-display.reg"#], env: env, timeout: .seconds(2 * 60))
         await run(engine.wineserver, ["-w"], env: env, timeout: .seconds(3 * 60))
         let now = (try? Data(contentsOf: userReg)).map { String(decoding: $0, as: UTF8.self) } ?? ""
-        log.line(now.contains("\"RetinaMode\"=\"\(want)\"")
-                 ? "High Resolution Mode is \(highResolution ? "on" : "off"), and games \(fillScreen ? "take" : "do not take") the whole screen"
-                 : "Warning: the display settings did not take in the bottle.")
+        let took = now.contains("\"RetinaMode\"=\"\(want)\"")
+        log.line(took ? "High Resolution Mode is \(highResolution ? "on" : "off"), and games \(fillScreen ? "take" : "do not take") the whole screen"
+                      : "Warning: the display settings did not take in the bottle.")
+        return took
     }
 
     private static func displaySettings(highResolution: Bool, fillScreen: Bool) -> Data {
@@ -617,7 +643,7 @@ enum OnlineSteam {
                 if !applied.skipped.isEmpty {
                     notes.append("Unwine skipped profile lines it cannot read: \(applied.skipped.joined(separator: ", ")).")
                 }
-                if dxmtCaps(env) { notes.append("The frame cap also applies to Windows Steam's own windows.") }
+                if dxmtCaps(env) { notes.append("The frame cap or 120 fps mode also applies to Windows Steam's own windows.") }
                 if env["MTL_HUD_ENABLED"] == "1" { notes.append("The Metal HUD also shows on Windows Steam's own windows.") }
                 if env["DXMT_METALFX_SPATIAL_SWAPCHAIN"] == "1" { notes.append("MetalFX upscaling also applies to Windows Steam's own windows.") }
             } else {
@@ -1061,7 +1087,7 @@ enum OnlineSteam {
         }
         if isRunning {
             log.line("Asking Windows Steam to quit")
-            await run(loader, [steamExe, "-shutdown"], env: env, cwd: steamDir, timeout: .seconds(60), cancellable: false)
+            await run(loader, [steamExe, "-shutdown"], env: env, cwd: steamDir, timeout: .seconds(60), cancellable: false, hurryable: true)
             let clock = SuspendingClock()
             let deadline = clock.now.advanced(by: .seconds(180))
             while isRunning, clock.now < deadline, !state.hurry { await pause(1000) }
@@ -1181,7 +1207,8 @@ enum OnlineSteam {
             // Cheap first look: Wine's processes all run a file named wine.
             let length = Int(proc_pidpath(pid, &path, UInt32(path.count)))
             guard length > 0, String(decoding: path.prefix(length), as: UTF8.self).split(separator: "/").last?.hasPrefix("wine") == true,
-                  let info = processArguments(pid), homes.contains(where: info.executable.hasPrefix) else { continue }
+                  let info = processArguments(pid), homes.contains(where: info.executable.hasPrefix),
+                  info.environment.contains("WINEPREFIX=" + prefix.path) else { continue }
             out.append((pid, info.arguments.filter { !$0.isEmpty }.joined(separator: " ")))
         }
         return out
@@ -1308,7 +1335,7 @@ enum OnlineSteam {
     /// Returns the exit code, or nil when the tool had to be stopped.
     @discardableResult
     private static func run(_ exe: URL, _ args: [String], env: [String: String], cwd: URL? = nil,
-                            timeout: Duration, cancellable: Bool = true) async -> Int32? {
+                            timeout: Duration, cancellable: Bool = true, hurryable: Bool = false) async -> Int32? {
         let process: Process
         do {
             process = try Shell.spawn(exe, args, env: env, cwd: cwd, log: log)
@@ -1319,7 +1346,7 @@ enum OnlineSteam {
         let clock = SuspendingClock()
         let deadline = clock.now.advanced(by: timeout)
         while process.isRunning {
-            let cancelled = cancellable && Task.isCancelled
+            let cancelled = (cancellable && Task.isCancelled) || (hurryable && state.hurry)
             if cancelled || clock.now >= deadline {
                 log.line(cancelled ? "Stopped \(exe.lastPathComponent)." : "\(exe.lastPathComponent) took too long and was stopped.")
                 process.terminate()
