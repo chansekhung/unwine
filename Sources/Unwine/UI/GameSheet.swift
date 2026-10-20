@@ -389,7 +389,7 @@ struct GameSheet: View {
         }
         if hz <= 60 { return "Your screen shows at most \(hz) frames a second, so this switch does nothing here." }
         if let cap = s.fpsCap { return "Your frame rate cap (\(cap) fps) wins, so this switch does nothing. Set the cap to Off to use it." }
-        return "Some games ask for a 60 Hz full screen. Your screen stays at \(hz) Hz, but DXMT then holds the game at 60 fps. On: DXMT paces to \(hz) Hz instead. It only helps if the game can make more than 60 frames a second, and it costs battery and heat. A game in a window, or set to \(hz) Hz in its own menu, gets \(hz) already. It also holds games with V-Sync off at \(hz). If the game runs too fast, turn this off."
+        return "Some full-screen games ask for 60 Hz, or for a rate your screen does not have, like 75 Hz. Your screen stays at \(hz) Hz, but DXMT then holds the game at 60 fps. On: DXMT paces to \(hz) Hz instead. It only helps if the game can make more than 60 frames a second, and it costs battery and heat. A game in a window, or set to \(hz) Hz in its own menu, gets \(hz) already. It also holds games with V-Sync off at \(hz). If the game runs too fast, turn this off."
     }
 
     /// Why Play online cannot start now, or nil when it can.

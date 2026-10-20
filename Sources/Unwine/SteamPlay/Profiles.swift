@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 /// What the user picked for one game. Stored in Unwine's settings; turned into a shell
 /// profile the runner wrappers read at every launch, so changes apply next time the game starts.
@@ -14,6 +14,7 @@ struct GameSettings: Codable, Equatable, Sendable {
     var fpsCap: Int? = nil
     var lowLatency = false              // DXVK's latency sleep, a Reflex-like wait before the game reads input
     var asyncShaders = true             // DirectX 8/9: build new shaders in the background, never stop the game for one
+    var fps120 = false                  // 120 fps mode: DXMT paces DirectX 10/11 games to the screen's refresh, not a 60 Hz game mode
 }
 
 extension GameSettings {
@@ -32,6 +33,7 @@ extension GameSettings {
         fpsCap = (try? c.decodeIfPresent(Int.self, forKey: .fpsCap)) ?? d.fpsCap
         lowLatency = (try? c.decodeIfPresent(Bool.self, forKey: .lowLatency)) ?? d.lowLatency
         asyncShaders = (try? c.decodeIfPresent(Bool.self, forKey: .asyncShaders)) ?? d.asyncShaders
+        fps120 = (try? c.decodeIfPresent(Bool.self, forKey: .fps120)) ?? d.fps120
     }
 }
 
@@ -93,8 +95,13 @@ enum Profiles {
         else { try? FileManager.default.removeItem(at: url) }
     }
 
+    /// The main screen's top refresh rate: 120 on a ProMotion Mac. Wine shows games this screen
+    /// as its primary one. Profiles are written again at every Play, so a new screen counts then.
+    static var screenHz: Int { NSScreen.screens.first?.maximumFramesPerSecond ?? 60 }
+
     /// The DXVK and DXMT config files a game needs, or nil when Unwine has nothing to set.
-    static func configs(settings s: GameSettings, renderer: Renderer, gameDir: URL?) -> (dxvk: String?, dxmt: String?) {
+    static func configs(settings s: GameSettings, renderer: Renderer, gameDir: URL?,
+                        screenHz: Int = Profiles.screenHz) -> (dxvk: String?, dxmt: String?) {
         func shipped(_ name: String) -> String {
             guard let dir = gameDir, let text = try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8) else { return "" }
             return "# From the game's own \(name):\n\(text)\n"
@@ -109,8 +116,15 @@ enum Profiles {
         }
         var dxmt: [String] = []
         // DXMT runs every layer choice except DXVK, WineD3D and a real D3DMetal (which has its own cap).
-        if renderer == .dxmt || renderer == .auto, let cap = s.fpsCap {
-            dxmt.append("d3d11.preferredMaxFrameRate = \(cap)")
+        if renderer == .dxmt || renderer == .auto {
+            if let cap = s.fpsCap {
+                dxmt.append("d3d11.preferredMaxFrameRate = \(cap)")
+            } else if s.fps120 && screenHz > 60 {
+                // A game in a 60 Hz full-screen mode gets paced to 60 by DXMT, though the Mac screen
+                // stays at its own rate. The user's own cap above wins over this.
+                dxmt.append("# 120 fps mode: pace to the screen's \(screenHz) Hz, not the game's display mode.")
+                dxmt.append("d3d11.preferredMaxFrameRate = \(screenHz)")
+            }
         }
         // A game's own dxvk.conf or dxmt.conf counts too: Unwine's file replaces the game's, so it carries it.
         let header = "# Written by Unwine. Settings from Steam's launch options still apply on top.\n"
