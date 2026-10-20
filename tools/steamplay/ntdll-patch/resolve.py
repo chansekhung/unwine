@@ -339,7 +339,7 @@ def resolve_amd64(pe):
 
 
 def amd64_load_path_rbp(pe, body, hook):
-    """Decant: frame-pointer builds (Sikarugir's llvm-mingw Wine) spill load_path to [rbp - D].
+    """Unwine: frame-pointer builds (Sikarugir's llvm-mingw Wine) spill load_path to [rbp - D].
 
     Returns the equivalent [rsp + N] slot at the hook, or None when the function does not
     follow that shape, so the original heuristic below can try instead.

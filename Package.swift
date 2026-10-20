@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "Decant",
+    name: "Unwine",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "Decant",
-            path: "Sources/Decant",
+            name: "Unwine",
+            path: "Sources/Unwine",
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

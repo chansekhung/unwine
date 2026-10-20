@@ -1,11 +1,11 @@
 #!/bin/bash
-# Builds Decant.app (release, arm64) into dist/ and ad-hoc signs it.
+# Builds Unwine.app (release, arm64) into dist/ and ad-hoc signs it.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="${VERSION:-1.0.0}"
-BUILD="${BUILD:-1}"
-APP="dist/Decant.app"
+VERSION="${VERSION:-1.0.1}"
+BUILD="${BUILD:-2}"
+APP="dist/Unwine.app"
 
 # The macOS 27 SDK turns SwiftUI's @State into a compiler plugin that the Command Line
 # Tools do not ship, so build against the macOS 26 SDK when it is there. The app runs on 27 too.
@@ -14,7 +14,7 @@ for sdk in /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk /Library/Develo
 done
 echo "▸ Compiling (SDK: ${SDKROOT:-default})"
 swift build -c release --arch arm64
-BIN="$(swift build -c release --arch arm64 --show-bin-path)/Decant"
+BIN="$(swift build -c release --arch arm64 --show-bin-path)/Unwine"
 
 echo "▸ Making icon"
 if [ ! -f Resources/AppIcon.icns ] || [ Resources/AppIcon.png -nt Resources/AppIcon.icns ]; then
@@ -30,7 +30,7 @@ fi
 echo "▸ Assembling bundle"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/Decant"
+cp "$BIN" "$APP/Contents/MacOS/Unwine"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -39,12 +39,12 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
   <key>CFBundleDevelopmentRegion</key><string>en</string>
-  <key>CFBundleExecutable</key><string>Decant</string>
+  <key>CFBundleExecutable</key><string>Unwine</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleIdentifier</key><string>app.decant.Decant</string>
+  <key>CFBundleIdentifier</key><string>app.unwine.Unwine</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
-  <key>CFBundleName</key><string>Decant</string>
-  <key>CFBundleDisplayName</key><string>Decant</string>
+  <key>CFBundleName</key><string>Unwine</string>
+  <key>CFBundleDisplayName</key><string>Unwine</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key><string>${BUILD}</string>
@@ -55,8 +55,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
   <key>NSHumanReadableCopyright</key><string>Free software (GPL-3.0). Wine is LGPL. Steam is Valve's.</string>
-  <key>NSDownloadsFolderUsageDescription</key><string>Decant looks for Apple's Game Porting Toolkit file you downloaded, to add GPTK.</string>
-  <key>DecantUpdateRepo</key><string>${DECANT_UPDATE_REPO:-chansekhung/decant}</string>
+  <key>NSDownloadsFolderUsageDescription</key><string>Unwine looks for Apple's Game Porting Toolkit file you downloaded, to add GPTK.</string>
+  <key>UnwineUpdateRepo</key><string>${UNWINE_UPDATE_REPO:-chansekhung/unwine}</string>
 </dict>
 </plist>
 PLIST

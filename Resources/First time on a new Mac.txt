@@ -1,24 +1,24 @@
-DECANT - FIRST TIME ON A NEW MAC
+UNWINE - FIRST TIME ON A NEW MAC
 
-1. Drag Decant into the Applications folder.
+1. Drag Unwine into the Applications folder.
 
-2. Open Decant.
-   macOS may say it "cannot verify" Decant. This is normal for a free app
+2. Open Unwine.
+   macOS may say it "cannot verify" Unwine. This is normal for a free app
    that is not sold through Apple. To allow it:
      - Open System Settings > Privacy & Security.
-     - Scroll down. Click "Open Anyway" next to Decant.
+     - Scroll down. Click "Open Anyway" next to Unwine.
      - Type your Mac password.
 
-3. Click "Start setup". Decant downloads the free engine and the Steam bridge
+3. Click "Start setup". Unwine downloads the free engine and the Steam bridge
    once (about 430 MB). If you have Apple's Game Porting Toolkit 4 file,
-   add it when Decant asks (it is free from Apple with your Apple ID).
+   add it when Unwine asks (it is free from Apple with your Apple ID).
 
-4. Steam Play must be on in your Mac Steam. Decant never changes Steam.app.
+4. Steam Play must be on in your Mac Steam. Unwine never changes Steam.app.
    See NotProton's project page for how Steam Play gets switched on:
    https://github.com/NotProtonNot/NotProton
 
-5. In Steam, install a Windows game. It shows up in Decant, ready to play.
+5. In Steam, install a Windows game. It shows up in Unwine, ready to play.
 
 YOUR GAMES ON A NEW MAC
 Steam keeps your games. Copy your Steam library folder over, or let Steam
-download them again. Decant's per-game settings are rebuilt in a few clicks.
+download them again. Unwine's per-game settings are rebuilt in a few clicks.
