@@ -71,6 +71,12 @@ struct GameSheet: View {
                                 .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Hide this message")
                         }
                     }
+                    if game.bottleIncomplete {
+                        NoticeRow(color: Palette.warn, icon: "wrench.and.screwdriver",
+                                  text: "This game's Windows bottle is incomplete: its 32-bit part is missing, so the game and its launcher quit at once. A fresh bottle fixes it. Steam Cloud saves stay.") {
+                            Button("Fresh bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
+                        }
+                    }
                     if case .publisherBlocked = advice.online {
                         NoticeRow(color: Palette.warn, icon: "nosign",
                                   text: "The publisher blocks this game on macOS, so it will not run here. No compatibility layer changes that, CrossOver included.")

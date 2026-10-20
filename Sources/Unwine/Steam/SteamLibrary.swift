@@ -20,6 +20,16 @@ struct SteamGame: Identifiable, Hashable, Sendable {
     var compatData: URL { steamapps.appendingPathComponent("compatdata/\(id)", isDirectory: true) }
     var runLog: URL { compatData.appendingPathComponent("notproton-run.log") }
     var wineLog: URL { SteamPlayPaths.launchers.appendingPathComponent("\(id)/notproton-wine.log") }
+
+    /// The game's Windows bottle has no 32-bit half (its first start was cut short, or it was copied
+    /// from an unfinished template). 32-bit games and launchers then quit at once ("could not load
+    /// kernel32.dll"). A fresh bottle fixes it.
+    var bottleIncomplete: Bool {
+        let windows = compatData.appendingPathComponent("pfx/drive_c/windows", isDirectory: true)
+        let fm = FileManager.default
+        return fm.fileExists(atPath: windows.appendingPathComponent("system32/kernel32.dll").path)
+            && !fm.fileExists(atPath: windows.appendingPathComponent("syswow64/kernel32.dll").path)
+    }
 }
 
 /// Reads Mac Steam's own library files. No login, no API key, no network.
