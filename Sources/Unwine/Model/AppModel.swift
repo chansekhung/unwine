@@ -704,7 +704,8 @@ final class AppModel {
         Task { [weak self] in
             for _ in 0..<120 {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                if let pid = await Task.detached(operation: { Self.windowOwner(prefix: pfx) }).value {
+                let pids = await Task.detached(operation: { Self.bottlePIDs(prefix: pfx) }).value
+                if let pid = Self.withWindows(pids).first {
                     self?.bringToFront(pid)
                     return
                 }
@@ -829,13 +830,14 @@ final class AppModel {
                                        phase: { [weak self] words in self?.localStarting[game.id] = words },
                                        onExit: { status in log.line("The game's process ended with status \(status)") })
             // Wait for the game to show a window, so the waiting screen covers the slow part. Stop
-            // when the bottle closes (the game ended), and after 15 s accept a small window too: it
-            // can be a question or an error the user must see.
+            // when the bottle closes (the game ended).
             var seenAlive = false, ended = false, shown = false
             for second in 0..<90 {
                 let alive = await Task.detached(operation: { LocalGames.isRunning(game) }).value
                 if alive { seenAlive = true; localRunning.insert(game.id) }
-                if let pid = Self.windowOwner(prefix: LocalGames.prefix(game), small: second >= 15) { bringToFront(pid); shown = true; break }
+                if let pid = Self.withWindows(await Task.detached(operation: { Self.bottlePIDs(prefix: LocalGames.prefix(game)) }).value).first {
+                    bringToFront(pid); shown = true; break
+                }
                 if !alive && (seenAlive || second >= 10) { ended = true; break }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
             }
@@ -861,6 +863,20 @@ final class AppModel {
         await refreshSteam()
     }
 
+    /// The processes, of those given, that opened a window. A Wine program turns into a normal Mac app
+    /// when it shows its first window, even one that Stage Manager keeps as a tile in its strip, so
+    /// this works where looking at window sizes cannot.
+    private static func withWindows(_ pids: [pid_t]) -> Set<pid_t> {
+        Set(pids.filter { NSRunningApplication(processIdentifier: $0)?.activationPolicy == .regular })
+    }
+
+    /// Every process whose Wine bottle is `prefix`.
+    nonisolated private static func bottlePIDs(prefix: URL) -> [pid_t] {
+        var pids = [pid_t](repeating: 0, count: 4096)
+        let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
+        return pids.prefix(max(0, count)).filter { $0 > 0 && processUsesPrefix($0, prefix.path) }
+    }
+
     /// The process of this bottle that shows a real window, once there is one. With `small`, a small
     /// window (a question or an error box) counts too.
     nonisolated private static func windowOwner(prefix: URL, small: Bool = false) -> pid_t? {
@@ -869,7 +885,7 @@ final class AppModel {
         for w in windows {
             guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, w[kCGWindowLayer as String] as? Int == 0,
                   let b = w[kCGWindowBounds as String] as? [String: Double],
-                  (b["Width"] ?? 0) >= (small ? 120 : 300), (b["Height"] ?? 0) >= (small ? 80 : 200)
+                  (b["Width"] ?? 0) >= (small ? 80 : 300), (b["Height"] ?? 0) >= (small ? 80 : 200)
             else { continue }
             if processUsesPrefix(pid, path) { return pid }
         }
@@ -987,7 +1003,7 @@ final class AppModel {
                 }
                 try OnlineSteam.shareGames(onlineGames(adding: game))
             }
-            let before = await Task.detached(priority: .userInitiated, operation: { OnlineSteam.windowOwners() }).value
+            let before = Self.withWindows(await Task.detached(priority: .userInitiated, operation: { OnlineSteam.processIDs() }).value)
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
             if !steamUp {
                 stored.onlineEnvHash = hash
@@ -1000,9 +1016,9 @@ final class AppModel {
             // that time, and a second click cannot start Steam twice.
             var shown = false, stopped = false
             for second in 0..<240 {
-                // A window from a process that had none before. For a game, Steam's own windows count
+                // A process that opened a window since the start. For a game, Steam's own windows count
                 // after 20 s: Steam may be asking something (a launch option, a cloud conflict, a sign-in).
-                let now = await Task.detached(priority: .userInitiated, operation: { OnlineSteam.windowOwners() }).value
+                let now = Self.withWindows(await Task.detached(priority: .userInitiated, operation: { OnlineSteam.processIDs() }).value)
                 let fresh = now.subtracting(before)
                 let pick = await Task.detached(priority: .userInitiated, operation: { () -> pid_t? in
                     let games = fresh.filter { !OnlineSteam.isSteamProcess($0) }

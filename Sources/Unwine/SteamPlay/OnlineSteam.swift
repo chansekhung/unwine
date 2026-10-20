@@ -54,7 +54,9 @@ enum OnlineSteam {
     /// minute after steam.exe starts. Window owners and sizes need no screen-recording permission.
     static var hasWindow: Bool { windowOwner(gameOnly: false) != nil }
 
-    /// Every process of the bottle that shows a real window now.
+    /// Every process of the bottle that shows a window now. Small ones count: Stage Manager shows a
+    /// window of an app that is not in front as a small tile in its strip. Wine's hidden helper
+    /// windows are off screen, and its menu-bar strip is too thin to count.
     static func windowOwners() -> Set<pid_t> {
         let pids = Set(bottleProcesses().map(\.pid))
         guard !pids.isEmpty else { return [] }
@@ -64,11 +66,14 @@ enum OnlineSteam {
             guard let pid = w[kCGWindowOwnerPID as String] as? pid_t, pids.contains(pid),
                   w[kCGWindowLayer as String] as? Int == 0,
                   let bounds = w[kCGWindowBounds as String] as? [String: Double],
-                  (bounds["Width"] ?? 0) >= 300, (bounds["Height"] ?? 0) >= 200 else { continue }
+                  (bounds["Width"] ?? 0) >= 80, (bounds["Height"] ?? 0) >= 80 else { continue }
             out.insert(pid)
         }
         return out
     }
+
+    /// Every process of the bottle.
+    static func processIDs() -> [pid_t] { bottleProcesses().map(\.pid) }
 
     /// True for the bottle's own Steam processes (client, web views, overlay, helpers).
     static func isSteamProcess(_ pid: pid_t) -> Bool {
