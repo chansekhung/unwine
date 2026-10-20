@@ -6,6 +6,8 @@ struct LibraryView: View {
     @State private var selected: SteamGame?
     @State private var showSettings = false
     @State private var addingGame = false
+    @State private var choosingProgram: [(url: URL, size: Int64)] = []
+    @State private var choosingFolder: URL?
 
     private let columns = [GridItem(.adaptive(minimum: 150, maximum: 190), spacing: 18)]
 
@@ -35,8 +37,28 @@ struct LibraryView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView().environment(model)
         }
-        .fileImporter(isPresented: $addingGame, allowedContentTypes: [UTType(filenameExtension: "exe") ?? .data]) { result in
-            if case .success(let url) = result { model.addLocalGame(exe: url) }
+        .fileImporter(isPresented: $addingGame, allowedContentTypes: [UTType(filenameExtension: "exe") ?? .data, .folder]) { result in
+            guard case .success(let url) = result else { return }
+            if url.hasDirectoryPath || (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                // A game folder: find its programs, then let the user pick when it is not obvious.
+                let programs = LocalGames.programs(in: url)
+                if programs.isEmpty {
+                    model.banner = "No .exe file in \(url.lastPathComponent). Pick the folder that holds the game's program."
+                } else if programs.count == 1 {
+                    model.addLocalGame(exe: programs[0].url, folder: url)
+                } else {
+                    choosingFolder = url
+                    choosingProgram = programs
+                }
+            } else {
+                model.addLocalGame(exe: url)
+            }
+        }
+        .sheet(isPresented: Binding(get: { !choosingProgram.isEmpty }, set: { if !$0 { choosingProgram = [] } })) {
+            ProgramChooser(folder: choosingFolder, programs: choosingProgram) { exe in
+                choosingProgram = []
+                if let exe { model.addLocalGame(exe: exe, folder: choosingFolder) }
+            }
         }
     }
 
@@ -52,7 +74,7 @@ struct LibraryView: View {
                 .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens Mac Steam")
             Button { addingGame = true } label: { Label("Add game", systemImage: "plus") }
                 .buttonStyle(QuietButtonStyle())
-                .help("Add a Windows game or program by its .exe. It runs without Steam.")
+                .help("Add a Windows game from its folder or its .exe. It runs without Steam.")
             Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 .buttonStyle(QuietButtonStyle())
                 .help("Settings, updates and GPTK")
@@ -146,7 +168,7 @@ struct LibraryView: View {
                     .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens the store in Mac Steam")
                 Button("Open Steam") { model.openMacSteam() }.buttonStyle(QuietButtonStyle())
                     .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens Mac Steam")
-                Button("Add a game by its .exe") { addingGame = true }.buttonStyle(QuietButtonStyle())
+                Button("Add a game folder or .exe") { addingGame = true }.buttonStyle(QuietButtonStyle())
                     .help("For Windows games from outside Steam. They run without Steam.")
             }
             Spacer()
@@ -227,6 +249,57 @@ extension Renderer {
         case .dxvk: return "DXVK"
         case .wined3d: return "WineD3D"
         }
+    }
+}
+
+// MARK: - Picking the program in a game folder
+
+/// Lists the programs found in a game folder, the likeliest first, so the user picks the one that
+/// starts the game.
+struct ProgramChooser: View {
+    let folder: URL?
+    let programs: [(url: URL, size: Int64)]
+    let done: (URL?) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Which program starts the game?").font(.system(size: 17, weight: .semibold)).foregroundStyle(Palette.text)
+            Text("Unwine found \(programs.count) programs in \(folder?.lastPathComponent ?? "the folder"). The likeliest is first: usually the biggest one that is not a setup or a tool. A launcher works too, if the game has one.")
+                .font(.system(size: 12)).foregroundStyle(Palette.muted)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(programs.enumerated()), id: \.offset) { i, p in
+                        Button { done(p.url) } label: {
+                            HStack {
+                                Image(systemName: i == 0 ? "star.fill" : "app").foregroundStyle(i == 0 ? Palette.glow : Palette.muted)
+                                Text(relative(p.url)).foregroundStyle(Palette.text)
+                                Spacer()
+                                Text(ByteCountFormatter.string(fromByteCount: p.size, countStyle: .file)).foregroundStyle(Palette.muted)
+                            }
+                            .font(.system(size: 12))
+                            .padding(.horizontal, 10).padding(.vertical, 7)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(i == 0 ? Palette.accent.opacity(0.18) : Palette.card))
+                        }
+                        .buttonStyle(.plain)
+                        .help("Adds \(p.url.lastPathComponent) as the game")
+                    }
+                }
+            }
+            .frame(maxHeight: 320)
+            HStack {
+                Spacer()
+                Button("Cancel") { done(nil) }.buttonStyle(QuietButtonStyle()).keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 480)
+        .background(AppBackground())
+    }
+
+    private func relative(_ url: URL) -> String {
+        guard let folder else { return url.lastPathComponent }
+        let base = folder.path.hasSuffix("/") ? folder.path : folder.path + "/"
+        return url.path.hasPrefix(base) ? String(url.path.dropFirst(base.count)) : url.lastPathComponent
     }
 }
 

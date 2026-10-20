@@ -46,6 +46,31 @@ enum LocalGames {
 
     static func logName(_ id: Int) -> String { "local-\(id).log" }
 
+    /// The .exe files in a game folder (and one level down), the likeliest game first: installers,
+    /// uninstallers, crash reporters and redistributables last, then bigger files before smaller.
+    static func programs(in folder: URL) -> [(url: URL, size: Int64)] {
+        let fm = FileManager.default
+        var found: [(url: URL, size: Int64)] = []
+        func scan(_ dir: URL, depth: Int) {
+            guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
+                                                          options: [.skipsHiddenFiles]) else { return }
+            for item in items {
+                let values = try? item.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
+                if values?.isDirectory == true {
+                    if depth < 1 { scan(item, depth: depth + 1) }
+                } else if item.pathExtension.lowercased() == "exe" {
+                    found.append((item, Int64(values?.fileSize ?? 0)))
+                }
+            }
+        }
+        scan(folder, depth: 0)
+        let unlikely = ["unins", "setup", "install", "redist", "vcredist", "dxsetup", "crash", "report", "dotnet", "directx", "uninst"]
+        func score(_ u: URL) -> Int { unlikely.contains { u.lastPathComponent.lowercased().contains($0) } ? 1 : 0 }
+        return found.sorted { a, b in
+            score(a.url) != score(b.url) ? score(a.url) < score(b.url) : a.size > b.size
+        }
+    }
+
     static func prefix(_ game: SteamGame) -> URL { game.compatData.appendingPathComponent("pfx", isDirectory: true) }
 
     static func isRunning(_ game: SteamGame) -> Bool { OnlineSteam.serverIsAlive(prefix(game)) }

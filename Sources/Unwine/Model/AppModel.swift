@@ -742,13 +742,16 @@ final class AppModel {
     // MARK: Games added by their .exe
 
     /// Adds a Windows game or program by its .exe. It shows in the library like a Steam game.
-    func addLocalGame(exe: URL) {
+    func addLocalGame(exe: URL, folder: URL? = nil) {
         if let known = stored.localGames.first(where: { $0.exePath == exe.path }) {
             banner = "\(known.name) is already in your library."
             return
         }
         let id = max(LocalGames.idBase, (stored.localGames.map(\.id).max() ?? LocalGames.idBase)) + 1
-        let record = LocalGameRecord(id: id, name: LocalGames.suggestedName(for: exe), exePath: exe.path, addedAt: Date())
+        // Named after the folder the user picked, else the folder the program sits in.
+        let name = folder.map { $0.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces) }
+            .flatMap { $0.isEmpty ? nil : $0 } ?? LocalGames.suggestedName(for: exe)
+        let record = LocalGameRecord(id: id, name: name, exePath: exe.path, addedAt: Date())
         stored.localGames.append(record)
         save()
         let game = LocalGames.game(from: record)
