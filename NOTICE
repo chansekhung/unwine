@@ -7,7 +7,9 @@ Unwine reuses work from these projects, each under its own licence:
   release payload (Steam add-on, lsteamclient, steam.exe shim) at setup time.
 - Wine (LGPL-2.1+), packaged by Gcenx as Sikarugir engines; downloaded at setup time.
 - Sikarugir Template runtime (GStreamer LGPL, MoltenVK Apache-2.0, DXMT, DXVK zlib, KosmicKrisp MIT);
-  downloaded at setup time. Apple's D3DMetal inside it is never extracted.
+  downloaded at setup time. Apple's D3DMetal inside it is never extracted. On this Mac, Unwine makes
+  patched copies of DXVK's d3d9.dll, the KosmicKrisp driver and Wine's ntdll.dll; the downloaded
+  originals are not changed.
 - Apple D3DMetal (Game Porting Toolkit): imported only from the user's own download from Apple.
 - Valve's Steam client files: downloaded from Valve at setup time.
 - Highball game database (gethighball.com): curated data CC0-1.0; its anti-cheat fields come from

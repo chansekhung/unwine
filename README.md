@@ -18,13 +18,27 @@ Mac Steam, and it runs through Unwine's free engine, like Proton on a Steam Deck
 - Per-game advice: the best layer (from tested Highball reports first, then the game's files), a
   "Best speed" and a "Best battery" setting set, and tips such as resolution limits for 32-bit games.
 - Per-game settings: graphics layer, msync, AVX, Metal HUD, MetalFX sharpening (DXMT, DirectX 10/11),
-  MetalFX for DLSS games, GPTK 4 Metal 4 mode, frame cap, and Low latency (DXVK's Reflex-like latency
-  sleep, for DirectX 8/9 games and the DXVK layer). Your own choices always win: the advisor only
-  suggests, and nothing is locked.
+  MetalFX for DLSS games, GPTK 4 Metal 4 mode, frame cap, Low latency (DXVK's Reflex-like latency
+  sleep, for DirectX 8/9 games and the DXVK layer), background shader building (DirectX 8/9) and a
+  120 fps mode (DXMT, for games that ask for 60 Hz on a faster screen). Your own choices always win:
+  the advisor only suggests, and nothing is locked.
+- Add game: any Windows program outside Steam, by its .exe or its folder. Each one gets its own Wine
+  bottle and the same per-game settings.
+- Fewer stutters: Unwine makes patched copies of DXVK's d3d9.dll (background shader building then also
+  covers the screen's back buffers) and of the KosmicKrisp driver (the right memory budget under
+  Rosetta). The downloaded files stay as they are.
+- No more DXMT freezes in 32-bit games: Unwine's copy of Wine lets the game's .exe decide DEP (Data
+  Execution Prevention, a memory guard), as Windows does.
+- Font stand-ins: Windows fonts such as Palatino Linotype use the Mac's Palatino, so launchers do not
+  show blank buttons.
 - Online mode for Valve Anti-Cheat (VAC) games (experimental): Windows Steam runs inside Unwine's engine,
   like CrossOver. It sees only the Windows games that need it, never your Mac versions of games, and uses
-  the same game files as Mac Steam. Mac Steam closes while it runs.
-- macOS Game Mode turns on for games in fullscreen.
+  the same game files as Mac Steam. Mac Steam closes while it runs. High Resolution Mode gives sharp
+  text on Retina screens, "Games fill the whole screen" covers the Dock and menu bar, and "Close now"
+  quits Windows Steam at once.
+- macOS Game Mode turns on for games in fullscreen: Steam Play games, added games, and Online mode
+  games (a switch in Settings).
+- Games come to the front when they open, also with Stage Manager on.
 - Updates itself: the engine (when Unwine can bridge it), Steam Play signature files, and the app.
 
 ## What it needs
