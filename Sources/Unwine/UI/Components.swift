@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - Palette
 
@@ -78,28 +79,36 @@ struct UnwineMark: View {
     var size: CGFloat = 88
 
     var body: some View {
-        TimelineView(.animation) { timeline in
-            let t = timeline.date.timeIntervalSinceReferenceDate
-            let line = max(2, size / 14)
-            let lit = LinearGradient(colors: [Palette.glow, .white], startPoint: .leading, endPoint: .trailing)
-            ZStack {
-                CoilShape().stroke(Palette.glow.opacity(0.16), style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
-                if let progress {
-                    CoilShape().trim(from: 0, to: max(0.02, progress))
-                        .stroke(lit, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
-                        .animation(.easeInOut(duration: 0.4), value: progress)
-                    PlayTip().fill(Color.white.opacity(0.25 + 0.75 * progress))
-                } else {
-                    let head = (t * 0.45).truncatingRemainder(dividingBy: 1.25)
-                    CoilShape().trim(from: max(0, head - 0.25), to: min(1, head))
-                        .stroke(lit, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
-                    PlayTip().fill(Color.white.opacity(0.55 + 0.35 * (0.5 + 0.5 * sin(t * 2.4))))
-                }
+        Group {
+            // Known progress only redraws when it changes. Only the "working" light needs a clock.
+            if let progress {
+                mark(progress: progress, t: 0)
+            } else {
+                TimelineView(Motion.schedule) { timeline in mark(progress: nil, t: timeline.date.timeIntervalSinceReferenceDate) }
             }
-            .shadow(color: Palette.glow.opacity(0.55), radius: size / 14)
-            .frame(width: size, height: size * 0.62)
         }
         .accessibilityLabel(progress.map { "Progress \(Int($0 * 100)) percent" } ?? "Working")
+    }
+
+    private func mark(progress: Double?, t: Double) -> some View {
+        let line = max(2, size / 14)
+        let lit = LinearGradient(colors: [Palette.glow, .white], startPoint: .leading, endPoint: .trailing)
+        return ZStack {
+            CoilShape().stroke(Palette.glow.opacity(0.16), style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
+            if let progress {
+                CoilShape().trim(from: 0, to: max(0.02, progress))
+                    .stroke(lit, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
+                    .animation(.easeInOut(duration: 0.4), value: progress)
+                PlayTip().fill(Color.white.opacity(0.25 + 0.75 * progress))
+            } else {
+                let head = (t * 0.45).truncatingRemainder(dividingBy: 1.25)
+                CoilShape().trim(from: max(0, head - 0.25), to: min(1, head))
+                    .stroke(lit, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
+                PlayTip().fill(Color.white.opacity(0.55 + 0.35 * (0.5 + 0.5 * sin(t * 2.4))))
+            }
+        }
+        .shadow(color: Palette.glow.opacity(0.55), radius: size / 14)
+        .frame(width: size, height: size * 0.62)
     }
 }
 
@@ -120,7 +129,7 @@ struct ProgressTrack: View {
                         .frame(width: max(height, geo.size.width * min(max(progress, 0), 1)))
                         .animation(.easeOut(duration: 0.35), value: progress)
                 } else {
-                    TimelineView(.animation) { tl in
+                    TimelineView(Motion.schedule) { tl in
                         let t = tl.date.timeIntervalSinceReferenceDate
                         let w = geo.size.width * 0.28
                         let x = (t.truncatingRemainder(dividingBy: 1.6) / 1.6) * (geo.size.width + w) - w
@@ -155,11 +164,34 @@ struct PhaseWords: View {
     }
 }
 
+// MARK: - Motion that stops when nobody sees it
+
+/// Tracks whether any Unwine window can be seen. Endless animations pause while Unwine is hidden or
+/// covered (for example by a full-screen game), so they cost the game nothing.
+@MainActor @Observable
+final class AppVisibility {
+    static let shared = AppVisibility()
+    private(set) var visible = true
+
+    private init() {
+        NotificationCenter.default.addObserver(forName: NSApplication.didChangeOcclusionStateNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { AppVisibility.shared.visible = NSApp.occlusionState.contains(.visible) }
+        }
+    }
+}
+
+enum Motion {
+    /// 30 frames a second is smooth enough for a loading light, and paused while no window shows.
+    @MainActor static var schedule: AnimationTimelineSchedule {
+        .animation(minimumInterval: 1.0 / 30, paused: !AppVisibility.shared.visible)
+    }
+}
+
 // MARK: - Skeleton shimmer for art that is still loading
 
 struct Shimmer: View {
     var body: some View {
-        TimelineView(.animation) { tl in
+        TimelineView(Motion.schedule) { tl in
             let t = tl.date.timeIntervalSinceReferenceDate
             GeometryReader { geo in
                 let x = (t.truncatingRemainder(dividingBy: 1.4) / 1.4) * geo.size.width * 2 - geo.size.width
@@ -213,7 +245,7 @@ struct StatusPill: View {
             Circle().fill(color).frame(width: 7, height: 7)
                 .overlay {
                     if pulsing {
-                        TimelineView(.animation) { tl in
+                        TimelineView(Motion.schedule) { tl in
                             let s = 1 + (tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.4) / 1.4) * 1.6
                             Circle().stroke(color.opacity(2 - s), lineWidth: 1.5).scaleEffect(s)
                         }

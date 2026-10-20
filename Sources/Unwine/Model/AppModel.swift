@@ -18,6 +18,8 @@ struct StoredState: Codable {
     var onlineEngine: String?           // engine folder Online mode's bottle was last set up with
     var onlineReopenMacSteam = false    // Unwine closed Mac Steam for Online mode and owes it a reopen
     var onlineEnvHash: String?          // the settings Windows Steam last started with; its games inherit them
+    var onlineEnv: [String: String]?    // those settings, to name what changed when a game needs others
+    var onlineGameMode = false          // experimental: macOS Game Mode for the games Windows Steam starts
     var presetChoice: [Int: String] = [:]   // the preset last clicked per game, to break ties
 
     init() {}
@@ -38,6 +40,8 @@ struct StoredState: Codable {
         onlineEngine = try? c.decodeIfPresent(String.self, forKey: .onlineEngine)
         onlineReopenMacSteam = (try? c.decodeIfPresent(Bool.self, forKey: .onlineReopenMacSteam)) ?? false
         onlineEnvHash = try? c.decodeIfPresent(String.self, forKey: .onlineEnvHash)
+        onlineEnv = try? c.decodeIfPresent([String: String].self, forKey: .onlineEnv)
+        onlineGameMode = (try? c.decodeIfPresent(Bool.self, forKey: .onlineGameMode)) ?? false
         presetChoice = (try? c.decodeIfPresent([Int: String].self, forKey: .presetChoice)) ?? [:]
     }
 }
@@ -82,6 +86,13 @@ enum SetupStep: String, CaseIterable, Identifiable {
 }
 
 /// Online mode: Windows Steam inside Unwine's engine, for games whose VAC needs the Windows client.
+/// A game needs settings the running Windows Steam did not start with: restart it, or play as it is.
+struct OnlineRestartAsk: Identifiable {
+    let game: SteamGame
+    let changes: [String]
+    var id: Int { game.id }
+}
+
 struct OnlineStatus: Equatable, Sendable {
     var installed = false
     var installing = false              // Unwine's own setup runs Windows Steam's updater
@@ -153,9 +164,11 @@ final class AppModel {
     var online = OnlineStatus()
     var onlineStep: StepStatus = .pending
     var onlineWords: [String]?          // phase words while Unwine opens, restarts or closes Windows Steam
+    var onlineRestartAsk: OnlineRestartAsk?   // a game needs settings Windows Steam did not start with
     var onlineForceQuit: [String]?      // games still running when the user asked to quit Windows Steam
     private var onlineStartedAt = Date.distantPast
     private var onlineGoneTicks = 0
+    private var tickCount = 0
     private var lastHighballCheck = Date()
     private var runnerNeedsRefresh = false  // the runner is from an older Unwine and was in use at launch
 
@@ -199,6 +212,8 @@ final class AppModel {
         let engines = EngineStore.installed()
         engine = engines.first { $0.folder == stored.activeEngine } ?? engines.first
         d3dmetal = D3DMetalStore.installed().first
+        if let engine { RendererPatches.prepare(engine: engine, log: log) }
+        OnlineSteam.gameModeForGames = stored.onlineGameMode
         if let engine {
             if Runner.matches(engine) {
                 runnerReady = true
@@ -250,7 +265,10 @@ final class AppModel {
     }
 
     /// Runs every few seconds: refresh Steam, finish work that waited for games to close.
+    /// While a game runs, Unwine looks only every third tick, so it takes less from the game.
     private func tick() async {
+        tickCount += 1
+        if (gameRunning || online.inUse) && !onlineBusy && tickCount % 3 != 0 { return }
         await refreshSteam()
         if Date().timeIntervalSince(lastHighballCheck) > 600 {
             lastHighballCheck = Date()
@@ -290,7 +308,7 @@ final class AppModel {
         gameRunning = snap.runnerInUse
         online = snap.online
         // A closed bottle has no settings left to compare with, so the next start sets them fresh.
-        if !online.inUse, stored.onlineEnvHash != nil, !onlineBusy { stored.onlineEnvHash = nil; save() }
+        if !online.inUse, stored.onlineEnvHash != nil, !onlineBusy { stored.onlineEnvHash = nil; stored.onlineEnv = nil; save() }
         reopenMacSteamIfOnlineEnded()
     }
 
@@ -424,6 +442,7 @@ final class AppModel {
 
     func buildRunner() async -> Bool {
         guard let engine else { return false }
+        RendererPatches.prepare(engine: engine, log: log)
         if Runner.matches(engine) {
             try? Runner.refresh(engine: engine, d3dmetal: d3dmetal)
             runnerReady = true
@@ -557,13 +576,14 @@ final class AppModel {
 
     /// Applies one of the advisor's setting sets. The layer goes back to Automatic (which is the
     /// advised layer), and the Metal overlay stays as the user set it: it is a display choice.
-    /// The Metal overlay and Low latency stay as the user set them: they are the user's choices,
-    /// not speed or battery settings.
+    /// The Metal overlay, Low latency and background shader building stay as the user set them:
+    /// they are the user's choices, not speed or battery settings.
     func apply(_ preset: Preset, to game: SteamGame) {
         let now = settings(for: game.id)
         var s = settings(preset, for: game, advice: advice(for: game))
         s.metalHUD = now.metalHUD
         s.lowLatency = now.lowLatency
+        s.asyncShaders = now.asyncShaders
         stored.games[game.id] = s
         stored.presetChoice[game.id] = preset.rawValue
         save()
@@ -584,6 +604,7 @@ final class AppModel {
             if s.renderer == a.renderer { s.renderer = .auto }
             s.metalHUD = false
             s.lowLatency = false
+            s.asyncShaders = true
             if !(real == .d3dmetal && gptk4) { s.metal4 = true }
             if real == .wined3d || (real == .d3dmetal && !gptk4) || (real == .dxvk && api == .dx12) { s.fpsCap = nil }
             if !((api == .dx11 || api == .dx12) && (real == .d3dmetal || real == .dxmt)) { s.metalFX = false }
@@ -620,6 +641,12 @@ final class AppModel {
         if r == .dxvk { return true }
         guard let api = stored.analyses[game.id]?.api else { return false }
         return (api == .dx9 || api == .dx8) && r != .wined3d
+    }
+
+    /// The background-shader fix lives in DXVK's DirectX 9 layer, so it works where that layer draws.
+    func canBuildShadersAsync(_ game: SteamGame) -> Bool {
+        guard let api = stored.analyses[game.id]?.api, api == .dx9 || api == .dx8 else { return false }
+        return renderer(for: game.id) != .wined3d
     }
 
     func update(_ id: Int, _ change: (inout GameSettings) -> Void) {
@@ -720,7 +747,7 @@ final class AppModel {
 
     /// Opens Windows Steam: with a game it starts that game online, without one it shows the
     /// sign-in window. Mac Steam closes first, so the two never write the same game files at once.
-    func openOnline(_ game: SteamGame?) async {
+    func openOnline(_ game: SteamGame?, restart: Bool? = nil) async {
         guard let engine, online.installed, !onlineBusy, !onlineStep.isRunning else { return }
         guard !Runner.isInUse() else { banner = "A game is running in Mac Steam. Close it first."; return }
         // After an engine update the bottle needs the new engine's files once (no new download).
@@ -731,13 +758,21 @@ final class AppModel {
         }
         onlineWords = ["Getting Windows Steam ready…"]
         defer { onlineWords = nil }
-        let profile = game.map { Profiles.file(for: $0.id) }
+        // Without a game, Windows Steam opens with the settings for new games, so a game that keeps
+        // those settings starts in the same Steam with no restart.
+        let profile = Profiles.file(for: game?.id)
         if let game { writeProfile(for: game.id) }
         let hash = OnlineSteam.environmentHash(engine: engine, profile: profile)
         var steamUp = await Task.detached(priority: .userInitiated) { OnlineSteam.isRunning }.value
-        // Games inherit Windows Steam's settings, so Steam restarts when this game needs other ones,
-        // but never under a running game. An unknown start (an older Unwine) counts as the same.
-        if steamUp, let last = stored.onlineEnvHash, last != hash {
+        // Games inherit Windows Steam's settings. Settings DXVK and DXMT read from a file need no
+        // restart; the rest (a different graphics layer, the Metal HUD) do. Unwine asks first, and
+        // never restarts under a running game. An unknown start (an older Unwine) counts as the same.
+        if steamUp, let last = stored.onlineEnvHash, last != hash, restart == nil, let game {
+            let now = OnlineSteam.environment(engine: engine, profile: profile)
+            onlineRestartAsk = OnlineRestartAsk(game: game, changes: OnlineSteam.describeChanges(from: stored.onlineEnv ?? [:], to: now))
+            return
+        }
+        if steamUp, let last = stored.onlineEnvHash, last != hash, restart == true {
             onlineWords = ["Restarting Windows Steam with this game's settings…", "Steam Cloud saves sync first"]
             if case .gamesRunning(let names) = await OnlineSteam.shutdown(engine: engine, force: false) {
                 banner = "\(names.joined(separator: ", ")) is still running in Windows Steam. Quit it first, then press Play online again."
@@ -760,7 +795,11 @@ final class AppModel {
                                          "VAC checks the game", "The game window opens soon"]
             if !steamUp { try OnlineSteam.shareGames(onlineGames(adding: game)) }
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
-            if !steamUp { stored.onlineEnvHash = hash; save() }
+            if !steamUp {
+                stored.onlineEnvHash = hash
+                stored.onlineEnv = OnlineSteam.environment(engine: engine, profile: profile)
+                save()
+            }
             onlineStartedAt = Date()
             // Wait until a window shows. Steam runs through Wine and Rosetta, and its window is a
             // built-in web browser, so this takes up to a minute or more. The words keep moving all
@@ -801,7 +840,7 @@ final class AppModel {
             onlineForceQuit = names
             return
         }
-        stored.onlineEnvHash = nil
+        stored.onlineEnvHash = nil; stored.onlineEnv = nil
         save()
         await refreshSteam()
         if !online.running, stored.onlineReopenMacSteam {
@@ -815,7 +854,7 @@ final class AppModel {
         do {
             try OnlineSteam.remove()
             stored.onlineEngine = nil
-            stored.onlineEnvHash = nil
+            stored.onlineEnvHash = nil; stored.onlineEnv = nil
             save()
             onlineStep = .pending
             banner = "Online mode moved to the Trash. Your games stay in Mac Steam."
@@ -936,6 +975,7 @@ final class AppModel {
         // Online mode's bottle runs on the engine itself, so it must be closed as well.
         guard !Runner.isInUse(), !OnlineSteam.isInUse else { return }
         do {
+            RendererPatches.prepare(engine: next, log: log)
             try await Runner.build(engine: next, d3dmetal: d3dmetal, log: log)
             stored.previousEngine = engine?.folder
             stored.activeEngine = next.folder

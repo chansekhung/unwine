@@ -520,12 +520,11 @@ enum OnlineSteam {
         // Steam's own windows (Chromium) draw only on DXMT. On D3DMetal they stay black.
         env["WINEDLLPATH_DXMT"] = engine.renderer("dxmt").path
         env["DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN"] = "1"
-        if engine.supports("WINEDLLPATH_D9VK") { env["WINEDLLPATH_D9VK"] = engine.renderer("d9vk").path }
+        // Unwine's copy of DXVK's DirectX 9 layer, when ready, like the default game profile.
+        let d9vk = RendererPatches.asyncDir("d9vk", engine: engine) ?? engine.renderer("d9vk")
+        if engine.supports("WINEDLLPATH_D9VK") { env["WINEDLLPATH_D9VK"] = d9vk.path }
         if engine.supports("WINEDLLPATH_CNCD") { env["WINEDLLPATH_CNCD"] = engine.renderer("cnc_ddraw").path }
-        // KosmicKrisp is a full Vulkan driver on Apple chips. MoltenVK lacks features DXVK 3 needs.
-        let icd = engine.runtime.appendingPathComponent("Resources/vulkan/icd.d", isDirectory: true)
-        let kosmic = icd.appendingPathComponent("kosmickrisp_mesa_icd.json")
-        let vulkan = FileManager.default.fileExists(atPath: kosmic.path) ? kosmic : icd.appendingPathComponent("MoltenVK_icd.json")
+        let vulkan = RendererPatches.vulkanICD(engine: engine)
         env["VK_DRIVER_FILES"] = vulkan.path
         env["VK_ICD_FILENAMES"] = vulkan.path
         env["ROSETTA_ADVERTISE_AVX"] = "1"
@@ -552,11 +551,55 @@ enum OnlineSteam {
             }
         }
 
+        // Games read DXVK's and DXMT's settings from a file when they start. Windows Steam always names
+        // the same two files, and Unwine fills them for each game just before Steam starts it, so
+        // those settings (Low latency, frame caps) never need a Steam restart.
+        env["DXVK_CONFIG_FILE"] = onlineDXVKConfig.path
+        env["DXMT_CONFIG_FILE"] = onlineDXMTConfig.path
+
         // Wine refuses a process whose msync setting differs from the server's, so the game's choice
         // holds for the whole bottle. Steam restarts when it changes.
         env["WINEMSYNC"] = engine.supportsMsync && env["WINEMSYNC"] != "0" ? "1" : "0"
         env.merge(identity) { _, mine in mine }
         return (env, notes)
+    }
+
+    static var onlineDXVKConfig: URL { Runner.profiles.appendingPathComponent("online.dxvk.conf") }
+    static var onlineDXMTConfig: URL { Runner.profiles.appendingPathComponent("online.dxmt.conf") }
+
+    /// Copies a game's DXVK and DXMT setting files into the two files Windows Steam names, or empties
+    /// them, just before Steam starts that game.
+    private static func stageConfigs(profile: URL?) {
+        var wanted: [String: String] = [:]
+        if let profile, let text = try? String(contentsOf: profile, encoding: .utf8) {
+            for (key, raw) in profileAssignments(text) where key == "DXVK_CONFIG_FILE" || key == "DXMT_CONFIG_FILE" {
+                if let path = shellWord(raw, env: [:]) { wanted[key] = path }
+            }
+        }
+        for (key, target) in [("DXVK_CONFIG_FILE", onlineDXVKConfig), ("DXMT_CONFIG_FILE", onlineDXMTConfig)] {
+            let text = wanted[key].flatMap { try? String(contentsOfFile: $0, encoding: .utf8) }
+                ?? "# Written by Unwine. This game has no settings here.\n"
+            _ = try? Paths.ensure(target.deletingLastPathComponent())
+            do { try text.write(to: target, atomically: true, encoding: .utf8) }
+            catch { log.line("Could not write \(target.lastPathComponent): \(error.localizedDescription)") }
+        }
+    }
+
+    /// Plain names for the settings that differ between two Windows Steam environments, for the
+    /// question Unwine asks before it restarts Steam. Empty when there is nothing to compare with.
+    static func describeChanges(from old: [String: String], to new: [String: String]) -> [String] {
+        guard !old.isEmpty else { return [] }
+        let names = ["MTL_HUD_ENABLED": "Metal performance overlay", "WINEDLLPATH_D9VK": "background shader building",
+                     "WINEDLLPATH_DXMT": "graphics layer", "WINEDLLPATH_D3DMETAL": "graphics layer", "WINEDLLPATH_DXVK": "graphics layer",
+                     "DXMT_METALFX_SPATIAL_SWAPCHAIN": "MetalFX sharpening", "DXMT_ENABLE_NVEXT": "MetalFX for DLSS",
+                     "ROSETTA_ADVERTISE_AVX": "AVX for games", "WINEMSYNC": "fast sync (msync)",
+                     "VK_DRIVER_FILES": "Vulkan driver", "VK_ICD_FILENAMES": "Vulkan driver"]
+        var out: [String] = []
+        for key in Set(old.keys).union(new.keys).sorted() where old[key] != new[key] && key != "WINELOADER" {
+            let name = names[key] ?? key
+            if !out.contains(name) { out.append(name) }
+        }
+        return out
     }
 
     /// DXMT draws Steam's windows too, so its frame cap holds for them.
@@ -705,16 +748,36 @@ enum OnlineSteam {
     // MARK: Game Mode
 
     /// macOS gives Game Mode only to apps that say they are games, and Wine's loader is a bare
-    /// executable. So Online mode starts Wine from an app bundle of its own: a hard link of the
-    /// engine's loader, its other files as links, and an Info.plist that says "game".
+    /// executable. So Online mode starts Wine from an app bundle of its own, with an Info.plist that
+    /// says "game".
     ///
     /// Wine 11 starts each new process from the loader next to the real ntdll.so (`init_paths` in
-    /// ntdll's unix/loader.c) and never reads WINELOADER. So only the processes Unwine starts itself,
-    /// such as steam.exe, run from this bundle; the programs Steam starts run from the engine. Putting
-    /// a real ntdll.so in the bundle moves them too, but then Wine looks for its other folders next to
-    /// the bundle, and in tests under Rosetta its processes hung.
+    /// ntdll's unix/loader.c) and never reads WINELOADER. With only the loader in the bundle (the
+    /// default), steam.exe runs from the bundle and the games Steam starts run from the engine. With
+    /// `gameModeForGames` (the user's switch, experimental), every unix file of Wine is cloned into
+    /// the bundle, so Steam's games run from it too and macOS sees them as games. Wine then finds its
+    /// Windows files, programs and data through links next to the clones. Clones, never hard links:
+    /// a hard-linked program can report its other path, and then macOS loses track of it.
     static var appBundle: URL { root.appendingPathComponent("Steam (Unwine).app", isDirectory: true) }
     private static var bundleLoader: URL { appBundle.appendingPathComponent("Contents/MacOS/wine") }
+
+    /// Clone all of Wine's unix files into the bundle (Game Mode for the games Steam starts).
+    /// Takes effect the next time the bottle starts.
+    static var gameModeForGames: Bool {
+        get { state.wholeBundle }
+        set { state.wholeBundle = newValue }
+    }
+
+    /// The links a whole-Wine bundle needs, relative to the bundle. Wine looks for its Windows files
+    /// next to ntdll.so's folder, and for its programs and data two folders up.
+    private static func bundleLinks(_ engine: InstalledEngine) -> [(path: String, target: String)] {
+        let lib = engine.wineDir.appendingPathComponent("lib/wine", isDirectory: true)
+        return [("Contents/MacOS/x86_64-unix", "."),
+                ("Contents/MacOS/x86_64-windows", lib.appendingPathComponent("x86_64-windows").path),
+                ("Contents/MacOS/i386-windows", lib.appendingPathComponent("i386-windows").path),
+                ("bin", engine.wineDir.appendingPathComponent("bin").path),
+                ("share", engine.wineDir.appendingPathComponent("share").path)]
+    }
     private static let lsregister = URL(fileURLWithPath:
         "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
 
@@ -781,8 +844,24 @@ enum OnlineSteam {
         let source = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
         let macOS = appBundle.appendingPathComponent("Contents/MacOS", isDirectory: true)
         guard let want = try? fm.contentsOfDirectory(atPath: source.path), want.contains("wine"),
-              let have = try? fm.contentsOfDirectory(atPath: macOS.path), Set(want) == Set(have),
+              let have = try? fm.contentsOfDirectory(atPath: macOS.path),
               (try? Data(contentsOf: appBundle.appendingPathComponent("Contents/Info.plist"))) == bundleInfo else { return false }
+        if gameModeForGames {
+            let links = bundleLinks(engine)
+            guard Set(have) == Set(want).union(links.compactMap { $0.path.hasPrefix("Contents/MacOS/") ? String($0.path.dropFirst(15)) : nil }) else { return false }
+            for link in links {
+                guard (try? fm.destinationOfSymbolicLink(atPath: appBundle.appendingPathComponent(link.path).path)) == link.target else { return false }
+            }
+            // Each file a clone of the engine's: its own file, same size and date.
+            for name in want {
+                var a = stat(), b = stat()
+                guard lstat(macOS.appendingPathComponent(name).path, &a) == 0, lstat(source.appendingPathComponent(name).path, &b) == 0,
+                      a.st_mode & S_IFMT == S_IFREG, a.st_ino != b.st_ino, a.st_size == b.st_size,
+                      a.st_mtimespec.tv_sec == b.st_mtimespec.tv_sec else { return false }
+            }
+            return true
+        }
+        guard Set(want) == Set(have) else { return false }
         for name in want where name != "wine" {
             let target = try? fm.destinationOfSymbolicLink(atPath: macOS.appendingPathComponent(name).path)
             guard target == source.appendingPathComponent(name).path else { return false }
@@ -790,8 +869,7 @@ enum OnlineSteam {
         let loader = macOS.appendingPathComponent("wine"), original = source.appendingPathComponent("wine")
         var a = stat(), b = stat()
         guard lstat(loader.path, &a) == 0, stat(original.path, &b) == 0, a.st_mode & S_IFMT == S_IFREG else { return false }
-        if a.st_dev == b.st_dev && a.st_ino == b.st_ino { return true }
-        return (try? Data(contentsOf: loader)) == (try? Data(contentsOf: original))   // the copy made when linking failed
+        return (try? Data(contentsOf: loader)) == (try? Data(contentsOf: original))
     }
 
     /// Builds the bundle in a staging folder and swaps it in, then tells Launch Services about it.
@@ -804,14 +882,21 @@ enum OnlineSteam {
         let macOS = stage.appendingPathComponent("Contents/MacOS", isDirectory: true)
         try Paths.ensure(macOS)
         try bundleInfo.write(to: stage.appendingPathComponent("Contents/Info.plist"))
+        let whole = gameModeForGames
         for name in try fm.contentsOfDirectory(atPath: source.path) {
             let from = source.appendingPathComponent(name), to = macOS.appendingPathComponent(name)
-            if name == "wine" {
-                // A real file: macOS finds a process's app from where its executable lives.
-                do { try fm.linkItem(at: from, to: to) } catch { try fm.copyItem(at: from, to: to) }
+            if name == "wine" || whole {
+                // A real file: macOS finds a process's app from where its executable lives. A clone
+                // keeps its own path (APFS, no extra space); a plain copy elsewhere.
+                if clonefile(from.path, to.path, 0) != 0 { try fm.copyItem(at: from, to: to) }
             } else {
                 // Links, so the loader finds the engine's ntdll.so and Wine its other folders.
                 try fm.createSymbolicLink(at: to, withDestinationURL: from)
+            }
+        }
+        if whole {
+            for link in bundleLinks(engine) {
+                try fm.createSymbolicLink(atPath: stage.appendingPathComponent(link.path).path, withDestinationPath: link.target)
             }
         }
         if (try? appBundle.checkResourceIsReachable()) == true || (try? fm.destinationOfSymbolicLink(atPath: appBundle.path)) != nil {
@@ -819,7 +904,8 @@ enum OnlineSteam {
         }
         try fm.moveItem(at: stage, to: appBundle)
         let registered = runAndWait(lsregister, ["-f", appBundle.path], env: nil, timeout: 20).status
-        log.line("Made the Game Mode app for \(engine.folder)" + (registered == 0 ? "" : " (Launch Services did not take it)"))
+        log.line("Made the Game Mode app for \(engine.folder)" + (whole ? ", with Game Mode for the games Steam starts" : "")
+                 + (registered == 0 ? "" : " (Launch Services did not take it)"))
     }
 
     // MARK: Start and stop
@@ -849,6 +935,7 @@ enum OnlineSteam {
             env["WINEMSYNC"] = live
         }
         for note in made.notes { log.line(note) }
+        stageConfigs(profile: profile)
         var args = [steamExe]
         if silent { args.append("-silent") }
         if let appID { args += ["-applaunch", String(appID)] }
@@ -1239,6 +1326,12 @@ private final class OnlineState: @unchecked Sendable {
     var session: [String: String]? {
         get { lock.withLock { launchEnvironment } }
         set { lock.withLock { launchEnvironment = newValue } }
+    }
+
+    private var whole = false
+    var wholeBundle: Bool {
+        get { lock.withLock { whole } }
+        set { lock.withLock { whole = newValue } }
     }
 }
 

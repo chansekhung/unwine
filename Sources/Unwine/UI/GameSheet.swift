@@ -138,9 +138,15 @@ struct GameSheet: View {
                         Toggle("Low latency (DXVK)", isOn: binding(game.id, \.lowLatency))
                         let lowers = model.canLowerLatency(game)
                         note(lowers
-                             ? "Like NVIDIA Reflex: DXVK waits a moment before the game reads your mouse and keys, so frames do not pile up and input feels quicker. It does nothing when the game's own frame limit is on. In a few games it makes motion less smooth: then turn it off."
+                             ? "Like NVIDIA Reflex: DXVK waits a moment before the game reads your mouse and keys, so frames do not pile up and input feels quicker. It keeps no spare frame, so with V-Sync on a 120 Hz screen any frame that misses 8 ms shows twice, and menus can sit near 60 fps. If that happens, turn this off."
                              : "Works only where DXVK draws: DirectX 8 and 9 games, or any game on the DXVK layer. This game uses \(resolved.title)\(analysis.map { " for \($0.api.label)" } ?? ""), so this switch does nothing.",
                              warn: s.lowLatency && !lowers)
+                        Toggle("Build shaders in the background (DirectX 8 and 9)", isOn: binding(game.id, \.asyncShaders))
+                        let builds = model.canBuildShadersAsync(game)
+                        note(builds
+                             ? "On: when something new shows up (a gun flash, a new room), DXVK builds its shader in the background and the game keeps running. The first time, that effect can show a moment late. Off: DXVK's own files, and the game stops for a moment for each new effect."
+                             : "Works only where DXVK draws DirectX 8 and 9. This game uses \(resolved.title)\(analysis.map { " for \($0.api.label)" } ?? ""), so this switch does nothing.",
+                             warn: false)
                     }
 
                     section("Apple extras") {
@@ -217,11 +223,24 @@ struct GameSheet: View {
         } message: {
             Text("\((model.onlineForceQuit ?? []).joined(separator: ", ")) is still running in Windows Steam. Unwine asks it to close first. Progress you have not saved can be lost.")
         }
+        .confirmationDialog("Restart Windows Steam?", isPresented: Binding(get: { model.onlineRestartAsk != nil }, set: { if !$0 { model.onlineRestartAsk = nil } }),
+                            presenting: model.onlineRestartAsk) { ask in
+            Button("Restart and play") { Task { await model.openOnline(ask.game, restart: true) } }
+            Button("Play without restarting") { Task { await model.openOnline(ask.game, restart: false) } }
+        } message: { ask in
+            Text(restartMessage(ask))
+        }
         .confirmationDialog("Start this game with a fresh Windows bottle?", isPresented: $confirmReset) {
             Button("Move bottle to Trash", role: .destructive) { model.resetBottle(game) }
         } message: {
             Text("Your game files and Steam Cloud saves stay. Saves kept only inside the bottle go to the Trash with it.")
         }
+    }
+
+    private func restartMessage(_ ask: OnlineRestartAsk) -> String {
+        let what = ask.changes.isEmpty ? "settings Windows Steam did not start with"
+                                       : "settings Windows Steam did not start with: " + ask.changes.joined(separator: ", ")
+        return "\(ask.game.name) uses \(what). Games take Windows Steam's settings, so it restarts to use them (Steam Cloud saves sync first). Without a restart the game plays with the settings Steam has now. Low latency and frame caps apply either way."
     }
 
     private func facts(_ game: SteamGame, _ a: GameAnalysis?) -> String {

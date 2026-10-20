@@ -13,6 +13,7 @@ struct GameSettings: Codable, Equatable, Sendable {
     var rayTracing: Bool? = nil
     var fpsCap: Int? = nil
     var lowLatency = false              // DXVK's latency sleep, a Reflex-like wait before the game reads input
+    var asyncShaders = true             // DirectX 8/9: build new shaders in the background, never stop the game for one
 }
 
 extension GameSettings {
@@ -30,6 +31,7 @@ extension GameSettings {
         rayTracing = (try? c.decodeIfPresent(Bool.self, forKey: .rayTracing)) ?? d.rayTracing
         fpsCap = (try? c.decodeIfPresent(Int.self, forKey: .fpsCap)) ?? d.fpsCap
         lowLatency = (try? c.decodeIfPresent(Bool.self, forKey: .lowLatency)) ?? d.lowLatency
+        asyncShaders = (try? c.decodeIfPresent(Bool.self, forKey: .asyncShaders)) ?? d.asyncShaders
     }
 }
 
@@ -108,9 +110,11 @@ enum Profiles {
         if renderer == .dxmt || renderer == .auto, let cap = s.fpsCap {
             dxmt.append("d3d11.preferredMaxFrameRate = \(cap)")
         }
+        // A game's own dxvk.conf or dxmt.conf counts too: Unwine's file replaces the game's, so it carries it.
         let header = "# Written by Unwine. Settings from Steam's launch options still apply on top.\n"
-        return (dxvk.isEmpty ? nil : header + shipped("dxvk.conf") + dxvk.joined(separator: "\n") + "\n",
-                dxmt.isEmpty ? nil : header + shipped("dxmt.conf") + dxmt.joined(separator: "\n") + "\n")
+        let ownDXVK = renderer != .wined3d ? shipped("dxvk.conf") : "", ownDXMT = shipped("dxmt.conf")
+        return (dxvk.isEmpty && ownDXVK.isEmpty ? nil : header + ownDXVK + dxvk.joined(separator: "\n") + "\n",
+                dxmt.isEmpty && ownDXMT.isEmpty ? nil : header + ownDXMT + dxmt.joined(separator: "\n") + "\n")
     }
 
     static func render(appID: Int?, settings s: GameSettings, renderer: Renderer,
@@ -128,7 +132,9 @@ enum Profiles {
 
         // DirectX 9 and DirectDraw helpers ride along with every modern layer.
         if renderer != .wined3d {
-            if engine.supports("WINEDLLPATH_D9VK") { export("WINEDLLPATH_D9VK", dir("d9vk")) }
+            // Unwine's copy lets DXVK's background shader builds reach the game's main picture too.
+            let d9vk = s.asyncShaders ? RendererPatches.asyncDir("d9vk", engine: engine)?.path : nil
+            if engine.supports("WINEDLLPATH_D9VK") { export("WINEDLLPATH_D9VK", d9vk ?? dir("d9vk")) }
             if engine.supports("WINEDLLPATH_CNCD") { export("WINEDLLPATH_CNCD", dir("cnc_ddraw")) }
             // DXVK (also behind the DirectX 9 helper) reads the frame cap and latency sleep from its file.
             if hasDXVKConfig { export("DXVK_CONFIG_FILE", dxvkConfig(for: appID).path) }
@@ -148,7 +154,8 @@ enum Profiles {
             }
         case .dxvk:
             let three = engine.renderer("dxvk3")
-            export("WINEDLLPATH_DXVK", FileManager.default.fileExists(atPath: three.path) ? three.path : dir("dxvk"))
+            let patched = s.asyncShaders ? RendererPatches.asyncDir("dxvk3", engine: engine) : nil
+            export("WINEDLLPATH_DXVK", patched?.path ?? (FileManager.default.fileExists(atPath: three.path) ? three.path : dir("dxvk")))
             export("DXVK_ASYNC", "1")
             if let cap = s.fpsCap { export("DXVK_FRAME_RATE", String(cap)) }   // DXVK 1.x; 3.x reads the config file
         case .wined3d:

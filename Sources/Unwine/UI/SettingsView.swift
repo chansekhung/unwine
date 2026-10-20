@@ -100,6 +100,12 @@ struct SettingsView: View {
                                 PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
                             }
                         } else if model.online.installed {
+                            Toggle("Game Mode for games in Windows Steam (experimental)", isOn: $model.stored.onlineGameMode)
+                                .onChange(of: model.stored.onlineGameMode) { OnlineSteam.gameModeForGames = model.stored.onlineGameMode; model.save() }
+                            Text(model.online.inUse
+                                 ? "Takes effect the next time Windows Steam starts. macOS Game Mode gives the game more of the CPU and quiets background work."
+                                 : "macOS Game Mode gives the game more of the CPU and quiets background work. If Windows Steam does not start after you turn this on, turn it off again.")
+                                .font(.system(size: 11)).foregroundStyle(Palette.muted)
                             HStack(spacing: 8) {
                                 if model.online.running {
                                     Button("Quit Windows Steam") { Task { await model.stopOnline() } }.buttonStyle(QuietButtonStyle())

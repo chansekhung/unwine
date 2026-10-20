@@ -17,7 +17,7 @@ enum Runner {
     static let build = "decant-1"
 
     /// Bump when the wrappers or engine.env change shape, so existing runners get rewritten.
-    static let format = 4      // 4: paths moved from the Decant folder to the Unwine folder
+    static let format = 5      // 5: Vulkan driver is Unwine's fixed copy when ready
 
     static var base: URL { SteamPlayPaths.runners.appendingPathComponent("crossover-\(build)", isDirectory: true) }
     static var root: URL { base.appendingPathComponent("CrossOver", isDirectory: true) }
@@ -190,10 +190,7 @@ enum Runner {
 
     static func engineEnv(_ engine: InstalledEngine) -> String {
         let fw = engine.frameworks.path
-        let icd = engine.runtime.appendingPathComponent("Resources/vulkan/icd.d/kosmickrisp_mesa_icd.json")
-        let mvk = engine.runtime.appendingPathComponent("Resources/vulkan/icd.d/MoltenVK_icd.json")
-        // KosmicKrisp is a full Vulkan 1.4 driver on Apple chips; MoltenVK lacks features DXVK 3 needs.
-        let vk = FileManager.default.fileExists(atPath: icd.path) ? icd : mvk
+        let vk = RendererPatches.vulkanICD(engine: engine)
         var lines = ["# Written by Unwine. The free engine's support libraries and Vulkan driver."]
         for (k, v) in engine.markerEnv.sorted(by: { $0.key < $1.key }) { lines.append("export \(k)=\(shellQuote(v))") }
         lines += [
@@ -240,12 +237,13 @@ enum Runner {
         real="$here/wine.decant-real"
         # Inside a per-game app bundle (made so macOS turns on Game Mode). macOS counts a process as
         # the game only when its executable is a real file inside the bundle, so the Wine loader is
-        # hard-linked in. Everything else stays a symlink: Wine finds its own files through them
-        # (hard-linking those too makes Wine crash at start). The bundle must also say it supports
-        # Game Mode. Both are fixed once per bundle; later processes skip this quickly.
+        # cloned in. A clone, not a hard link: a hard-linked program can report its other path, and
+        # then macOS no longer sees the game. Everything else stays a symlink: Wine finds its own
+        # files through them. The bundle must also say it supports Game Mode. Both are fixed once
+        # per bundle; later processes skip this quickly.
         if [ "$here" != "$DECANT_RUNNER/lib/wine/x86_64-unix" ]; then
           if [ -L "$real" ] || [ ! -e "$real" ]; then
-            ln -f "$real_src" "$real.$$" 2>/dev/null && mv -f "$real.$$" "$real" || rm -f "$real.$$"
+            /bin/cp -c -p "$real_src" "$real.$$" 2>/dev/null && mv -f "$real.$$" "$real" || rm -f "$real.$$"
           fi
           plist="${here%/MacOS}/Info.plist"
           if [ -f "$plist" ] && ! /usr/bin/grep -q LSSupportsGameMode "$plist"; then
