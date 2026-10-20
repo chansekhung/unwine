@@ -15,6 +15,8 @@ struct GameSettings: Codable, Equatable, Sendable {
     var lowLatency = false              // DXVK's latency sleep, a Reflex-like wait before the game reads input
     var asyncShaders = true             // DirectX 8/9: build new shaders in the background, never stop the game for one
     var fps120 = false                  // 120 fps mode: DXMT paces DirectX 10/11 games to the screen's refresh, not a 60 Hz game mode
+    var saveBatteryUnplugged = true     // on battery, in Low Power Mode or hot: the profile gets the battery overlay
+    var maxTessFactor: Int? = nil       // DXMT: the most tessellation a DirectX 11 game gets (4 to 64); nil = the game's own
 }
 
 extension GameSettings {
@@ -34,6 +36,38 @@ extension GameSettings {
         lowLatency = (try? c.decodeIfPresent(Bool.self, forKey: .lowLatency)) ?? d.lowLatency
         asyncShaders = (try? c.decodeIfPresent(Bool.self, forKey: .asyncShaders)) ?? d.asyncShaders
         fps120 = (try? c.decodeIfPresent(Bool.self, forKey: .fps120)) ?? d.fps120
+        saveBatteryUnplugged = (try? c.decodeIfPresent(Bool.self, forKey: .saveBatteryUnplugged)) ?? d.saveBatteryUnplugged
+        maxTessFactor = (try? c.decodeIfPresent(Int.self, forKey: .maxTessFactor)) ?? d.maxTessFactor
+    }
+}
+
+/// What a launch profile changes while the Mac saves battery (on battery, in Low Power Mode or
+/// hot), for a game with "Save battery when unplugged" on. Plugged in, a profile has none of it.
+/// Unwine writes the profiles again when the power changes, and games read them at every start,
+/// so this works for games started from Mac Steam too.
+struct BatteryOverlay: Equatable, Sendable {
+    /// Low Power Mode or heat. Low Power Mode cuts the GPU clock (to about 67% on an M4 Pro), and
+    /// with V-Sync a game that then misses 60 fps drops to 30, so the cap goes lower.
+    var strict: Bool
+    var screenHz: Int
+
+    /// DXVK builds shaders on every core by default. Four at a time gives smaller CPU spikes and less heat.
+    static let compilerThreads = 4
+
+    /// The cap when the user set none: 60 on a screen above 60 Hz, the screen's own rate on a slower
+    /// one. In Low Power Mode or heat: 40 on a faster screen, half the rate (30) on a 60 Hz one.
+    var cap: Int {
+        let hz = screenHz > 0 ? screenHz : 60
+        if strict { return hz > 60 ? 40 : max(24, hz / 2) }
+        return min(60, hz)
+    }
+
+    /// The settings the profile is written with: the user's own cap wins, and 120 fps mode waits.
+    func applied(to s: GameSettings) -> GameSettings {
+        var s = s
+        if s.fpsCap == nil { s.fpsCap = cap }
+        s.fps120 = false
+        return s
     }
 }
 
@@ -75,14 +109,17 @@ enum Profiles {
 
     /// Writes the profile for one game (or the default one when `appID` is nil). `gameDir` lets a
     /// dxvk.conf or dxmt.conf that ships with the game keep working: Unwine's file starts with it.
+    /// `battery` is the overlay while the Mac saves battery, nil plugged in.
     static func write(appID: Int?, settings: GameSettings, renderer: Renderer, api: GraphicsAPI? = nil,
-                      engine: InstalledEngine, d3dmetal: D3DMetalInstall?, gameDir: URL? = nil) throws {
+                      engine: InstalledEngine, d3dmetal: D3DMetalInstall?, gameDir: URL? = nil,
+                      battery: BatteryOverlay? = nil) throws {
         try Paths.ensure(Runner.profiles)
-        let (dxvk, dxmt) = configs(settings: settings, renderer: renderer, api: api, gameDir: gameDir)
+        let s = battery?.applied(to: settings) ?? settings
+        let (dxvk, dxmt) = configs(settings: s, renderer: renderer, api: api, gameDir: gameDir, battery: battery)
         try writeOrRemove(dxvk, at: dxvkConfig(for: appID))
         try writeOrRemove(dxmt, at: dxmtConfig(for: appID))
-        let text = render(appID: appID, settings: settings, renderer: renderer, engine: engine, d3dmetal: d3dmetal,
-                          hasDXVKConfig: dxvk != nil, hasDXMTConfig: dxmt != nil)
+        let text = render(appID: appID, settings: s, renderer: renderer, engine: engine, d3dmetal: d3dmetal,
+                          hasDXVKConfig: dxvk != nil, hasDXMTConfig: dxmt != nil, battery: battery)
         try text.write(to: file(for: appID), atomically: true, encoding: .utf8)
     }
 
@@ -99,17 +136,37 @@ enum Profiles {
     /// as its primary one. Profiles are written again at every Play, so a new screen counts then.
     static var screenHz: Int { NSScreen.screens.first?.maximumFramesPerSecond ?? 60 }
 
+    /// Pixels per point on the same screen: 2 on a Retina screen, 1 on most external ones.
+    static var screenScale: CGFloat { NSScreen.screens.first?.backingScaleFactor ?? 2 }
+
+    /// The frame caps that divide the screen's rate, lowest first: 30, 40, 60 and 120 on a 120 Hz
+    /// screen, 30 and 60 on a 60 Hz one. Each frame then shows for the same number of refreshes.
+    static func capChoices(screenHz hz: Int = Profiles.screenHz) -> [Int] {
+        [4, 3, 2, 1].compactMap { n in hz % n == 0 && hz / n >= 24 ? hz / n : nil }
+    }
+
     /// The DXVK and DXMT config files a game needs, or nil when Unwine has nothing to set.
     static func configs(settings s: GameSettings, renderer: Renderer, api: GraphicsAPI? = nil, gameDir: URL?,
-                        screenHz: Int = Profiles.screenHz) -> (dxvk: String?, dxmt: String?) {
+                        screenHz: Int = Profiles.screenHz, screenScale: CGFloat = Profiles.screenScale,
+                        battery: BatteryOverlay? = nil) -> (dxvk: String?, dxmt: String?) {
         func shipped(_ name: String) -> String {
             guard let dir = gameDir, let text = try? String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8) else { return "" }
             return "# From the game's own \(name):\n\(text)\n"
         }
         var dxvk: [String] = []
         if renderer != .wined3d {
-            // DXVK 3 reads dxvk.maxFrameRate, older builds dxgi/d3d9.maxFrameRate; unknown keys are ignored.
-            if let cap = s.fpsCap { dxvk += ["dxgi.maxFrameRate = \(cap)", "d3d9.maxFrameRate = \(cap)", "dxvk.maxFrameRate = \(cap)"] }
+            if let cap = s.fpsCap, cap > 0, screenHz >= cap, screenHz % cap == 0 {
+                // A cap that divides the screen's rate becomes V-Sync on every Nth refresh: DXVK shows
+                // each frame for exactly that many refreshes, with no CPU timer. DXVK's own limiter
+                // paces badly, its log says. Still to check on KosmicKrisp: the frame-interval graph
+                // of the Metal HUD should show one even bar.
+                let interval = screenHz / cap
+                dxvk += ["dxgi.syncInterval = \(interval)", "d3d9.presentInterval = \(interval)"]
+            } else if let cap = s.fpsCap {
+                // DXVK 3 reads dxvk.maxFrameRate, older builds dxgi/d3d9.maxFrameRate; unknown keys are ignored.
+                dxvk += ["dxgi.maxFrameRate = \(cap)", "d3d9.maxFrameRate = \(cap)", "dxvk.maxFrameRate = \(cap)"]
+            }
+            if battery != nil { dxvk.append("dxvk.numCompilerThreads = \(BatteryOverlay.compilerThreads)") }
             if s.lowLatency { dxvk.append("dxvk.latencySleep = True") }
             // Background shader builds, said out loud so no build default decides it.
             dxvk.append(s.asyncShaders ? "dxvk.enableAsync = True" : "dxvk.enableAsync = False")
@@ -130,6 +187,12 @@ enum Profiles {
                 dxmt.append("# 120 fps mode: pace to the screen's \(screenHz) Hz, not the game's display mode.")
                 dxmt.append("d3d11.preferredMaxFrameRate = \(screenHz)")
             }
+            // MetalFX sharpening enlarges the picture by the screen's own scale, so it lands on the
+            // real pixels. A 1x screen gets 1.0: there is nothing to add, and the switch does nothing.
+            if s.metalFXSpatial {
+                dxmt.append("d3d11.metalSpatialUpscaleFactor = \(String(format: "%.1f", min(2, max(1, screenScale))))")
+            }
+            if let tess = s.maxTessFactor { dxmt.append("d3d11.maxTessFactor = \(min(64, max(4, tess)))") }
         }
         // A game's own dxvk.conf or dxmt.conf counts too: Unwine's file replaces the game's, so it carries it.
         let header = "# Written by Unwine. Settings from Steam's launch options still apply on top.\n"
@@ -140,10 +203,16 @@ enum Profiles {
 
     static func render(appID: Int?, settings s: GameSettings, renderer: Renderer,
                        engine: InstalledEngine, d3dmetal: D3DMetalInstall?,
-                       hasDXVKConfig: Bool = false, hasDXMTConfig: Bool = false) -> String {
+                       hasDXVKConfig: Bool = false, hasDXMTConfig: Bool = false,
+                       battery: BatteryOverlay? = nil) -> String {
         let q = Runner.shellQuote
         var out = ["# Written by Unwine for \(appID.map { "Steam app \($0)" } ?? "games without their own settings").",
                    "# Renderer: \(renderer.rawValue)"]
+        // `s` already carries the overlay's cap (D3DMetal's below, DXVK's and DXMT's in their files).
+        if let battery {
+            out.append("# Saving battery (\(battery.strict ? "Low Power Mode or heat" : "on battery")): frame cap "
+                       + "\(s.fpsCap.map { "\($0) fps" } ?? "none"), no 120 fps mode, \(BatteryOverlay.compilerThreads) DXVK shader threads.")
+        }
         func export(_ k: String, _ v: String) { out.append("export \(k)=\(q(v))") }
         func dir(_ name: String) -> String { engine.renderer(name).path }
 

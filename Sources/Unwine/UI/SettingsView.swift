@@ -76,6 +76,8 @@ struct SettingsView: View {
                         if case .needsUser(let why) = model.steps[.gptk] { Text(why).font(.system(size: 11)).foregroundStyle(Palette.warn) }
                     }
 
+                    group("New games") { NewGamesControls() }
+
                     group("Steam") {
                         row("Steam Play", stateText)
                         row("Steam version", model.steamVersion ?? "Unknown")
