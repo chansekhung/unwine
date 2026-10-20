@@ -100,6 +100,10 @@ struct SettingsView: View {
                                 PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
                             }
                         } else if model.online.installed {
+                            Toggle("High Resolution Mode", isOn: $model.stored.onlineHighResolution)
+                                .onChange(of: model.stored.onlineHighResolution) { OnlineSteam.highResolution = model.stored.onlineHighResolution; model.save() }
+                            Text("On: games and Windows Steam use your screen's full pixels, like CrossOver's switch of the same name. Set a game to your screen's full size (\(fullScreenPixels)). Off: everything draws at half size and macOS scales it up, which is lighter on the GPU; set games to \(halfScreenPixels). Applies the next time Windows Steam starts.")
+                                .font(.system(size: 11)).foregroundStyle(Palette.muted)
                             Toggle("Game Mode for games in Windows Steam (experimental)", isOn: $model.stored.onlineGameMode)
                                 .onChange(of: model.stored.onlineGameMode) { OnlineSteam.gameModeForGames = model.stored.onlineGameMode; model.save() }
                             Text(model.online.inUse
@@ -172,6 +176,16 @@ struct SettingsView: View {
     }
 
     private var addingGPTK: Bool { model.steps[.gptk]?.isRunning == true }
+
+    private var fullScreenPixels: String {
+        guard let s = NSScreen.main else { return "3024 x 1964" }
+        return "\(Int(s.frame.width * s.backingScaleFactor)) x \(Int(s.frame.height * s.backingScaleFactor))"
+    }
+
+    private var halfScreenPixels: String {
+        guard let s = NSScreen.main else { return "1512 x 982" }
+        return "\(Int(s.frame.width)) x \(Int(s.frame.height))"
+    }
 
     private var removeMessage: String {
         let f = { (b: Int64) in ByteCountFormatter.string(fromByteCount: b, countStyle: .file) }

@@ -104,6 +104,8 @@ enum Profiles {
             // DXVK 3 reads dxvk.maxFrameRate, older builds dxgi/d3d9.maxFrameRate; unknown keys are ignored.
             if let cap = s.fpsCap { dxvk += ["dxgi.maxFrameRate = \(cap)", "d3d9.maxFrameRate = \(cap)", "dxvk.maxFrameRate = \(cap)"] }
             if s.lowLatency { dxvk.append("dxvk.latencySleep = True") }
+            // Background shader builds, said out loud so no build default decides it.
+            dxvk.append(s.asyncShaders ? "dxvk.enableAsync = True" : "dxvk.enableAsync = False")
         }
         var dxmt: [String] = []
         // DXMT runs every layer choice except DXVK, WineD3D and a real D3DMetal (which has its own cap).
@@ -156,7 +158,7 @@ enum Profiles {
             let three = engine.renderer("dxvk3")
             let patched = s.asyncShaders ? RendererPatches.asyncDir("dxvk3", engine: engine) : nil
             export("WINEDLLPATH_DXVK", patched?.path ?? (FileManager.default.fileExists(atPath: three.path) ? three.path : dir("dxvk")))
-            export("DXVK_ASYNC", "1")
+            export("DXVK_ASYNC", s.asyncShaders ? "1" : "0")
             if let cap = s.fpsCap { export("DXVK_FRAME_RATE", String(cap)) }   // DXVK 1.x; 3.x reads the config file
         case .wined3d:
             break
@@ -164,8 +166,9 @@ enum Profiles {
             export("WINEDLLPATH_DXMT", dir("dxmt"))
             export("DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN", "1")
             if s.metalFX { export("DXMT_ENABLE_NVEXT", "1") }
-            // Bottles run without Retina mode, so a game draws at the screen's point size and
-            // DXMT's default 2x MetalFX output lands on the screen's real pixels.
+            // Steam Play bottles run without Retina mode (Online mode's follows its High Resolution
+            // Mode switch), so a game draws at the screen's point size and DXMT's default 2x MetalFX
+            // output lands on the screen's real pixels.
             if s.metalFXSpatial { export("DXMT_METALFX_SPATIAL_SWAPCHAIN", "1") }
             if hasDXMTConfig { export("DXMT_CONFIG_FILE", dxmtConfig(for: appID).path) }
         }

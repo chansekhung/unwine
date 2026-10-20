@@ -20,6 +20,7 @@ struct StoredState: Codable {
     var onlineEnvHash: String?          // the settings Windows Steam last started with; its games inherit them
     var onlineEnv: [String: String]?    // those settings, to name what changed when a game needs others
     var onlineGameMode = false          // experimental: macOS Game Mode for the games Windows Steam starts
+    var onlineHighResolution = false    // CrossOver's High Resolution Mode for the Windows Steam bottle
     var presetChoice: [Int: String] = [:]   // the preset last clicked per game, to break ties
 
     init() {}
@@ -42,6 +43,7 @@ struct StoredState: Codable {
         onlineEnvHash = try? c.decodeIfPresent(String.self, forKey: .onlineEnvHash)
         onlineEnv = try? c.decodeIfPresent([String: String].self, forKey: .onlineEnv)
         onlineGameMode = (try? c.decodeIfPresent(Bool.self, forKey: .onlineGameMode)) ?? false
+        onlineHighResolution = (try? c.decodeIfPresent(Bool.self, forKey: .onlineHighResolution)) ?? false
         presetChoice = (try? c.decodeIfPresent([Int: String].self, forKey: .presetChoice)) ?? [:]
     }
 }
@@ -214,6 +216,7 @@ final class AppModel {
         d3dmetal = D3DMetalStore.installed().first
         if let engine { RendererPatches.prepare(engine: engine, log: log) }
         OnlineSteam.gameModeForGames = stored.onlineGameMode
+        OnlineSteam.highResolution = stored.onlineHighResolution
         if let engine {
             if Runner.matches(engine) {
                 runnerReady = true
@@ -793,7 +796,10 @@ final class AppModel {
                                          "Windows programs start slowly on a Mac", opens]
                                       : ["Starting Windows Steam…", "Steam checks for its own updates…", "Starting \(game!.name)…",
                                          "VAC checks the game", "The game window opens soon"]
-            if !steamUp { try OnlineSteam.shareGames(onlineGames(adding: game)) }
+            if !steamUp {
+                await OnlineSteam.applyHighResolution(engine: engine)
+                try OnlineSteam.shareGames(onlineGames(adding: game))
+            }
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
             if !steamUp {
                 stored.onlineEnvHash = hash

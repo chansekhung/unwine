@@ -185,24 +185,74 @@ enum OnlineSteam {
 
         // A file next to the bottle's C: drive keeps the path free of spaces.
         let regFile = prefix.appendingPathComponent("drive_c/decant-settings.reg")
-        try registrySettings().write(to: regFile)
+        try registrySettings(highResolution: highResolution).write(to: regFile)
         defer { try? FileManager.default.removeItem(at: regFile) }
         await run(loader, ["regedit", "/S", #"C:\decant-settings.reg"#], env: env, timeout: .seconds(2 * 60))
         await run(engine.wineserver, ["-w"], env: env, timeout: .seconds(3 * 60))   // Wine saves user.reg as the server quits
         let saved = (try? Data(contentsOf: prefix.appendingPathComponent("user.reg"))).map { String(decoding: $0, as: UTF8.self) } ?? ""
-        if !saved.contains("\"RetinaMode\"=\"n\"") { log.line("Warning: the bottle's settings did not take.") }
+        if !saved.contains("\"RetinaMode\"=\"\(highResolution ? "y" : "n")\"") { log.line("Warning: the bottle's settings did not take.") }
     }
 
-    /// The bottle's settings as a .reg file. Wine's regedit wants UTF-16 with a byte-order mark and CRLF
-    /// line ends. The Mac driver values must be strings, never DWORDs.
-    static func registrySettings() -> Data {
+    /// CrossOver's "High Resolution Mode", for the whole bottle (Wine reads it once per process and
+    /// never per program). On: Wine's Retina mode plus 192 DPI, so Windows Steam draws sharp at its
+    /// usual size, and a game set to the screen's full pixel size gets exactly that, with no display
+    /// mode switch. Off: everything draws at the screen's point size and macOS scales it up. A game
+    /// set to the full pixel size then gets a picture of the wrong size, which DXVK keeps rebuilding.
+    static var highResolution: Bool {
+        get { state.highResolution }
+        set { state.highResolution = newValue }
+    }
+
+    /// Writes the High Resolution Mode choice into the bottle when it differs. Only while the bottle
+    /// is closed: Wine reads it when a process starts, and saves the registry when its server quits.
+    static func applyHighResolution(engine: InstalledEngine) async {
+        let want = highResolution ? "y" : "n"
+        let userReg = prefix.appendingPathComponent("user.reg")
+        let saved = (try? Data(contentsOf: userReg)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        guard isInstalled, !saved.contains("\"RetinaMode\"=\"\(want)\"") else { return }
+        // Just after Steam quits, Wine's server can take a few seconds to go.
+        for _ in 0..<15 where isInUse { await pause(1000) }
+        guard !isInUse else { log.line("High Resolution Mode changes the next time the bottle closes."); return }
+        var env = makeEnvironment(engine: engine, profile: nil).env
+        env["WINELOADER"] = engine.wine.path
+        let regFile = prefix.appendingPathComponent("drive_c/unwine-display.reg")
+        do { try displaySettings(highResolution: highResolution).write(to: regFile) } catch { return }
+        defer { try? FileManager.default.removeItem(at: regFile) }
+        await run(engine.wine, ["regedit", "/S", #"C:\unwine-display.reg"#], env: env, timeout: .seconds(2 * 60))
+        await run(engine.wineserver, ["-w"], env: env, timeout: .seconds(3 * 60))
+        let now = (try? Data(contentsOf: userReg)).map { String(decoding: $0, as: UTF8.self) } ?? ""
+        log.line(now.contains("\"RetinaMode\"=\"\(want)\"")
+                 ? "High Resolution Mode is \(highResolution ? "on" : "off") in the bottle"
+                 : "Warning: High Resolution Mode did not take in the bottle.")
+    }
+
+    private static func displaySettings(highResolution: Bool) -> Data {
         let lines = [
             "Windows Registry Editor Version 5.00",
             "",
             "[HKEY_CURRENT_USER\\Software\\Wine\\Mac Driver]",
-            "\"RetinaMode\"=\"n\"",             // Steam draws at normal size, not doubled
+            "\"RetinaMode\"=\"\(highResolution ? "y" : "n")\"",
+            "",
+            "[HKEY_CURRENT_USER\\Control Panel\\Desktop]",
+            "\"LogPixels\"=dword:\(highResolution ? "000000c0" : "00000060")",
+            "",
+        ]
+        return Data([0xFF, 0xFE]) + (lines.joined(separator: "\r\n").data(using: .utf16LittleEndian) ?? Data())
+    }
+
+    /// The bottle's settings as a .reg file. Wine's regedit wants UTF-16 with a byte-order mark and CRLF
+    /// line ends. The Mac driver values must be strings, never DWORDs.
+    static func registrySettings(highResolution: Bool = false) -> Data {
+        let lines = [
+            "Windows Registry Editor Version 5.00",
+            "",
+            "[HKEY_CURRENT_USER\\Software\\Wine\\Mac Driver]",
+            "\"RetinaMode\"=\"\(highResolution ? "y" : "n")\"",     // High Resolution Mode (the user's switch)
             "\"LeftOptionIsAlt\"=\"y\"",
             "\"RightOptionIsAlt\"=\"y\"",
+            "",
+            "[HKEY_CURRENT_USER\\Control Panel\\Desktop]",
+            "\"LogPixels\"=dword:\(highResolution ? "000000c0" : "00000060")",
             "",
             "[HKEY_CURRENT_USER\\Software\\Wine\\WineDbg]",
             "\"ShowCrashDialog\"=dword:00000000",
@@ -556,6 +606,9 @@ enum OnlineSteam {
         // those settings (Low latency, frame caps) never need a Steam restart.
         env["DXVK_CONFIG_FILE"] = onlineDXVKConfig.path
         env["DXMT_CONFIG_FILE"] = onlineDXMTConfig.path
+        // Not read by Wine: it puts the bottle's High Resolution Mode into the settings Unwine compares,
+        // so a change asks for a Steam restart like any other.
+        env["UNWINE_HIGH_RESOLUTION"] = highResolution ? "1" : "0"
 
         // Wine refuses a process whose msync setting differs from the server's, so the game's choice
         // holds for the whole bottle. Steam restarts when it changes.
@@ -593,7 +646,8 @@ enum OnlineSteam {
                      "WINEDLLPATH_DXMT": "graphics layer", "WINEDLLPATH_D3DMETAL": "graphics layer", "WINEDLLPATH_DXVK": "graphics layer",
                      "DXMT_METALFX_SPATIAL_SWAPCHAIN": "MetalFX sharpening", "DXMT_ENABLE_NVEXT": "MetalFX for DLSS",
                      "ROSETTA_ADVERTISE_AVX": "AVX for games", "WINEMSYNC": "fast sync (msync)",
-                     "VK_DRIVER_FILES": "Vulkan driver", "VK_ICD_FILENAMES": "Vulkan driver"]
+                     "VK_DRIVER_FILES": "Vulkan driver", "VK_ICD_FILENAMES": "Vulkan driver",
+                     "UNWINE_HIGH_RESOLUTION": "High Resolution Mode"]
         var out: [String] = []
         for key in Set(old.keys).union(new.keys).sorted() where old[key] != new[key] && key != "WINELOADER" {
             let name = names[key] ?? key
@@ -1326,6 +1380,12 @@ private final class OnlineState: @unchecked Sendable {
     var session: [String: String]? {
         get { lock.withLock { launchEnvironment } }
         set { lock.withLock { launchEnvironment = newValue } }
+    }
+
+    private var hires = false
+    var highResolution: Bool {
+        get { lock.withLock { hires } }
+        set { lock.withLock { hires = newValue } }
     }
 
     private var whole = false
