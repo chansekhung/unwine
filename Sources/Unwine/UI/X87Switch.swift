@@ -38,7 +38,7 @@ struct X87Switch: View {
         .confirmationDialog("Turn on Faster x87 math?", isPresented: $asking) {
             Button("Download and turn on") { Task { await model.enableX87(for: game.id) } }
         } message: {
-            Text("Old 32-bit games do a lot of x87 math, and Rosetta runs it slowly. x87sidecar makes this math much faster. It is a free program by other people (MIT licence), from github.com/athei/x87sidecar. Unwine downloads it one time (\(X87Sidecar.sizeText)) and checks it with your Mac's Rosetta.\n\nThe first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. Allow it: if you do not, the game does not start. x87sidecar uses 64-bit math, not the 80-bit math of old PCs, so a few games can glitch. If a game glitches, turn the switch off. x87sidecar stays off for every other game.")
+            Text("Old 32-bit games do a lot of x87 math, and Rosetta runs it slowly. x87sidecar makes this math much faster. It is a free program by other people (MIT licence), from github.com/athei/x87sidecar. Unwine downloads it one time (\(X87Sidecar.sizeText)) and checks it with your Mac's Rosetta.\n\nThe first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. Allow it: if you do not, the game does not start. x87sidecar uses 64-bit math, not the 80-bit math of old PCs, so a few games can glitch. \(problems) If a game glitches, turn the switch off. x87sidecar stays off for every other game.")
         }
         .task(id: game.id) { session = await model.x87Session(for: game.id) }
     }
@@ -46,6 +46,11 @@ struct X87Switch: View {
     /// The switch's note: what it does, or why it does nothing now, with the next step.
     @ViewBuilder
     private func state(_ s: GameSettings, busy: Bool, blocker: String?) -> some View {
+        // What this game's own code says, first: it decides if the switch is worth turning on.
+        if let mix = model.analysis(for: game)?.mathMix {
+            let costs = mix.verdict == .none || mix.verdict == .little
+            note(mix.advice + (s.x87 && costs ? " Turn this switch off for more speed." : ""), warn: costs)
+        }
         if !s.x87 {
             note(blocker ?? offNote, warn: blocker != nil)
             if blocker == nil {
@@ -96,7 +101,19 @@ struct X87Switch: View {
 
     // x87sidecar's entitled build attaches by itself (this engine has no cooperative handshake), and an
     // attach that fails does not start the game: its README says so for this mode.
-    private let onNote = "x87sidecar makes this game's x87 math much faster. The first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. Allow it: if you do not, the game does not start. If the game glitches, crashes or does not start, turn this off."
+    private var onNote: String {
+        "x87sidecar makes this game's x87 math much faster. The first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. Allow it: if you do not, the game does not start. "
+            + problems + " If the game glitches, crashes or does not start, turn this off."
+    }
+
+    /// What goes wrong with it on this engine, seen on 21 Oct 2026. The attach turns off Rosetta's
+    /// ahead-of-time cache for the whole game. Age of Mythology crashed in about half its starts. The
+    /// Steam overlay (gameoverlayui) cannot attach to a game that x87sidecar holds, so Steam never
+    /// sees the game end and its Play button stays on "Stop".
+    private var problems: String {
+        "It is experimental. Rosetta's fast cache is off while it runs, so code that is not x87 runs slower. Some games crash with it."
+            + (game.localExe == nil ? " The Steam overlay does not open, and after you quit, Steam can still show \"Stop\". Then quit Steam and open it again." : "")
+    }
 
     private func notAttachedNote(_ reason: String) -> String {
         "Last time, x87sidecar did not attach, so the game ran without faster x87 math. "

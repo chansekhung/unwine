@@ -33,6 +33,8 @@ struct GameAnalysis: Codable, Sendable, Equatable {
     var hasDLSS = false
     /// `GameAnalyzer.fingerprint` of the game when it was read. A new one means the game changed.
     var fingerprint: String? = nil
+    /// How much of a 32-bit game's math is x87, read from its code. Nil for 64-bit games.
+    var mathMix: MathMix? = nil
 
     /// False when a newer Unwine detects more than the one that made this, so it is worth redoing.
     var isCurrent: Bool { analyzerVersion == GameAnalyzer.version }
@@ -51,6 +53,7 @@ extension GameAnalysis {
         analyzerVersion = try c.decodeIfPresent(Int.self, forKey: .analyzerVersion)
         hasDLSS = (try? c.decodeIfPresent(Bool.self, forKey: .hasDLSS)) ?? false
         fingerprint = try? c.decodeIfPresent(String.self, forKey: .fingerprint)
+        mathMix = try? c.decodeIfPresent(MathMix.self, forKey: .mathMix)
     }
 }
 
@@ -88,8 +91,8 @@ private extension Character {
 
 enum GameAnalyzer {
     /// Bump when detection changes, so games analysed by an older Unwine are looked at again.
-    /// 4: DLSS, and the fingerprint that replaced the 7-day timer.
-    static let version = 4
+    /// 4: DLSS, and the fingerprint that replaced the 7-day timer. 5: the x87 share of 32-bit games.
+    static let version = 5
 
     /// What changes when the game changes: Steam's build id (the appmanifest's "buildid") for a Steam
     /// game, the program's size and date for one added by its .exe. Nil when neither can be read.
@@ -176,6 +179,20 @@ enum GameAnalyzer {
     /// Reading imports and text is the slow part, so a game with many matching DLLs gets the nearest ones.
     private static let maxRendererDLLs = 24
 
+    /// DLLs that are Windows', the compiler's or a store's, not the game's own code. They do not say
+    /// how the game does its math.
+    private static let notGameDLLs = ["msvc", "vcruntime", "ucrtbase", "api-ms-", "concrt", "mfc", "atl", "vcomp",
+                                      "steam_api", "steamclient", "gameoverlay", "galaxy", "eossdk", "discord",
+                                      "xinput", "dinput", "dsound", "d3d", "dxgi", "opengl32", "vulkan", "dbghelp", "crashrpt"]
+    /// Bought-in libraries for video, web pages, streaming and network: big, and not the game's math.
+    /// Left 4 Dead 2 carries a 20 MB web browser (libcef.dll), Age of Mythology a Twitch video encoder.
+    private static let notGameLibraries = ["cef", "icu", "libmfx", "twitch", "lame", "curl", "ffmpeg", "avcodec", "avformat",
+                                           "avutil", "swscale", "swresample", "bink", "ssl", "libeay", "crypto", "dxvk",
+                                           "nvtt", "awesomium", "chrome", "openvr"]
+
+    /// The x87 scan reads the game's program and its biggest own DLLs, where the game's math is.
+    private static let maxMathDLLs = 8
+
     /// Folder names (relative to the game's folder) above `url`, lowercased. `level` is the walker's depth.
     private static func folders(above url: URL, level: Int) -> [String] {
         url.pathComponents.suffix(level).dropLast().map { $0.lowercased() }
@@ -192,6 +209,7 @@ enum GameAnalyzer {
         let fm = FileManager.default
         var exes: [(url: URL, size: Int)] = []
         var rendererDLLs: [URL] = []
+        var gameDLLs: [(url: URL, size: Int, inBin: Bool)] = []
         var antiCheat = Set<String>()
         var engine: String?
         var hasAgilitySDK = false
@@ -236,8 +254,12 @@ enum GameAnalyzer {
                     case dlssFile: hasDLSS = true
                     default: break
                     }
-                    if level <= 4, rendererNeedles.contains(where: { lower.contains($0) }), !isInRedist(parents) {
-                        rendererDLLs.append(url)
+                    if level <= 4, !isInRedist(parents) {
+                        if rendererNeedles.contains(where: { lower.contains($0) }) { rendererDLLs.append(url) }
+                        if !notGameDLLs.contains(where: { lower.hasPrefix($0) }), !notGameLibraries.contains(where: { lower.contains($0) }) {
+                            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                            gameDLLs.append((url, size, parents.contains { $0 == "bin" || $0 == "binaries" || $0 == "system" }))
+                        }
                     }
                 } else if lower == "gameinfo.txt", level == 2 {
                     hasGameInfo = true
@@ -295,8 +317,21 @@ enum GameAnalyzer {
         // on DirectX 9, so the highest import would be wrong. The DX9 layer is the one it really uses.
         if engine == "Source", hasShaderAPIDX9 { api = .dx9 }
 
+        // Engines like Source keep almost all their code in DLLs (Left 4 Dead 2's exe is a small
+        // launcher), so the biggest ones are read with the program. Only DLLs beside the program or in
+        // a bin or System folder count (RPG Maker VX Ace keeps its whole engine in System/RGSS301.dll):
+        // other folders hold tools and add-ons. About 20 ms for each 5 MB file.
+        var mathMix: MathMix?
+        if !is64, let exe = candidates.first?.url {
+            let exeFolder = exe.deletingLastPathComponent().standardizedFileURL.path
+            let dlls = gameDLLs
+                .filter { $0.inBin || $0.url.deletingLastPathComponent().standardizedFileURL.path == exeFolder }
+                .sorted { $0.size > $1.size }.prefix(maxMathDLLs).map(\.url)
+            mathMix = X87Scan.scan([exe] + dlls)
+        }
+
         let main = candidates.first.map { String($0.url.path.dropFirst(installDir.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/")) }
         return GameAnalysis(api: api, is64Bit: is64, mainExe: main, antiCheat: antiCheat.sorted(), engine: engine,
-                            analyzedAt: Date(), analyzerVersion: version, hasDLSS: hasDLSS)
+                            analyzedAt: Date(), analyzerVersion: version, hasDLSS: hasDLSS, mathMix: mathMix)
     }
 }

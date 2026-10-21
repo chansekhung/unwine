@@ -17,6 +17,28 @@ enum PEInspector {
         return Info(is64Bit: image.is64Bit, imports: image.imports(in: file))
     }
 
+    /// The bytes of a 32-bit program's code sections, for `X87Scan`, without the padding the file adds
+    /// after them. Nil for 64-bit programs, .NET programs and files that are not Windows programs.
+    /// Reads at most `limit` bytes.
+    static func code32(_ url: URL, limit: Int) -> [[UInt8]]? {
+        guard let file = RandomAccessFile(url), let image = Image(file), !image.is64Bit, !image.isDotNet else { return nil }
+        var blocks: [[UInt8]] = []
+        var left = limit
+        for s in image.sections where s.isCode && left > 0 {
+            let size = min(s.rawSize, s.declaredSize > 0 ? s.declaredSize : s.rawSize, left)
+            guard size > 0, let bytes = file.read(size, at: s.rawOffset) else { continue }
+            blocks.append(bytes)
+            left -= bytes.count
+        }
+        return blocks
+    }
+
+    /// A .NET program: its code is IL, which the .NET runtime compiles while the program runs.
+    static func isDotNet(_ url: URL) -> Bool {
+        guard let file = RandomAccessFile(url), let image = Image(file) else { return false }
+        return image.isDotNet
+    }
+
     /// What a program says about itself in its resources: its name and its icon.
     struct Resources {
         /// ProductName from each language of the version info, English first. Empty when it has none.
@@ -370,6 +392,8 @@ enum PEInspector {
             let rawOffset: Int
             let rawSize: Int
             let flags: Int
+            /// The size the section declares, before the file pads it (0 when it declares none).
+            var declaredSize = 0
 
             /// Holds code, or can be run. Strings for LoadLibrary live in the other sections.
             var isCode: Bool { flags & 0x2000_0020 != 0 }
@@ -380,6 +404,8 @@ enum PEInspector {
         let sizeOfHeaders: Int
         /// (RVA, size) per data directory the file declares, up to 16.
         let directories: [(rva: Int, size: Int)]
+        /// Data directory 14 is the CLR header, which only .NET programs have.
+        var isDotNet: Bool { directories.count > 14 && directories[14].rva != 0 }
 
         init?(_ file: RandomAccessFile) {
             // "MZ", then the offset of "PE\0\0".
@@ -413,7 +439,7 @@ enum PEInspector {
                       let rawSize = PEInspector.le32(tail, o + 16), let rawOffset = PEInspector.le32(tail, o + 20),
                       let flags = PEInspector.le32(tail, o + 36) else { break }
                 sections.append(Section(virtualAddress: virtualAddress, virtualSize: max(virtualSize, rawSize),
-                                        rawOffset: rawOffset, rawSize: rawSize, flags: flags))
+                                        rawOffset: rawOffset, rawSize: rawSize, flags: flags, declaredSize: virtualSize))
             }
             self.sections = sections
         }
