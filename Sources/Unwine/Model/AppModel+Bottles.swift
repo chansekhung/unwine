@@ -96,9 +96,6 @@ extension AppModel {
         return .nextStart
     }
 
-    /// The bottle writes go to Unwine's own log: Show logs on a game's page opens Steam Play's logs.
-    func showBottleLog() { NSWorkspace.shared.activateFileViewerSelecting([log.url]) }
-
     /// The game uses DirectDraw, so cnc-ddraw draws it (under every layer but WineD3D). Cached per
     /// game folder, and the profile writes at Unwine's start have read it already.
     func usesDirectDraw(_ game: SteamGame) -> Bool {
@@ -126,9 +123,18 @@ extension AppModel {
 }
 
 extension GameSettings {
-    /// Logs, display and experimental choices are the player's, not speed or battery settings, so a
-    /// preset keeps them.
+    /// The player's own choices, not speed or battery settings, so a preset keeps them: the Metal
+    /// overlay, MetalFX sharpening, Low latency, background shader building, 120 fps mode, Save battery
+    /// when unplugged, Faster x87 math, and the logs, display and experimental choices.
     mutating func keepPlayerChoices(from other: GameSettings) {
+        metalHUD = other.metalHUD
+        metalFXSpatial = other.metalFXSpatial
+        lowLatency = other.lowLatency
+        asyncShaders = other.asyncShaders
+        fps120 = other.fps120
+        saveBatteryUnplugged = other.saveBatteryUnplugged
+        x87 = other.x87
+        x87PreciseFaults = other.x87PreciseFaults
         detailedLogs = other.detailedLogs
         retina = other.retina
         fillScreen = other.fillScreen

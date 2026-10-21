@@ -53,6 +53,9 @@ enum X87Sidecar {
         return [("ROSETTA_X87_PATH", binary.path)] + (s.x87PreciseFaults ? [("X87_PRECISE_FAULTS", "1")] : [])
     }
 
+    /// Every name `exports` can set. Making a bottle runs without them (LocalGames.withoutX87).
+    static let variables: Set<String> = ["ROSETTA_X87_PATH", "X87_PRECISE_FAULTS"]
+
     /// True when this engine's Wine runs 32-bit processes through ROSETTA_X87_PATH. Read once per engine.
     @MainActor static func engineHasHook(_ engine: InstalledEngine) -> Bool {
         if let known = hooks[engine.folder] { return known }

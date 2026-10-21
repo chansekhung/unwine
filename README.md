@@ -22,10 +22,24 @@ Mac Steam, and it runs through Unwine's free engine, like Proton on a Steam Deck
   sleep, for DirectX 8/9 games and the DXVK layer), background shader building (DirectX 8/9) and a
   120 fps mode (DXMT, for games that ask for 60 Hz on a faster screen). Your own choices always win:
   the advisor only suggests, and nothing is locked.
+- Automatic battery mode: on battery, in Low Power Mode or when the Mac is hot, games start with a
+  60 fps cap (40 fps in Low Power Mode or heat) and without 120 fps mode. Plugged in, nothing changes.
+  Each game has a switch, your own frame cap always stays, and games you start from Mac Steam get it
+  too while Unwine is open.
 - Add game: any Windows program outside Steam, by its .exe or its folder. Each one gets its own Wine
   bottle and the same per-game settings. Programs from one game folder (a launcher and its game)
-  share one bottle, so the launcher's settings reach the game. Right-click a game to play, rename or
-  remove it.
+  share one bottle, so the launcher's settings reach the game. Right-click a game to play, quit, rename
+  or remove it.
+- Launch options and mods on each game page: launch options for added games, extra NAME=value
+  settings, DLL overrides for mod loaders (dinput8, version, winmm, dsound, winhttp) and a game
+  language, so old games show Japanese or Chinese text. Steam's own launch options still apply, but
+  Wine gets only the names NotProton passes on: CX_GRAPHICS*, D3DM_*, DXMT_*, DXVK_*, MTL_*,
+  ROSETTA_*, Steam*, WINEDLLOVERRIDES, WINEDEBUG, WINEMSYNC and a few more. Unwine's Extra settings
+  reach every name.
+- Wine tools for each game's bottle: run an installer, a patch or a mod tool in it with the game's
+  settings, open Wine settings, the registry editor, the task manager or the uninstaller, and show the
+  bottle's C: drive, where many games keep their saves. After an installer ends, its entry can start
+  the installed game from the same bottle.
 - Fewer stutters: Unwine makes patched copies of DXVK's d3d9.dll (background shader building then also
   covers the screen's back buffers) and of the KosmicKrisp driver (the right memory budget under
   Rosetta). The downloaded files stay as they are.
@@ -35,6 +49,10 @@ Mac Steam, and it runs through Unwine's free engine, like Proton on a Steam Deck
   DLLs carry on without the share, and the hidden DirectX 9 device no longer covers the game's window.
 - No more DXMT freezes in 32-bit games: Unwine's copy of Wine lets the game's .exe decide DEP (Data
   Execution Prevention, a memory guard), as Windows does.
+- Faster x87 math (experimental, a switch per 32-bit game, off at first):
+  [x87sidecar](https://github.com/athei/x87sidecar) (MIT, by Lifeisawful and athei) makes Rosetta run
+  the x87 math of old games much faster. Unwine downloads it (181 KB) only when you turn it on, checks
+  its SHA-256 and checks it with this Mac's Rosetta. macOS asks for your password once after each login.
 - Font stand-ins: Windows fonts such as Palatino Linotype use the Mac's Palatino, so launchers do not
   show blank buttons. Chinese, Japanese and Korean fonts (MS UI Gothic, SimSun, PMingLiU, Gulim and
   others) use the Mac's PingFang, Hiragino, Songti and Apple SD Gothic Neo, so dialogs in those
@@ -47,11 +65,18 @@ Mac Steam, and it runs through Unwine's free engine, like Proton on a Steam Deck
 - macOS Game Mode turns on for games in fullscreen: Steam Play games, added games, and Online mode
   games (a switch in Settings).
 - Games come to the front when they open, also with Stage Manager on.
+- Storage in Settings shows what the engines, bottles, shader caches and downloads use, and cleans up
+  safely: leftover downloads, the bottles of removed games (to the Trash), old GPTK copies and saved
+  shaders. Each download is deleted once it is installed.
+- Logs open inside Unwine, for each game and for Unwine itself, with "Copy details for a bug report"
+  and "Report a problem". They stay quiet (only DXVK's and DXMT's warnings and errors) unless a game's
+  Detailed logs is on.
 - Updates itself: the engine (when Unwine can bridge it), Steam Play signature files, and the app.
 
 ## What it needs
 
-- An Apple Silicon Mac with macOS 15 or newer, Rosetta, and Mac Steam.
+- An Apple Silicon Mac with macOS 15 or newer, Rosetta, and Mac Steam for Steam games. Added games
+  run without Steam.
 - Steam Play switched on in Mac Steam, as described by the
   [NotProton project](https://github.com/NotProtonNot/NotProton). Unwine never changes Steam.app.
 

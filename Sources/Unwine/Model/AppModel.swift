@@ -224,6 +224,7 @@ final class AppModel {
     var online = OnlineStatus()
     var onlineStep: StepStatus = .pending
     var onlineWords: [String]?          // phase words while Unwine opens, restarts or closes Windows Steam
+    var onlineStarting: Int?            // the game Unwine starts in Windows Steam now, until its window shows (its tile's badge)
     var onlineRestartAsk: OnlineRestartAsk?   // a game needs settings Windows Steam did not start with
     var onlineForceQuit: [String]?      // games still running when the user asked to quit Windows Steam
     var onlineClosing = false           // Windows Steam is closing (it syncs Steam Cloud saves first)
@@ -768,22 +769,13 @@ final class AppModel {
     }
 
     /// Applies one of the advisor's setting sets. The layer goes back to Automatic (which is the
-    /// advised layer), and the Metal overlay stays as the user set it: it is a display choice.
-    /// The Metal overlay, MetalFX sharpening, Low latency, background shader building, 120 fps mode,
-    /// Save battery when unplugged and Faster x87 math stay as the user set them: they are the user's
-    /// choices, not speed or battery settings.
+    /// advised layer). The Metal overlay, MetalFX sharpening, Low latency, background shader building,
+    /// 120 fps mode, Save battery when unplugged, Faster x87 math and the logs, display and experimental
+    /// choices stay as the user set them: they are the user's choices, not speed or battery settings.
     func apply(_ preset: Preset, to game: SteamGame) {
         let now = settings(for: game.id)
         var s = settings(preset, for: game, advice: advice(for: game))
-        s.keepPlayerChoices(from: now)      // logs, display and experimental choices (AppModel+Bottles)
-        s.metalHUD = now.metalHUD
-        s.metalFXSpatial = now.metalFXSpatial
-        s.lowLatency = now.lowLatency
-        s.asyncShaders = now.asyncShaders
-        s.fps120 = now.fps120
-        s.saveBatteryUnplugged = now.saveBatteryUnplugged
-        s.x87 = now.x87
-        s.x87PreciseFaults = now.x87PreciseFaults
+        s.keepPlayerChoices(from: now)      // the one list of them (AppModel+Bottles)
         stored.games[game.id] = s
         stored.presetChoice[game.id] = preset.rawValue
         save()
@@ -799,18 +791,10 @@ final class AppModel {
         let gptk4 = d3dmetal?.isVersion4 == true
         func normal(_ s: GameSettings) -> GameSettings {
             var s = s
-            s.dropPlayerChoices()           // logs, display and experimental choices (AppModel+Bottles)
+            s.dropPlayerChoices()           // the user's own choices, the ones a preset keeps (AppModel+Bottles)
             let real = s.renderer == .auto ? a.renderer
                 : Profiles.resolve(s.renderer, analysis: stored.analyses[game.id], hasD3DMetal: d3dmetal != nil)
             if s.renderer == a.renderer { s.renderer = .auto }
-            s.metalHUD = false
-            s.metalFXSpatial = false
-            s.lowLatency = false
-            s.asyncShaders = true
-            s.fps120 = false
-            s.saveBatteryUnplugged = true
-            s.x87 = false
-            s.x87PreciseFaults = false
             if !(real == .d3dmetal && gptk4) { s.metal4 = true }
             if real == .wined3d || (real == .d3dmetal && !gptk4) || (real == .dxvk && api == .dx12) { s.fpsCap = nil }
             if !((api == .dx11 || api == .dx12) && (real == .d3dmetal || real == .dxmt)) { s.metalFX = false }
@@ -968,7 +952,7 @@ final class AppModel {
             if verdict == .closedEarly {
                 steamGamesRunning.remove(game.id)
                 show("\(game.name) closed before it showed a window. Its log says why.", .problem,
-                     action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
+                     action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
                 log.line("\(game.name) closed before it showed a window")
                 return
             }
@@ -979,7 +963,7 @@ final class AppModel {
             if case .timedOut(let started) = verdict {
                 if started {
                     show("\(game.name) is still starting. Its window shows soon. Its log says what it is doing.",
-                         action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
+                         action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
                 } else {
                     banner = "Steam has not started \(game.name) yet. Look in Steam: it can ask a question or update the game first."
                 }
@@ -1333,13 +1317,13 @@ final class AppModel {
             if ended {
                 localRunning.remove(game.id)
                 show("\(game.name) closed before it showed a window. Its log says why.", .problem,
-                     action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
+                     action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
                 log.line("The game closed before it showed a window")
                 await offerInstalledPrograms(game, before: before)
             } else {
                 if !shown {
                     show("\(game.name) is still starting. Its window shows soon. Its log says what it is doing.",
-                         action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
+                         action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
                 }
                 // Until the bottle closes: playtime, the display kept awake, and leftovers closed.
                 Task { await self.watchLocalSession(game, exited: exited, installsBefore: before, since: launched) }
@@ -1349,7 +1333,7 @@ final class AppModel {
             let moved: Bool = { if case LocalGamesError.missing = error { return true }; return false }()
             show("\(game.name) did not start: \(error.localizedDescription)", .problem,
                  action: moved ? .init("Locate…") { [weak self] in self?.locateLocalGame(game) }
-                               : .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
+                               : .init("Show logs") { [weak self] in self?.showLogs(of: game) })
             log.line("start failed: \(error)")
         }
         await refreshSteam()
@@ -1473,7 +1457,7 @@ final class AppModel {
             guard stored.onlineEngine == engine.folder else { return }
         }
         onlineWords = ["Getting Windows Steam ready…"]
-        defer { onlineWords = nil }
+        defer { onlineWords = nil; onlineStarting = nil }
         // Without a game, Windows Steam opens with the settings for new games, so a game that keeps
         // those settings starts in the same Steam with no restart.
         let profile = Profiles.file(for: game?.id)
@@ -1488,6 +1472,8 @@ final class AppModel {
             onlineRestartAsk = OnlineRestartAsk(game: game, changes: OnlineSteam.describeChanges(from: stored.onlineEnv ?? [:], to: now))
             return
         }
+        // The game's start: its words show in the library's Online mode card, its tile says Starting.
+        onlineStarting = game?.id
         if steamUp, let last = stored.onlineEnvHash, last != hash, restart == true {
             onlineWords = ["Restarting Windows Steam with this game's settings…", "Steam Cloud saves sync first"]
             onlineClosing = true
@@ -1552,7 +1538,7 @@ final class AppModel {
             let back = willReopenMacSteam ? " Mac Steam comes back by itself." : ""
             if stopped {
                 show("Windows Steam closed while it started. Try again. If it closes again, its log says why.", .problem,
-                     action: .init("Show log") { [weak self] in self?.revealLog(named: "online-steam.log") })
+                     action: .init("Show log") { [weak self] in self?.showLogs(of: nil, log: "online") })
                 log.line("online start: Windows Steam quit before it showed a window")
             } else if !shown {
                 banner = "Windows Steam is still starting. Its window shows soon."

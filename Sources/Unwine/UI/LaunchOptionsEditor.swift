@@ -33,7 +33,7 @@ struct LaunchOptionsEditor: View {
                 dllOverrides
                 languagePicker
                 if !isLocal {
-                    note("Steam's own Launch Options work too, but Wine gets only these names from them: \(LaunchOptions.steamPassesNames). Extra settings here reach every name, because Unwine's Steam tool reads this game's settings each time a program starts. When a name is in both places, Unwine's value wins. DLL overrides from both places add up.", warn: false)
+                    note("Steam's own Launch Options work too, but Wine gets only these names from them: \(LaunchOptions.steamPassesNames). Extra settings here reach every name, because Unwine's Steam tool reads this game's settings each time a program starts. When a name is in both places, Unwine's value wins. The log levels (WINEDEBUG, DXVK_LOG_LEVEL and DXMT_LOG_LEVEL) are the one exception: Steam's win, as Detailed logs says. DLL overrides from both places add up.", warn: false)
                 }
             }
             saveRow

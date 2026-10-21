@@ -663,6 +663,9 @@ enum OnlineSteam {
             if let text = try? String(contentsOf: profile, encoding: .utf8) {
                 let keys = Set(profileAssignments(text).map(\.key))
                 let applied = apply(text, to: &env)
+                // Every program in this bottle shares one DXMT, Windows Steam's own windows too. Online
+                // mode keeps DXMT as it ships, without the experimental "DirectX 12 through DXMT" part.
+                if env["WINEDLLPATH_DXMT"] == DXMTD3D12.wineFolder(engine).path { env["WINEDLLPATH_DXMT"] = engine.renderer("dxmt").path }
                 if applied.dropped {
                     let layer = keys.contains("WINEDLLPATH_D3DMETAL") ? "D3DMetal" : "DXVK"
                     notes.append("Online mode runs this game on DXMT, not \(layer). Windows Steam's own windows need DXMT, and the game inherits Steam's settings.")
@@ -720,6 +723,7 @@ enum OnlineSteam {
 
     /// Plain names for the settings that differ between two Windows Steam environments, for the
     /// question Unwine asks before it restarts Steam. Empty when there is nothing to compare with.
+    /// A name the user typed in Extra settings (DXVK_HUD) shows as it is: that is the name they know.
     static func describeChanges(from old: [String: String], to new: [String: String]) -> [String] {
         guard !old.isEmpty else { return [] }
         let names = ["MTL_HUD_ENABLED": "Metal performance overlay", "WINEDLLPATH_D9VK": "background shader building",
@@ -727,14 +731,31 @@ enum OnlineSteam {
                      "DXMT_METALFX_SPATIAL_SWAPCHAIN": "MetalFX sharpening", "DXMT_ENABLE_NVEXT": "MetalFX for DLSS",
                      "ROSETTA_ADVERTISE_AVX": "AVX for games", "WINEMSYNC": "fast sync (msync)",
                      "VK_DRIVER_FILES": "Vulkan driver", "VK_ICD_FILENAMES": "Vulkan driver",
-                     "UNWINE_HIGH_RESOLUTION": "High Resolution Mode", "UNWINE_FILL_SCREEN": "games fill the whole screen"]
+                     "UNWINE_HIGH_RESOLUTION": "High Resolution Mode", "UNWINE_FILL_SCREEN": "games fill the whole screen",
+                     // What a game's page sets now: logs, Faster x87 math, Display, Launch options and mods.
+                     "WINEDEBUG": "Detailed logs", "DXVK_LOG_LEVEL": "Detailed logs", "DXMT_LOG_LEVEL": "Detailed logs",
+                     "ROSETTA_X87_PATH": "Faster x87 math", "X87_PRECISE_FAULTS": "Faster x87 math",
+                     "CNC_DDRAW_CONFIG_FILE": "DirectDraw picture",
+                     "LANG": "game language", "LC_ALL": "game language", "WINEUSERLOCALE": "game language",
+                     "WINEDLLOVERRIDES": "DLL overrides", "DXMT_CONFIG": d3dmetalCapName, "TZ": "time zone"]
+        // WINELOADER names the same Steam each time. An older Unwine set WINEESYNC, which this Wine
+        // does not use (WineEnvironment), so its change changes nothing.
+        let unused: Set<String> = ["WINELOADER", "WINEESYNC"]
+        // A log level is Detailed logs only when one side has its levels. Else Unwine's quiet levels
+        // changed (a Steam started by an older Unwine), or a level the user typed.
+        let detailed: Set<String> = [WineEnvironment.detailedDebug, WineEnvironment.detailedLayerLog]
         var out: [String] = []
-        for key in Set(old.keys).union(new.keys).sorted() where old[key] != new[key] && key != "WINELOADER" {
-            let name = names[key] ?? key
+        for key in Set(old.keys).union(new.keys).sorted() where old[key] != new[key] && !unused.contains(key) {
+            var name = names[key] ?? key
+            if name == "Detailed logs", !detailed.contains(old[key] ?? ""), !detailed.contains(new[key] ?? "") { name = "log settings" }
             if !out.contains(name) { out.append(name) }
         }
         return out
     }
+
+    /// The restart question's name for a D3DMetal game's frame cap. DXMT gets that cap from Windows
+    /// Steam's own settings (`apply`), so unlike the caps in DXVK's and DXMT's files it waits for a restart.
+    static let d3dmetalCapName = "frame rate cap"
 
     /// DXMT draws Steam's windows too, so its frame cap holds for them.
     private static func dxmtCaps(_ env: [String: String]) -> Bool {

@@ -54,6 +54,10 @@ struct LibraryView: View {
                     if let exe { chosenProgram = (exe, folder) }
                     model.librarySheet = nil
                 }
+            case .logs(let id, let log, let back):
+                // From a banner's Show logs. Opened over a game's page or Settings, Done goes back there.
+                LogsView(gameID: id, log: log, done: back.map { sheet in { model.librarySheet = sheet } })
+                    .environment(model)
             }
         }
         .alert("Rename \(renaming?.name ?? "")", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
@@ -598,8 +602,21 @@ struct GameTile: View {
     /// item cannot show a tooltip, so a blocked one says why in its own title.
     @ViewBuilder private var menu: some View {
         if game.localExe != nil {
-            Button { model.play(game) } label: { Label(busy ? "Play (already running)" : "Play", systemImage: "play.fill") }
-                .disabled(busy)
+            // While a start or a quit goes on, the step says which ("Closing …" is a quit, as in RunState).
+            let step = model.localStarting[game.id]
+            let closing = step?.hasPrefix("Closing") == true
+            if model.localRunning.contains(game.id) {
+                // The page's Quit game: it ends everything in the game's bottle at once.
+                Button { Task { await model.stopLocal(game) } } label: {
+                    Label(step == nil ? "Quit game" : closing ? "Quit game (closing now)" : "Quit game (the game is starting)", systemImage: "stop.fill")
+                }
+                .disabled(step != nil)
+            } else {
+                Button { model.play(game) } label: {
+                    Label(step == nil ? "Play" : closing ? "Play (the game is closing)" : "Play (the game is starting)", systemImage: "play.fill")
+                }
+                .disabled(step != nil)
+            }
         } else if model.steamGamesRunning.contains(game.id) {
             // The bottle is open: the game runs, or its start hangs. Quit game asks first.
             Button { confirmQuit = true } label: {

@@ -8,12 +8,17 @@ enum LibrarySheet: Identifiable {
     case settings
     /// The program chooser. Without `programs` it looks through the folder itself, off the main thread.
     case chooser(folder: URL?, programs: [(url: URL, size: Int64)]?)
+    /// The Logs sheet from a banner's Show logs: a game's logs, or Unwine's own without a game. `log`
+    /// is the LogSource it opens on. `back` is the sheet it took the place of (a game's page or
+    /// Settings), which Done opens again.
+    indirect case logs(game: Int?, log: String?, back: LibrarySheet?)
 
     var id: String {
         switch self {
         case .game(let id): return "game-\(id)"
         case .settings: return "settings"
         case .chooser(let folder, _): return "chooser-\(folder?.path ?? "")"
+        case .logs(let game, let log, _): return "logs-\(game.map(String.init) ?? "unwine")-\(log ?? "")"
         }
     }
 }
@@ -188,16 +193,22 @@ extension AppModel {
         NSWorkspace.shared.open(Paths.logs)
     }
 
-    /// Shows a game's logs in Finder. Before its first start there are none, so the Logs folder opens.
-    func revealLogs(of game: SteamGame) {
-        let files = [game.runLog, game.wineLog].filter { FileManager.default.fileExists(atPath: $0.path) }
-        if files.isEmpty { showLogsFolder() } else { NSWorkspace.shared.activateFileViewerSelecting(files) }
+    /// A banner's Show logs: the Logs sheet in Unwine, for a game, or for Unwine itself without one.
+    /// `log` is the LogSource it opens on. Over a game's page or Settings, the logs take that sheet's
+    /// place, and Done brings it back: the next step (a setting, Detailed logs) is there.
+    func showLogs(of game: SteamGame?, log: String? = nil) {
+        var back: LibrarySheet?
+        switch librarySheet {
+        case .game?, .settings?: back = librarySheet
+        default: back = nil
+        }
+        librarySheet = .logs(game: game?.id, log: log, back: back)
     }
 
-    /// Shows one of Unwine's own logs in Finder, or the Logs folder when that log is not there yet.
-    func revealLog(named name: String) {
-        let file = Paths.logs.appendingPathComponent(name)
-        if FileManager.default.fileExists(atPath: file.path) { NSWorkspace.shared.activateFileViewerSelecting([file]) } else { showLogsFolder() }
+    /// Help > Show Logs: the Logs sheet once the library shows. During setup there is no library to
+    /// hold it, so the Logs folder opens in Finder.
+    func showLogsFromMenu() {
+        if showsLibrary { showLogs(of: nil) } else { showLogsFolder() }
     }
 
     // MARK: Updates

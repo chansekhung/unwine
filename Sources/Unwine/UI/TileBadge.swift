@@ -4,8 +4,9 @@ import SwiftUI
 /// A tile shows only the most important one. Its reason is the tooltip and what VoiceOver reads.
 struct TileBadge: Comparable {
     /// From the most to the least important. Running comes from the game's run state (RunState) and a
-    /// missing program file from the added games, both in `badges(for:)`. A start or a quit shows its
-    /// words at the bottom of the tile instead, so `starting` stays free for a start without words.
+    /// missing program file from the added games, both in `badges(for:)`. A start or a quit in Mac Steam
+    /// or an added game's bottle shows its words at the bottom of the tile instead, so `starting` is for
+    /// a start whose words show elsewhere: a game Unwine starts in Windows Steam (the Online mode card).
     enum Kind: Int {
         case starting, running, missingFile, blocked, otherTool, onlineMode
     }
@@ -32,11 +33,15 @@ extension AppModel {
     /// What the advisor and Steam already know about a game, as tile badges, the most important first.
     func badges(for game: SteamGame) -> [TileBadge] {
         var list: [TileBadge] = []
+        if onlineStarting == game.id {
+            list.append(TileBadge(kind: .starting, text: "Starting", icon: "hourglass",
+                                  reason: "\(game.name) is starting in Windows Steam. The card at the top of the library shows each step.",
+                                  needsAttention: false))
+        }
         if runState(of: game) == .running {
-            // Not a button: the reason names where Quit game is.
+            // Not a button: the reason names where Quit game is. Steam games and added games have it in both places.
             list.append(TileBadge(kind: .running, text: "Running", icon: "play.fill",
-                                  reason: game.localExe == nil ? "\(game.name) is running. To quit it, right-click it or open its page."
-                                                              : "\(game.name) is running. To quit it, open its page.",
+                                  reason: "\(game.name) is running. To quit it, right-click it or open its page.",
                                   needsAttention: false))
         }
         if let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {

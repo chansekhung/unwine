@@ -2,15 +2,26 @@ import AppKit
 import SwiftUI
 
 /// The Logs sheet: the last part of a game's logs and of Unwine's own, with ways to copy a log, show
-/// it in Finder and report a problem. It opens from a game's Show logs and from Settings.
+/// it in Finder and report a problem. It opens from a game's Show logs, from Settings, from a banner's
+/// Show logs and from Help > Show Logs.
 struct LogsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
     let gameID: Int?
+    /// What Done does instead of closing the sheet: from a banner, it brings back the game's page or
+    /// Settings that the logs took the place of.
+    let done: (() -> Void)?
     @State private var selected: String?    // a LogSource id
     @State private var text: String?        // nil while the log loads
     @State private var exists = true
     @State private var note: String?
+
+    /// `log` is the LogSource the sheet opens on; without it (or when that log is not there), the first.
+    init(gameID: Int?, log: String? = nil, done: (() -> Void)? = nil) {
+        self.gameID = gameID
+        self.done = done
+        _selected = State(initialValue: log)
+    }
 
     private var sources: [LogSource] { model.logSources(for: gameID) }
     private var source: LogSource? { sources.first { $0.id == selected } ?? sources.first }
@@ -26,7 +37,8 @@ struct LogsView: View {
                         .font(.system(size: 12)).foregroundStyle(Palette.muted)
                 }
                 Spacer()
-                Button("Done") { dismiss() }.buttonStyle(PrimaryButtonStyle()).keyboardShortcut(.defaultAction)
+                Button("Done") { if let done { done() } else { dismiss() } }
+                    .buttonStyle(PrimaryButtonStyle()).keyboardShortcut(.defaultAction)
             }
             .padding(20)
 
@@ -130,17 +142,21 @@ struct LogsView: View {
     }
 }
 
-/// A game page's "Show logs": opens the Logs sheet for that game.
+/// A game page's "Show logs", and its other Show log buttons: the Logs sheet over the page, so Done
+/// leaves the page where it was. `game` nil shows Unwine's own logs; `log` is the LogSource to open on.
 struct ShowLogsButton: View {
     @Environment(AppModel.self) private var model
-    let game: SteamGame
+    let game: SteamGame?
+    var log: String? = nil
+    var title = "Show logs"
+    var help = "Shows this game's logs and Unwine's own, and copies them for a bug report"
     @State private var showing = false
 
     var body: some View {
-        Button("Show logs") { showing = true }
+        Button(title) { showing = true }
             .buttonStyle(QuietButtonStyle())
-            .help("Shows this game's logs and Unwine's own, and copies them for a bug report")
-            .sheet(isPresented: $showing) { LogsView(gameID: game.id).environment(model) }
+            .help(help)
+            .sheet(isPresented: $showing) { LogsView(gameID: game?.id, log: log).environment(model) }
     }
 }
 

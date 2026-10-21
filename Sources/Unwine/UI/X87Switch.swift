@@ -30,8 +30,7 @@ struct X87Switch: View {
                     Button("Try again") { Task { await model.enableX87(for: game.id, again: true) } }.buttonStyle(QuietButtonStyle())
                         .help(s.x87 ? "Gets x87sidecar again if it is missing, then checks it with Rosetta"
                                     : "Gets x87sidecar again if it is missing, checks it with Rosetta, then turns this on")
-                    Button("Show log") { NSWorkspace.shared.activateFileViewerSelecting([model.log.url]) }.buttonStyle(QuietButtonStyle())
-                        .help("Shows Unwine's log in Finder")
+                    ShowLogsButton(game: game, log: "unwine", title: "Show log", help: "Shows Unwine's log. It says what went wrong.")
                 }
             }
             state(s, busy: busy, blocker: blocker)
@@ -80,8 +79,10 @@ struct X87Switch: View {
             if let reason = session.notAttached {
                 NoticeRow(color: Palette.warn, icon: "exclamationmark.triangle", text: notAttachedNote(reason)) {
                     if let log = session.log {
-                        Button("Show log") { NSWorkspace.shared.activateFileViewerSelecting([log]) }.buttonStyle(QuietButtonStyle())
-                            .help("Shows the game's log in Finder. It has x87sidecar's whole message.")
+                        // It can be a launcher's log: what the game prints lands in the log of the program that started it.
+                        let owner = model.games.first { $0.runLog == log || $0.wineLog == log } ?? game
+                        ShowLogsButton(game: owner, log: owner.wineLog == log ? "wine" : "game", title: "Show log",
+                                       help: "Shows the game's log. It has x87sidecar's whole message.")
                     }
                 }
             }

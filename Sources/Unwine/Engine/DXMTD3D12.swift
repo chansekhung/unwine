@@ -16,14 +16,20 @@ enum DXMTD3D12 {
         FileManager.default.fileExists(atPath: source(engine).path)
     }
 
-    /// renderer/dxmt-d3d12/wine, made on first use and again when DXMT's file changes. Nil when the engine
-    /// has no DXMT DirectX 12 file or the copy failed (the game then gets DXMT as it ships). Cheap once made.
+    /// renderer/dxmt-d3d12/wine: the WINEDLLPATH_DXMT of a game with the switch on. Online mode leaves
+    /// it out (OnlineSteam), so Windows Steam's bottle keeps DXMT as it ships.
+    static func wineFolder(_ engine: InstalledEngine) -> URL {
+        engine.rendererRoot.appendingPathComponent("dxmt-d3d12/wine", isDirectory: true)
+    }
+
+    /// `wineFolder`, made on first use and again when DXMT's file changes. Nil when the engine has no
+    /// DXMT DirectX 12 file or the copy failed (the game then gets DXMT as it ships). Cheap once made.
     static func folder(engine: InstalledEngine, log: LogFile? = nil) -> URL? {
         let fm = FileManager.default
         guard let attrs = try? fm.attributesOfItem(atPath: source(engine).path) else { return nil }
         let stamp = "\((attrs[.size] as? NSNumber)?.int64Value ?? 0) \((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)\n"
-        let copy = engine.rendererRoot.appendingPathComponent("dxmt-d3d12", isDirectory: true)
-        let wine = copy.appendingPathComponent("wine", isDirectory: true)
+        let wine = wineFolder(engine)
+        let copy = wine.deletingLastPathComponent()
         if (try? String(contentsOf: copy.appendingPathComponent(markerName), encoding: .utf8)) == stamp { return wine }
         let stage = engine.rendererRoot.appendingPathComponent(".dxmt-d3d12-\(UUID().uuidString)", isDirectory: true)
         do {

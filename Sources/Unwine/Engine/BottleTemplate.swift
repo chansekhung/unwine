@@ -53,7 +53,8 @@ enum BottleTemplate {
         let pfx = stage.appendingPathComponent("pfx", isDirectory: true)
         try Paths.ensure(stage)
         defer { try? fm.removeItem(at: stage) }
-        let env = LocalGames.environment(engine: engine, prefix: pfx, profile: Profiles.file(for: nil))
+        // Without Faster x87 math: macOS must not ask for the password while Unwine makes a bottle.
+        let env = LocalGames.withoutX87(LocalGames.environment(engine: engine, prefix: pfx, profile: Profiles.file(for: nil)))
         let started = Date()
         log.line("Making the bottle template for \(engine.wineVersion)")
         do {

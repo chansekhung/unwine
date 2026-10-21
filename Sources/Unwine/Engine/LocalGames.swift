@@ -271,6 +271,13 @@ enum LocalGames {
         return env
     }
 
+    /// `env` without Faster x87 math, for the wineboot that makes a bottle. wineboot starts 32-bit
+    /// programs too, and x87sidecar would attach to them: macOS could then ask for the password while
+    /// only a bottle is made. The game itself starts with it.
+    static func withoutX87(_ env: [String: String]) -> [String: String] {
+        env.filter { !X87Sidecar.variables.contains($0.key) }
+    }
+
     /// Starts the game with `arguments` after its program's name. On its first start, makes the bottle
     /// first: a clone of the engine's template from `template` (which builds it once if needed), else
     /// with wineboot (about 25 s under Rosetta). `phase` names each step for the waiting screen.
@@ -286,7 +293,6 @@ enum LocalGames {
         }
         let pfx = prefix(game)
         try Paths.ensure(game.compatData)
-        var env = environment(engine: engine, prefix: pfx, profile: profile)
 
         // A folder that is there without a registry may hold files: wineboot finishes it in place.
         if !FileManager.default.fileExists(atPath: pfx.path), let template {
@@ -300,24 +306,26 @@ enum LocalGames {
         if !FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) {
             await phase("Making a Windows bottle for this game…")
             log.line("Making the bottle for \(game.name)")
+            let boot = withoutX87(environment(engine: engine, prefix: pfx, profile: profile))
             do {
-                try await Shell.run(engine.wine, ["wineboot", "--init"], env: env, log: log)
-                try await Shell.run(engine.wineserver, ["-w"], env: env, log: log, check: false)
+                try await Shell.run(engine.wine, ["wineboot", "--init"], env: boot, log: log)
+                try await Shell.run(engine.wineserver, ["-w"], env: boot, log: log, check: false)
             } catch {
                 // A half-made bottle would be used as it is next time: it goes to the Trash.
-                _ = try? await Shell.run(engine.wineserver, ["-k"], env: env, log: log, check: false)
+                _ = try? await Shell.run(engine.wineserver, ["-k"], env: boot, log: log, check: false)
                 try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
-                throw LocalGamesError.bottle("Wine stopped while it set up the bottle. Press Play to try again; if it fails again, Show logs on the game's page says why.")
+                // The failed-start banner's Show logs opens this game's log.
+                throw LocalGamesError.bottle("Wine stopped while it set up the bottle. Press Play to try again. If it fails again, press Show logs: the game's log says why.")
             }
             guard FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) else {
                 try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
-                throw LocalGamesError.bottle("Wine made no bottle. Press Play to try again; Show logs on the game's page says why.")
+                throw LocalGamesError.bottle("Wine made no bottle. Press Play to try again. If it fails again, press Show logs: the game's log says why.")
             }
             BottleFonts.ensure(prefix: pfx)
         }
 
-        // Read the profile again now: the user may have changed settings while the bottle was made.
-        env = environment(engine: engine, prefix: pfx, profile: profile)
+        // Read the profile now: the user may have changed settings while the bottle was made.
+        var env = environment(engine: engine, prefix: pfx, profile: profile)
         // The game's Display choices (and, for D3DMetal, Apple's DLSS files) go into the closed bottle
         // now: Wine reads them when the game starts. An open bottle keeps what it has (BottlePrep).
         _ = await BottlePrep.apply(profile: profile, prefix: pfx, engine: engine, game: game.name, log: log, announce: phase)

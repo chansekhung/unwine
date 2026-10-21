@@ -438,7 +438,9 @@ struct GameSheet: View {
     private func restartMessage(_ ask: OnlineRestartAsk) -> String {
         let what = ask.changes.isEmpty ? "settings Windows Steam did not start with"
                                        : "settings Windows Steam did not start with: " + ask.changes.joined(separator: ", ")
-        return "\(ask.game.name) uses \(what). Games take Windows Steam's settings, so it restarts to use them (Steam Cloud saves sync first). Without a restart the game plays with the settings Steam has now. Low latency and frame caps apply either way."
+        // A D3DMetal game's cap reaches DXMT through Windows Steam's own settings, so it is in the list then.
+        let either = ask.changes.contains(OnlineSteam.d3dmetalCapName) ? "Low latency applies either way." : "Low latency and frame caps apply either way."
+        return "\(ask.game.name) uses \(what). Games take Windows Steam's settings, so it restarts to use them (Steam Cloud saves sync first). Without a restart the game plays with the settings Steam has now. \(either)"
     }
 
     private func facts(_ game: SteamGame, _ a: GameAnalysis?) -> String {
@@ -611,7 +613,8 @@ struct GameSheet: View {
 
     private func summary(_ s: GameSettings, renderer: Renderer) -> String {
         var parts = [s.fpsCap.map { "\($0) fps cap" } ?? "No frame cap"]
-        if renderer == .d3dmetal && s.metal4 && model.d3dmetal?.isVersion4 == true { parts.append("Metal 4") }
+        // Below macOS 26 there is no Metal 4, and the profile leaves it out (Profiles.render).
+        if renderer == .d3dmetal && s.metal4 && model.d3dmetal?.isVersion4 == true && Profiles.hasMetal4 { parts.append("Metal 4") }
         if renderer == .d3dmetal && s.rayTracing == false { parts.append("Ray tracing off") }
         if renderer == .dxmt, let tess = s.maxTessFactor { parts.append("Tessellation up to \(tess)x") }
         if s.metalFX { parts.append("MetalFX for DLSS") }
@@ -662,13 +665,15 @@ struct GameSheet: View {
                 HStack(spacing: 8) {
                     Button("Try again") { Task { await model.setUpOnline() } }.buttonStyle(PrimaryButtonStyle())
                         .disabled(model.onlineBusy).help(model.onlineBusy ? "Unwine is switching Steam. Wait a moment." : "Runs setup again. Finished steps are skipped.")
-                    Button("Show log") { NSWorkspace.shared.activateFileViewerSelecting([Paths.logs]) }.buttonStyle(QuietButtonStyle())
+                    // Windows Steam's own log has each setup step; Unwine's log, beside it, has the failure.
+                    ShowLogsButton(game: nil, log: "online", title: "Show log", help: "Shows Windows Steam's log and Unwine's. They say what went wrong.")
                 }
             default:
                 onlineControls(game, online: online)
             }
             if online.installed, model.analysis(for: game)?.api == .dx12 {
-                note("DirectX 12 games cannot run in Online mode yet: Windows Steam's own window needs DXMT, and DXMT has no DirectX 12.", warn: true)
+                // OnlineSteam keeps the bottle's DXMT as it ships, without DXMT's experimental DirectX 12 part.
+                note("DirectX 12 games cannot run in Online mode yet. Windows Steam's own window needs DXMT, and Online mode does not use the experimental switch \u{201C}DirectX 12 through DXMT\u{201D}.", warn: true)
             }
             if online.installed, let engine = model.engine {
                 ForEach(Array(OnlineSteam.notes(engine: engine, profile: Profiles.file(for: game.id)).enumerated()), id: \.offset) { _, text in
@@ -788,7 +793,7 @@ private struct PresetCard: View {
         .buttonStyle(.plain)
         .foregroundStyle(Palette.text)
         .help(active ? "Already in use"
-              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your Metal overlay, MetalFX sharpening, Low latency, 120 fps mode and Save battery when unplugged choices stay. Applies the next time the game starts.")
+              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your own choices stay: the Metal overlay, MetalFX sharpening, Low latency, background shader building, 120 fps mode, Save battery when unplugged, Faster x87 math, Detailed logs, Display and the Experimental switch. Applies the next time the game starts.")
     }
 }
 

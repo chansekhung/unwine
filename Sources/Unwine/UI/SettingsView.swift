@@ -97,10 +97,16 @@ struct SettingsView: View {
 
                     group("Steam") {
                         row("Steam Play", stateText)
-                        row("Steam version", model.steamVersion ?? "Unknown")
+                        row("Steam version", model.steamMissing ? "Not installed" : model.steamVersion ?? "Unknown")
                         Text("Unwine's tool shows in Steam as \u{201C}\(Runner.toolDisplay)\u{201D}. Unwine never changes Steam.app.")
                             .font(.system(size: 11)).foregroundStyle(Palette.muted)
                         HStack(spacing: 8) {
+                            // Set up without Steam: Restart Steam is off and says why, and this is the next step.
+                            if model.steamMissing {
+                                Button("Get Steam") { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/about/")!) }
+                                    .buttonStyle(QuietButtonStyle())
+                                    .help("Opens Valve's page, where you download Steam for Mac")
+                            }
                             RestartSteamButton(primary: false)
                             Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }
                                 .buttonStyle(QuietButtonStyle())
@@ -251,6 +257,7 @@ struct SettingsView: View {
     }
 
     private var stateText: String {
+        if model.steamMissing { return "Steam is not installed" }
         switch model.steamPlay {
         case .on: return "On, Unwine listed"
         case .off: return "Not seen in Steam"

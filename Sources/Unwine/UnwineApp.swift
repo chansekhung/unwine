@@ -41,7 +41,7 @@ struct UnwineApp: App {
             }
             CommandGroup(replacing: .help) {
                 Button("Report a Problem…") { model.reportProblem() }
-                Button("Show Logs") { model.showLogsFolder() }
+                Button("Show Logs") { model.showLogsFromMenu() }
                 Divider()
                 Button("Unwine on GitHub") { model.openProjectPage() }
             }

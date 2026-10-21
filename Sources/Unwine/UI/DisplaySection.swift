@@ -114,8 +114,8 @@ struct DisplayControls: View {
             HStack(spacing: 8) {
                 settingNote("Unwine could not write these settings into the game's Windows bottle. Press Play in Unwine to try again.", warn: true)
                 Spacer(minLength: 0)
-                Button("Show log") { model.showBottleLog() }.buttonStyle(QuietButtonStyle())
-                    .help("Shows Unwine's log in Finder. Its last lines say what went wrong.")
+                // The bottle writes go to Unwine's own log.
+                ShowLogsButton(game: game, log: "unwine", title: "Show log", help: "Shows Unwine's log. Its last lines say what went wrong.")
             }
         }
     }
@@ -224,7 +224,8 @@ struct DetailedLogsControl: View {
             settingNote((on
                 ? "On: the next start writes Wine's errors, and the notes of DXVK and DXMT, into the logs. Turn this off when you are done: the logs grow fast."
                 : "Off: the logs keep only the warnings and errors of DXVK and DXMT, and nothing from Wine. When a game fails, turn this on, press Play, then open Show logs.")
-                + (game.localExe == nil ? " A WINEDEBUG in Steam's launch options always wins." : "")
+                // The runner's wrappers put back the levels that Steam's launch options set (Runner.restoreAskedLogs).
+                + (game.localExe == nil ? " A log level in Steam's launch options (WINEDEBUG, DXVK_LOG_LEVEL or DXMT_LOG_LEVEL) always wins." : "")
                 + (source.map { " This program shares the choice with \($0.name)." } ?? ""))
         }
     }

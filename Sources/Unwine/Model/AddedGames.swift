@@ -193,7 +193,8 @@ extension AppModel {
         }.value
         guard !found.isEmpty, stored.localGames.contains(where: { $0.id == game.id }) else { return }
         installedPrograms[game.id] = found
-        banner = "\(game.name) ended. It put \(found.count == 1 ? "a new program" : "\(found.count) new programs") in its Windows bottle. Open its page and press Pick the installed program."
+        show("\(game.name) ended. It put \(found.count == 1 ? "a new program" : "\(found.count) new programs") in its Windows bottle. Open its page and press Pick the installed program.",
+             action: .init("Open its page") { [weak self] in self?.openPage(game) })
     }
 
     /// Makes an installer's entry start the program it installed. The bottle and its saves stay,
@@ -341,9 +342,9 @@ extension AppModel {
             case 0?: banner = "\(title) ran in the Windows bottle of \(game.name) and finished."
             case _?:
                 // The programs run in a bottle write to the game's log (added game) or its tools log (Steam game).
-                let logName = game.localExe == nil ? Self.bottleLogName(game.id) : LocalGames.logName(game.id)
+                let source = game.localExe == nil ? "tools" : "game"
                 show("\(title) closed before it showed a window. Its log says why.", .problem,
-                     action: .init("Show log") { [weak self] in self?.revealLog(named: logName) })
+                     action: .init("Show log") { [weak self] in self?.showLogs(of: game, log: source) })
             case nil: banner = "\(title) is still running in the Windows bottle of \(game.name), with no window yet."
             }
         }
