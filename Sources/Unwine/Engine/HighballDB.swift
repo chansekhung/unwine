@@ -91,6 +91,11 @@ enum HighballDB {
     /// Highball's entry for a Steam app, from the cached file. Safe from any thread.
     static func game(_ appID: Int) -> HighballGame? { index.games[appID] }
 
+    /// Highball's entry for a game by its title, for games added by their .exe. Letter case, accents,
+    /// punctuation, ™ and ®, a leading "The" and Roman numbers do not count (see GameTitles.key). A
+    /// title that two games share finds nothing: Unwine does not guess. Safe from any thread.
+    static func game(title: String) -> HighballGame? { index.titleTables.game(title: title) }
+
     /// Downloads the database when the cached copy is missing, unreadable or older than three days.
     /// The old copy stays in place unless the new one passes `parse`, so any failure is harmless.
     /// When there is nothing to do it costs one file-date check, and after a failed try only the
@@ -103,7 +108,7 @@ enum HighballDB {
             guard let games = parse(data) else { throw RefreshError.notADatabase }
             try Paths.ensure(cacheURL.deletingLastPathComponent())
             try data.write(to: cacheURL, options: .atomic)
-            index.set(byAppID(games))
+            index.set(games)
             log?.line("Highball database refreshed: \(games.count) games")
             return true
         } catch {
@@ -123,34 +128,80 @@ enum HighballDB {
         return age < 0 || age > maxAge || index.games.isEmpty
     }
 
-    /// Parsed once, then kept. `refreshIfStale` replaces it after writing a new file.
+    /// Parsed once, then kept. `refreshIfStale` replaces it after writing a new file. The title
+    /// tables are built on the first title lookup, so a library of Steam games never pays for them.
     private final class Index: @unchecked Sendable {
         private let lock = NSLock()
-        private var cached: [Int: HighballGame]?
+        private var list: [HighballGame]?
+        private var byAppID: [Int: HighballGame] = [:]
+        private var titles: Titles?
 
         var games: [Int: HighballGame] {
             lock.lock(); defer { lock.unlock() }
-            if let cached { return cached }
-            let loaded = HighballDB.loadFromDisk()
-            cached = loaded
-            return loaded
+            loadIfNeeded()
+            return byAppID
         }
 
-        func set(_ games: [Int: HighballGame]) {
+        var titleTables: Titles {
             lock.lock(); defer { lock.unlock() }
-            cached = games
+            loadIfNeeded()
+            if let titles { return titles }
+            let made = Titles(list ?? [])
+            titles = made
+            return made
+        }
+
+        func set(_ games: [HighballGame]) {
+            lock.lock(); defer { lock.unlock() }
+            use(games)
+        }
+
+        private func loadIfNeeded() {
+            if list == nil { use(HighballDB.loadFromDisk()) }
+        }
+
+        private func use(_ games: [HighballGame]) {
+            list = games
+            byAppID = Dictionary(games.compactMap { game in game.appID.map { ($0, game) } }, uniquingKeysWith: { first, _ in first })
+            titles = nil
         }
     }
 
     private static let index = Index()
 
-    private static func loadFromDisk() -> [Int: HighballGame] {
-        guard let data = try? Data(contentsOf: cacheURL), let games = parse(data) else { return [:] }
-        return byAppID(games)
+    private static func loadFromDisk() -> [HighballGame] {
+        guard let data = try? Data(contentsOf: cacheURL), let games = parse(data) else { return [] }
+        return games
     }
 
-    private static func byAppID(_ games: [HighballGame]) -> [Int: HighballGame] {
-        Dictionary(games.compactMap { game in game.appID.map { ($0, game) } }, uniquingKeysWith: { first, _ in first })
+    /// The games by title keys (see GameTitles.key).
+    private struct Titles {
+        /// Whole titles.
+        var whole: [String: HighballGame] = [:]
+        /// Titles without their "(...)" part, or cut before a numbered subtitle, where no whole title
+        /// has that key.
+        var loose: [String: HighballGame] = [:]
+
+        init(_ games: [HighballGame]) {
+            var whole: [String: [HighballGame]] = [:]
+            var loose: [String: [HighballGame]] = [:]
+            for game in games {
+                if let key = GameTitles.key(game.title) { whole[key, default: []].append(game) }
+                for key in GameTitles.looseKeys(game.title) { loose[key, default: []].append(game) }
+            }
+            // A key that two games share would be a guess, so it finds nothing.
+            self.whole = whole.compactMapValues { $0.count == 1 ? $0[0] : nil }
+            self.loose = loose.filter { whole[$0.key] == nil }.compactMapValues { $0.count == 1 ? $0[0] : nil }
+        }
+
+        /// The whole title first, then the title's own looser forms against whole titles. Two loose
+        /// forms are never matched with each other: that would join "Star Wars: A" and "Star Wars: B".
+        func game(title: String) -> HighballGame? {
+            guard !whole.isEmpty, let key = GameTitles.key(title) else { return nil }
+            if let game = whole[key] ?? loose[key] { return game }
+            for form in GameTitles.looseKeys(title) { if let game = whole[form] { return game } }
+            return nil
+        }
     }
 
     // MARK: Parsing

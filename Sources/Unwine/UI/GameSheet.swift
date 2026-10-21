@@ -257,6 +257,7 @@ struct GameSheet: View {
                                     .help("Steam goes back to its default for this game")
                             }
                         }
+                        if isLocal { coverButtons(game) }
                         Text("Settings apply the next time the game starts.").font(.system(size: 11)).foregroundStyle(Palette.muted)
                     }
                 }
@@ -320,6 +321,26 @@ struct GameSheet: View {
 
     /// DirectX 8 and 9 games draw with DXVK's DirectX 9 part under every layer but WineD3D.
     private func oldDirectX(_ a: GameAnalysis?) -> Bool { a?.api == .dx9 || a?.api == .dx8 }
+
+    /// An added game's cover: the picture on its tile and at the top of this page.
+    @ViewBuilder
+    private func coverButtons(_ game: SteamGame) -> some View {
+        let copying = ArtState.shared.preparing.contains(game.id)
+        HStack(spacing: 8) {
+            Button("Choose cover…") { model.chooseCover(for: game) }.buttonStyle(QuietButtonStyle())
+                .disabled(copying)
+                .help(copying ? "Unwine is copying the picture you picked. Wait a moment." : "Pick a picture for this game. A tall picture fits the tile best.")
+            if model.hasCover(game.id) {
+                Button("Reset cover") { model.resetCover(for: game) }.buttonStyle(QuietButtonStyle())
+                    .disabled(copying)
+                    .help(copying ? "Unwine is copying the picture you picked. Wait a moment." : "Removes your picture. The tile shows the program's icon again, or the game's initials.")
+            }
+            if copying {
+                UnwineMark(progress: nil, size: 18)
+                PhaseWords(words: ["Copying the picture…", "Saving it in Unwine's folder…"]).font(.system(size: 11)).foregroundStyle(Palette.glow)
+            }
+        }
+    }
 
     private func restartMessage(_ ask: OnlineRestartAsk) -> String {
         let what = ask.changes.isEmpty ? "settings Windows Steam did not start with"

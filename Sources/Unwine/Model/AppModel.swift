@@ -344,6 +344,7 @@ final class AppModel {
         mappings = snap.mappings
         games = snap.games + stored.localGames.map(LocalGames.game(from:))
         localRunning = Set(games.filter { $0.localExe != nil && LocalGames.isRunning($0) }.map(\.id))
+        refreshArtAndIdentities()
         gameRunning = snap.runnerInUse
         online = snap.online
         // A closed bottle has no settings left to compare with, so the next start sets them fresh.
@@ -605,9 +606,11 @@ final class AppModel {
 
     private func advice(appID: Int, name: String) -> Advice {
         _ = highballLoads       // read so SwiftUI redraws when the Highball list arrives
+        // Added games are found in Highball by steam_appid.txt or by title (see highballMatch).
+        let match = highballMatch(for: appID)
         return Advisor.advise(appID: appID, name: name, analysis: stored.analyses[appID],
-                              highball: HighballDB.game(appID), hasD3DMetal: d3dmetal != nil,
-                              d3dmetalIsV4: d3dmetal?.isVersion4 ?? false, screenPixels: Self.screenPixels)
+                              highball: match?.game, hasD3DMetal: d3dmetal != nil,
+                              d3dmetalIsV4: d3dmetal?.isVersion4 ?? false, screenPixels: Self.screenPixels).found(by: match)
     }
 
     private static var screenPixels: CGSize {
@@ -778,9 +781,9 @@ final class AppModel {
         }
         let id = max(LocalGames.idBase, stored.lastLocalID, stored.localGames.map(\.id).max() ?? 0) + 1
         stored.lastLocalID = id
-        // Named after the folder the user picked, else the folder the program sits in.
-        var name = folder.map { $0.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces) }
-            .flatMap { $0.isEmpty ? nil : $0 } ?? LocalGames.suggestedName(for: exe)
+        // Named after the folder the user picked, else the folder the program sits in. When those
+        // folders say nothing about the game ("Game", "Downloads"), the program's own ProductName.
+        var name = LocalGames.defaultName(for: exe, picked: folder)
         // A second program from the same game (often its launcher) shares the first one's bottle.
         // A launcher or tool says so in its name, so the tiles differ.
         let mate = LocalGames.bottleMate(for: exe, in: stored.localGames)
@@ -794,6 +797,7 @@ final class AppModel {
         save()
         let game = LocalGames.game(from: record)
         games.append(game)
+        readLocalIdentities()       // the program's icon and Highball details, in the background
         let lower = exe.lastPathComponent.lowercased()
         banner = ["setup", "install", "unins"].contains(where: lower.contains)
             ? "\(record.name) looks like an installer. Play runs it inside the game's own bottle. When it finishes, use Add game again and pick the installed program (Unwine's LocalGames folder holds the bottle)."
@@ -908,6 +912,7 @@ final class AppModel {
         stored.localGames[i].exePath = exe.path
         stored.analyses[id] = nil
         save()
+        readLocalIdentities()       // the moved program's icon and name are read again
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
         banner = "\(stored.localGames[i].name) now starts \(exe.lastPathComponent) from \(exe.deletingLastPathComponent().path)."
         if let g = games.first(where: { $0.id == id }) { Task { await analyze(g) } }
