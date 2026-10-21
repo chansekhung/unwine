@@ -666,6 +666,12 @@ enum OnlineSteam {
                 // Every program in this bottle shares one DXMT, Windows Steam's own windows too. Online
                 // mode keeps DXMT as it ships, without the experimental "DirectX 12 through DXMT" part.
                 if env["WINEDLLPATH_DXMT"] == DXMTD3D12.wineFolder(engine).path { env["WINEDLLPATH_DXMT"] = engine.renderer("dxmt").path }
+                // No Faster x87 math in Online mode: x87sidecar would attach to steam.exe and to the VAC
+                // game itself, and a ban is permanent. Unwine takes no risk with VAC.
+                if env.removeValue(forKey: "ROSETTA_X87_PATH") != nil {
+                    env["X87_PRECISE_FAULTS"] = nil
+                    notes.append("Faster x87 math is off in Online mode, so nothing attaches to Windows Steam or to a game with Valve Anti-Cheat (VAC). Play uses it.")
+                }
                 if applied.dropped {
                     let layer = keys.contains("WINEDLLPATH_D3DMETAL") ? "D3DMetal" : "DXVK"
                     notes.append("Online mode runs this game on DXMT, not \(layer). Windows Steam's own windows need DXMT, and the game inherits Steam's settings.")

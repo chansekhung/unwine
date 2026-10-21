@@ -54,6 +54,7 @@ How to keep this list. The build reads it, so follow these rules.
   - The first time you turn it on, Unwine downloads x87sidecar (181 KB, free, from github.com/athei/x87sidecar) and checks it.
   - macOS asks for your password once after each login. Allow it. If you do not, the game does not start.
   - A few games can glitch. Then turn the switch off for that game.
+  - It is always off in Online mode, so nothing attaches to Windows Steam or to a game with Valve Anti-Cheat (VAC).
 - **Last session** on each game page (macOS 27): frames each second, GPU time for each frame and shader time, with one tip.
 - **DirectX 12 through DXMT** is a new test switch for DirectX 12 games without GPTK. The game can fail to start. Online mode does not use it.
 - **Storage** in Settings shows what uses space and can clean it up. Unwine also deletes each download after it installs.
