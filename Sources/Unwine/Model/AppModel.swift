@@ -218,6 +218,10 @@ final class AppModel {
     private var refreshing = false
     private var pendingProfiles = Set<Int?>()
 
+    // Battery mode, presets and frame pacing (group a)
+    private var powerWatched = false
+    private var powerSeen: BatteryOverlay?  // the power state the profiles were last written for
+
     static let storeURL = Paths.support.appendingPathComponent("state.json")
 
     var isReady: Bool { engine != nil && runnerReady }
@@ -265,6 +269,7 @@ final class AppModel {
         } else if stored.setupComplete {
             stored.setupComplete = false     // parts went missing; setup repairs them
         }
+        watchPower()
         Task { await refreshSteam() }
         Task { await refreshHighball() }
         runTestSwitches()
@@ -589,10 +594,14 @@ final class AppModel {
 
     func analyze(_ game: SteamGame) async {
         guard case .installed = game.state else { return }
-        // A newer analyzer reads games better, so its results replace older ones at once.
-        if let a = stored.analyses[game.id], a.isCurrent, Date().timeIntervalSince(a.analyzedAt) < 7 * 86_400 { return }
-        let dir = game.installDir, exe = game.localExe
-        let result = await Task.detached(priority: .utility) { GameAnalyzer.analyze(installDir: dir, mainExe: exe) }.value
+        let id = game.id, apps = game.steamapps, dir = game.installDir, exe = game.localExe
+        // The game is read again only when it changed (a Steam update gives a new build id, a new
+        // program a new size or date), or when a newer analyzer reads games better. A fingerprint
+        // that cannot be read now (Steam is writing its file) keeps what Unwine knows.
+        let stamp = await Task.detached(priority: .utility) { GameAnalyzer.fingerprint(appID: id, steamapps: apps, exe: exe) }.value
+        if let a = stored.analyses[id], a.isCurrent, stamp == nil || a.fingerprint == stamp { return }
+        var result = await Task.detached(priority: .utility) { GameAnalyzer.analyze(installDir: dir, mainExe: exe) }.value
+        result.fingerprint = stamp
         guard games.contains(where: { $0.id == game.id }) else { return }   // removed while it was being read
         stored.analyses[game.id] = result
         save()
@@ -626,16 +635,19 @@ final class AppModel {
 
     /// Applies one of the advisor's setting sets. The layer goes back to Automatic (which is the
     /// advised layer), and the Metal overlay stays as the user set it: it is a display choice.
-    /// The Metal overlay, Low latency, background shader building and 120 fps mode stay as the user
-    /// set them: they are the user's choices, not speed or battery settings.
+    /// The Metal overlay, MetalFX sharpening, Low latency, background shader building, 120 fps mode
+    /// and Save battery when unplugged stay as the user set them: they are the user's choices, not
+    /// speed or battery settings.
     func apply(_ preset: Preset, to game: SteamGame) {
         let now = settings(for: game.id)
         var s = settings(preset, for: game, advice: advice(for: game))
         s.keepPlayerChoices(from: now)      // logs, display and experimental choices (AppModel+Bottles)
         s.metalHUD = now.metalHUD
+        s.metalFXSpatial = now.metalFXSpatial
         s.lowLatency = now.lowLatency
         s.asyncShaders = now.asyncShaders
         s.fps120 = now.fps120
+        s.saveBatteryUnplugged = now.saveBatteryUnplugged
         stored.games[game.id] = s
         stored.presetChoice[game.id] = preset.rawValue
         save()
@@ -656,14 +668,16 @@ final class AppModel {
                 : Profiles.resolve(s.renderer, analysis: stored.analyses[game.id], hasD3DMetal: d3dmetal != nil)
             if s.renderer == a.renderer { s.renderer = .auto }
             s.metalHUD = false
+            s.metalFXSpatial = false
             s.lowLatency = false
             s.asyncShaders = true
             s.fps120 = false
+            s.saveBatteryUnplugged = true
             if !(real == .d3dmetal && gptk4) { s.metal4 = true }
             if real == .wined3d || (real == .d3dmetal && !gptk4) || (real == .dxvk && api == .dx12) { s.fpsCap = nil }
             if !((api == .dx11 || api == .dx12) && (real == .d3dmetal || real == .dxmt)) { s.metalFX = false }
-            if !(real == .dxmt && (api == .dx10 || api == .dx11)) { s.metalFXSpatial = false }
             if real != .d3dmetal { s.rayTracing = nil }
+            if !(real == .dxmt && api == .dx11) { s.maxTessFactor = nil }
             return s
         }
         let now = normal(settings(for: game.id))
@@ -672,15 +686,58 @@ final class AppModel {
         return matches.first
     }
 
-    /// A preset's full settings for one game: exactly what a click stores.
+    /// A preset's full settings for one game: what a click stores, apart from the user's own choices
+    /// that `apply` keeps. MetalFX sharpening is one of those: it buys a sharper picture with GPU
+    /// time, not battery, so no preset turns it on.
     func settings(_ preset: Preset, for game: SteamGame, advice a: Advice) -> GameSettings {
         var s = preset == .speed ? a.performance : a.battery
         s.renderer = .auto
-        // MetalFX sharpening lets a DirectX 10/11 game draw at half size and still fill the
-        // screen sharply. It costs a little GPU time, so only the battery set turns it on.
-        s.metalFXSpatial = preset == .battery && canSharpen(game, renderer: a.renderer)
         return s
     }
+
+    /// The game's layer takes a frame cap from Unwine: DXMT and DXVK do, D3DMetal from GPTK 4.
+    /// WineD3D does not, nor does Wine's own DirectX 12 on the DXVK layer.
+    func takesFrameCap(_ game: SteamGame) -> Bool {
+        let r = renderer(for: game.id)
+        return r != .wined3d && !(r == .d3dmetal && d3dmetal?.isVersion4 != true)
+            && !(r == .dxvk && stored.analyses[game.id]?.api == .dx12)
+    }
+
+    /// "New games start with" in Settings. Best battery leaves its marks in the settings for new
+    /// games (ray tracing off, a tessellation cap), so the choice needs no field of its own.
+    var newGamesPreset: Preset {
+        stored.defaults.rayTracing == false && stored.defaults.maxTessFactor != nil ? .battery : .speed
+    }
+
+    /// Gives new games a preset. Unwine knows nothing about a new game yet, so this is the preset
+    /// without what needs the game's own files (MetalFX for DLSS); a game page can add that. The
+    /// layer stays Automatic, and the user's own choices (overlay, sharpening, ...) stay.
+    func applyToNewGames(_ preset: Preset) {
+        updateDefaults { s in
+            let battery = preset == .battery
+            s.renderer = .auto
+            s.msync = true
+            s.advertiseAVX = true
+            s.metal4 = true
+            s.metalFX = false
+            s.fpsCap = battery ? 60 : nil
+            s.rayTracing = battery ? false : nil
+            s.maxTessFactor = battery ? 16 : nil
+        }
+    }
+
+    /// Changes the settings that every game without its own uses, and rewrites their profiles.
+    func updateDefaults(_ change: (inout GameSettings) -> Void) {
+        var s = stored.defaults
+        change(&s)
+        guard s != stored.defaults else { return }
+        stored.defaults = s
+        save()
+        writeAllProfiles()
+    }
+
+    /// The games in the library that use the settings for new games: none of their own yet.
+    var gamesOnDefaults: Int { windowsGames.filter { stored.games[$0.id] == nil }.count }
 
     /// DXMT's MetalFX sharpening works only for DirectX 10/11 games running on DXMT.
     func canSharpen(_ game: SteamGame, renderer: Renderer? = nil) -> Bool {
@@ -1267,8 +1324,10 @@ final class AppModel {
         let s = settings(for: id)
         let r = renderer(for: id)
         let dir = games.first { $0.id == id }?.installDir
-        do { try Profiles.write(appID: id, settings: s, renderer: r, api: stored.analyses[id]?.api, engine: engine, d3dmetal: d3dmetal, gameDir: dir) }
-        catch { log.line("profile \(id) failed: \(error)") }
+        do {
+            try Profiles.write(appID: id, settings: s, renderer: r, api: stored.analyses[id]?.api, engine: engine, d3dmetal: d3dmetal,
+                               gameDir: dir, battery: s.saveBatteryUnplugged ? batteryOverlayNow : nil)
+        } catch { log.line("profile \(id) failed: \(error)") }
         prepareBottle(for: id)          // a Steam game's display values and DLSS files (AppModel+Bottles)
     }
 
@@ -1278,9 +1337,54 @@ final class AppModel {
             pendingProfiles.insert(nil)
         } else {
             let r = Profiles.resolve(stored.defaults.renderer, analysis: nil, hasD3DMetal: d3dmetal != nil)
-            try? Profiles.write(appID: nil, settings: stored.defaults, renderer: r, engine: engine, d3dmetal: d3dmetal)
+            try? Profiles.write(appID: nil, settings: stored.defaults, renderer: r, engine: engine, d3dmetal: d3dmetal,
+                                battery: stored.defaults.saveBatteryUnplugged ? batteryOverlayNow : nil)
         }
         for id in Set(stored.games.keys).union(stored.analyses.keys) { writeProfile(for: id) }
+    }
+
+    // MARK: Battery mode
+
+    /// The overlay a game with "Save battery when unplugged" gets now, or nil while the Mac does not
+    /// save battery (plugged in, not in Low Power Mode, not hot).
+    var batteryOverlayNow: BatteryOverlay? {
+        let power = PowerState.shared
+        guard power.savesBattery else { return nil }
+        return BatteryOverlay(strict: power.lowPowerMode || power.thermal == .serious || power.thermal == .critical,
+                              screenHz: Profiles.screenHz)
+    }
+
+    /// Profiles are written again whenever the power changes, so a game started from Mac Steam,
+    /// without Unwine's Play, starts with the right settings too. A running game's bottle keeps its
+    /// profile until it closes (see writeProfile).
+    private func watchPower() {
+        guard !powerWatched else { return }
+        powerWatched = true
+        powerSeen = batteryOverlayNow
+        PowerState.shared.onChange { [weak self] in self?.powerChanged() }
+        watchPowerLevel()
+    }
+
+    /// onChange fires only when saving battery starts or stops. Low Power Mode or heat that comes or
+    /// goes while on battery changes the cap too (60 to 40), so those are watched as well.
+    private func watchPowerLevel() {
+        withObservationTracking {
+            _ = batteryOverlayNow
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                self?.powerChanged()
+                self?.watchPowerLevel()
+            }
+        }
+    }
+
+    private func powerChanged() {
+        let now = batteryOverlayNow
+        guard now != powerSeen else { return }
+        powerSeen = now
+        log.line(now.map { "Saving battery (\($0.strict ? "Low Power Mode or heat" : "on battery")): games without their own cap start at \($0.cap) fps" }
+                 ?? "Not saving battery: games start with their own settings")
+        if runnerReady { writeAllProfiles() }
     }
 
     private func flushProfiles() {

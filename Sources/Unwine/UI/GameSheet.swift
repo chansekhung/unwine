@@ -174,19 +174,22 @@ struct GameSheet: View {
                         hint("Faster in most games. Turn off if a game freezes or a download stalls.")
                         Toggle("Tell games the CPU has AVX", isOn: binding(game.id, \.advertiseAVX))
                         hint("Some new games refuse to start without it. Rosetta handles it.")
-                        Picker("Frame rate cap", selection: binding(game.id, \.fpsCap)) {
-                            Text("Off").tag(Int?.none)
-                            ForEach([30, 40, 60, 120], id: \.self) { Text("\($0) fps").tag(Int?.some($0)) }
-                        }
+                        FrameCapPicker(cap: binding(game.id, \.fpsCap))
                         if resolved == .wined3d && s.fpsCap != nil {
                             note("Unwine has no frame cap for Wine's own layer (WineD3D), so this cap does nothing for this game. Use the game's own frame limit instead.", warn: true)
                         } else if resolved == .dxvk && analysis?.api == .dx12 && s.fpsCap != nil {
                             note("On the DXVK layer, Wine's own DirectX 12 draws this game, and Unwine cannot cap it. Use the game's own frame limit instead.", warn: true)
                         } else if resolved == .d3dmetal && model.d3dmetal?.isVersion4 != true && s.fpsCap != nil {
                             note("D3DMetal takes a frame cap only from GPTK 4. Yours is \(model.d3dmetal?.label ?? "older"), so this cap does nothing for this game.", warn: true)
+                        } else if let cap = s.fpsCap, cap > Profiles.screenHz {
+                            hint("Your screen shows at most \(Profiles.screenHz) frames a second, so a \(cap) fps cap saves little. Pick \(evenCaps) to save more.")
+                        } else if let cap = s.fpsCap, Profiles.screenHz % max(1, cap) != 0 {
+                            hint("\(cap) fps does not divide your screen's \(Profiles.screenHz) Hz, so some frames show longer than others. Pick \(evenCaps) for even motion.")
                         } else {
-                            hint("Off lets the game run as fast as it can. A cap saves battery and heat; pick a value that divides your screen's refresh rate.")
+                            hint("Off lets the game run as fast as it can. A cap saves battery and heat. Each value in the list divides your screen's \(Profiles.screenHz) Hz, so every frame shows for the same time.")
                         }
+                        Toggle("Save battery when unplugged", isOn: binding(game.id, \.saveBatteryUnplugged))
+                        note(batteryNote(game, s), warn: false)
                         Toggle("120 fps mode (DirectX 10 and 11)", isOn: binding(game.id, \.fps120))
                         note(fps120Note(game, s, analysis, resolved), warn: s.fps120 && !fps120Works(game, s))
                         Toggle("Low latency (DXVK)", isOn: binding(game.id, \.lowLatency))
@@ -209,15 +212,19 @@ struct GameSheet: View {
                         // Every switch stays yours to flip. When Unwine thinks one does nothing for
                         // this game, the note says why, and turns orange while the switch is on.
                         Toggle("MetalFX sharpening (DirectX 10 and 11)", isOn: binding(game.id, \.metalFXSpatial))
-                        note(canSharpen
-                             ? "DXMT doubles the size the game draws, with MetalFX. Set the game to \(halfScreen) and it fills your screen sharply. If you set the game to your screen's full size, turn this off: doubling it again only costs battery."
-                             : noMetalFXReason(analysis, resolved, dlss: false),
-                             warn: s.metalFXSpatial && !canSharpen)
+                        note(sharpenNote(canSharpen, analysis, resolved),
+                             warn: s.metalFXSpatial && (!canSharpen || Profiles.screenScale < 2))
                         Toggle("MetalFX for DLSS games", isOn: binding(game.id, \.metalFX))
-                        note(canMetalFX
-                             ? "Turns the game's DLSS option into Apple's MetalFX. Set the game to DLSS to get the gain."
-                             : noMetalFXReason(analysis, resolved, dlss: true),
-                             warn: s.metalFX && !canMetalFX)
+                        // An analysis from an older Unwine did not look for DLSS, so only a current one can say "none".
+                        let noDLSS = analysis.map { $0.isCurrent && !$0.hasDLSS } ?? false
+                        note(dlssNote(canMetalFX, noDLSS: noDLSS, analysis, resolved),
+                             warn: s.metalFX && (!canMetalFX || noDLSS))
+                        Picker("Ray tracing (D3DMetal)", selection: binding(game.id, \.rayTracing)) {
+                            Text("Apple's default").tag(Bool?.none)
+                            Text("Off").tag(Bool?.some(false))
+                            Text("On").tag(Bool?.some(true))
+                        }
+                        note(rayTracingNote(resolved), warn: s.rayTracing != nil && resolved != .d3dmetal)
                         Toggle("Metal 4 mode (GPTK 4)", isOn: binding(game.id, \.metal4))
                         note(metal4Note(resolved), warn: false)
                     }
@@ -352,6 +359,8 @@ struct GameSheet: View {
                     Text(advice.rendererReason).font(.system(size: 12)).foregroundStyle(Palette.muted)
                 }
             }
+            // The next step when only Apple's file stands between this game and D3DMetal.
+            if advice.needsGPTK { GPTKOffer() }
             HStack(spacing: 8) {
                 ForEach(Preset.allCases) { p in
                     PresetCard(preset: p, detail: summary(model.settings(p, for: game, advice: advice), renderer: advice.renderer),
@@ -403,7 +412,65 @@ struct GameSheet: View {
         }
         if hz <= 60 { return "Your screen shows at most \(hz) frames a second, so this switch does nothing here." }
         if let cap = s.fpsCap { return "Your frame rate cap (\(cap) fps) wins, so this switch does nothing. Set the cap to Off to use it." }
+        if s.fps120, s.saveBatteryUnplugged, let battery = model.batteryOverlayNow {
+            return "Your Mac saves battery now, so this game starts without 120 fps mode, capped at \(battery.cap) fps. When you plug in, 120 fps mode comes back."
+        }
         return "Some full-screen games ask for 60 Hz, or for a rate your screen does not have, like 75 Hz. Your screen stays at \(hz) Hz, but DXMT then holds the game at 60 fps. On: DXMT paces to \(hz) Hz instead. It only helps when your Mac draws each frame well under \(String(format: "%.1f", 1000.0 / Double(hz))) ms (GPU time in the Metal overlay). A slower frame waits for the next refresh, so you still see 60, and motion can look uneven: then turn this off, or lower the game's graphics settings. It costs battery and heat. A game in a window, or set to \(hz) Hz in its own menu, gets \(hz) already. It also holds games with V-Sync off at \(hz). If the game runs too fast, turn this off."
+    }
+
+    /// The caps that divide the screen's rate, in words: "30, 40, 60 or 120 fps".
+    private var evenCaps: String {
+        let caps = Profiles.capChoices().map(String.init)
+        guard let last = caps.last else { return "a lower cap" }
+        return (caps.count > 1 ? caps.dropLast().joined(separator: ", ") + " or " + last : last) + " fps"
+    }
+
+    /// What "Save battery when unplugged" does for this game, for the Mac's power right now.
+    /// PowerState is observed, so the line changes the moment the Mac is plugged in or unplugged.
+    private func batteryNote(_ game: SteamGame, _ s: GameSettings) -> String {
+        guard s.saveBatteryUnplugged else { return "Off: this game starts with the same settings on battery and on power." }
+        guard model.takesFrameCap(game) else {
+            return "Unwine has no frame cap for this game's layer, so this switch changes nothing for it. Use the game's own frame limit to save battery."
+        }
+        let power = PowerState.shared
+        let hz = Profiles.screenHz
+        // Where DXVK draws (the same games Low latency reaches), it also builds fewer shaders at once.
+        let shaders = model.canLowerLatency(game) ? " DXVK builds fewer shaders at the same time, for less heat." : " Nothing else changes for this game."
+        if let battery = model.batteryOverlayNow {
+            let now = power.lowPowerMode ? "Low Power Mode is on" : battery.strict ? "Your Mac is hot" : "On battery now"
+            if let own = s.fpsCap { return "\(now): your own cap of \(own) fps stays.\(shaders)" }
+            return "\(now): this game starts capped at \(battery.cap) fps. Plugged in, it starts as usual. A running game keeps its settings until it closes."
+        }
+        if let own = s.fpsCap { return "Plugged in now. On battery, your own cap of \(own) fps stays.\(shaders)" }
+        let normal = BatteryOverlay(strict: false, screenHz: hz).cap, strict = BatteryOverlay(strict: true, screenHz: hz).cap
+        return "Plugged in now. On battery, this game starts capped at \(normal) fps, and at \(strict) fps in Low Power Mode or when your Mac is hot."
+    }
+
+    /// DXMT enlarges by the screen's own scale (see Profiles.configs), so a 1x screen gets nothing.
+    private func sharpenNote(_ can: Bool, _ a: GameAnalysis?, _ r: Renderer) -> String {
+        guard can else { return noMetalFXReason(a, r, dlss: false) }
+        guard Profiles.screenScale >= 2 else {
+            return "Your screen has no Retina pixels (1x), so MetalFX has nothing to add, and this switch does nothing here. On a Retina screen, DXMT draws the picture 2x larger."
+        }
+        return "DXMT draws the picture 2x larger with MetalFX, to your screen's real pixels. Set the game to \(halfScreen) and it fills your screen sharply. If you set the game to your screen's full size, turn this off: a second enlargement only costs battery. On a screen without Retina (1x), this switch does nothing."
+    }
+
+    private func dlssNote(_ can: Bool, noDLSS: Bool, _ a: GameAnalysis?, _ r: Renderer) -> String {
+        guard can else { return noMetalFXReason(a, r, dlss: true) }
+        if noDLSS {
+            return "Unwine found no DLSS files in this game, so MetalFX has nothing to replace."
+                + (r == .dxmt ? " On DXMT this switch still makes the game see an NVIDIA graphics card, and some games then take slower paths. Leave it off."
+                              : " This switch does nothing for it.")
+        }
+        return "\(a?.hasDLSS == true ? "This game has DLSS. " : "")Turns the game's DLSS option into Apple's MetalFX. Set the game to DLSS to get the gain."
+    }
+
+    private func rayTracingNote(_ resolved: Renderer) -> String {
+        guard resolved == .d3dmetal else {
+            return "Works only with the D3DMetal layer (DirectX 12 with GPTK). This game uses \(resolved.title) now, so this choice does nothing."
+        }
+        let here = MacChip.name.flatMap { name in MacChip.raysByDefault.map { " This Mac has an \(name), so the default here is \($0 ? "on" : "off")." } } ?? ""
+        return "Apple's default is on for M3 and newer chips, and off for M1 and M2.\(here) Off saves battery and heat in games with ray-traced light and shadows. If a game shows broken shadows or crashes, try Off."
     }
 
     /// Why Play online cannot start now, or nil when it can.
@@ -434,7 +501,8 @@ struct GameSheet: View {
     private func summary(_ s: GameSettings, renderer: Renderer) -> String {
         var parts = [s.fpsCap.map { "\($0) fps cap" } ?? "No frame cap"]
         if renderer == .d3dmetal && s.metal4 && model.d3dmetal?.isVersion4 == true { parts.append("Metal 4") }
-        if s.metalFXSpatial { parts.append("MetalFX sharpening") }
+        if renderer == .d3dmetal && s.rayTracing == false { parts.append("Ray tracing off") }
+        if renderer == .dxmt, let tess = s.maxTessFactor { parts.append("Tessellation up to \(tess)x") }
         if s.metalFX { parts.append("MetalFX for DLSS") }
         if s.msync { parts.append("msync") }
         return parts.joined(separator: " · ")
@@ -609,7 +677,7 @@ private struct PresetCard: View {
         .buttonStyle(.plain)
         .foregroundStyle(Palette.text)
         .help(active ? "Already in use"
-              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your Metal overlay, Low latency and 120 fps mode choices stay. Applies the next time the game starts.")
+              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your Metal overlay, MetalFX sharpening, Low latency, 120 fps mode and Save battery when unplugged choices stay. Applies the next time the game starts.")
     }
 }
 
