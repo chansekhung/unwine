@@ -61,6 +61,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
   <key>NSHumanReadableCopyright</key><string>Free software (GPL-3.0). Wine is LGPL. Steam is Valve's.</string>
   <key>NSDownloadsFolderUsageDescription</key><string>Unwine looks for Apple's Game Porting Toolkit file you downloaded, to add GPTK.</string>
+  <!-- "Open With > Unwine" and a drop on the Dock icon add a Windows program as a game. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Windows program</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>com.microsoft.windows-executable</string></array>
+    </dict>
+  </array>
   <key>UnwineUpdateRepo</key><string>${UNWINE_UPDATE_REPO:-chansekhung/unwine}</string>
 </dict>
 </plist>

@@ -58,16 +58,30 @@ struct SetupView: View {
     @ViewBuilder
     private var footer: some View {
         if model.isSettingUp {
+            // When a step needs a click and another app is in front, Unwine's Dock icon bounces.
             Text("You can keep using your Mac. Unwine tells you when it needs you.")
                 .font(.system(size: 12))
                 .foregroundStyle(Palette.muted)
-        } else if !SetupStep.allCases.allSatisfy({ model.steps[$0]?.isDone ?? false }) {
+        } else if !SetupStep.allCases.allSatisfy({ model.steps[$0]?.isDone ?? false }) && !cannotRun {
             Button(SetupStep.allCases.contains { model.steps[$0] != .pending } ? "Continue setup" : "Start setup") {
                 Task { await model.runSetup() }
             }
             .buttonStyle(PrimaryButtonStyle())
             .keyboardShortcut(.defaultAction)
         }
+        if !model.pendingOpens.isEmpty {
+            Text("Unwine adds \(model.pendingOpens.map(\.lastPathComponent).joined(separator: ", ")) to your library when setup is done.")
+                .font(.system(size: 12))
+                .foregroundStyle(Palette.glow)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    /// Nothing on this Mac lets Unwine run (an Intel Mac, or a macOS older than 15), so setup has no
+    /// button that only fails again.
+    private var cannotRun: Bool {
+        guard case .failed = model.steps[.mac] else { return false }
+        return !MacCheck.isAppleSilicon || MacCheck.needsNewerMacOS
     }
 
     @ViewBuilder
@@ -79,6 +93,14 @@ struct SetupView: View {
             Button("Get Steam") { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/about/")!) }
                 .buttonStyle(PrimaryButtonStyle())
             Button("Check again") { Task { await model.runSetup() } }.buttonStyle(QuietButtonStyle())
+            Button("Use without Steam for now") { Task { await model.useWithoutSteam() } }.buttonStyle(QuietButtonStyle())
+                .help("For Windows games you add by their folder or .exe. Steam games need Steam. Install it later, and Unwine finds it.")
+        case (.mac, .failed) where !MacCheck.isAppleSilicon:
+            // Unwine runs only on Apple Silicon. Try again cannot change that, so there is no button.
+            EmptyView()
+        case (.mac, .failed) where MacCheck.needsNewerMacOS:
+            Button("Open Software Update") { MacCheck.openSoftwareUpdate() }.buttonStyle(PrimaryButtonStyle())
+                .help("macOS 15 Sequoia and newer are free in Software Update. Open Unwine again after the update.")
         case (.gptk, .needsUser), (.gptk, .failed):
             Button("Get GPTK 4 from Apple") { NSWorkspace.shared.open(D3DMetalStore.appleDownloadPage) }
                 .buttonStyle(QuietButtonStyle())

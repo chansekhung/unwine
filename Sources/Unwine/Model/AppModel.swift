@@ -34,6 +34,12 @@ struct StoredState: Codable {
     var skippedEngine: String?               // release key of the engine the user went back from; updates leave it out
     var pendingRelease: EngineRelease?       // pendingEngine in full, so its archives stay for a newer Unwine
     var pendingSince: String?                // the Unwine that found pendingEngine; a newer one tries it again
+    // Library and app shell (group d)
+    var librarySort: String?                // how the library orders games (LibrarySort); nil = recently played
+    var libraryFilter: String?              // which games the library shows (LibraryFilter); nil = all
+    var favourites: Set<Int> = []           // games in the Favourites shelf at the top of the library
+    var hiddenGames: Set<Int> = []          // games the user hid; "Hidden games" under the grid shows them
+    var withoutSteam = false                // setup finished without Mac Steam, for games added by their .exe
 
     init() {}
 
@@ -70,6 +76,12 @@ struct StoredState: Codable {
         skippedEngine = try? c.decodeIfPresent(String.self, forKey: .skippedEngine)
         pendingRelease = try? c.decodeIfPresent(EngineRelease.self, forKey: .pendingRelease)
         pendingSince = try? c.decodeIfPresent(String.self, forKey: .pendingSince)
+        // Library and app shell (group d)
+        librarySort = try? c.decodeIfPresent(String.self, forKey: .librarySort)
+        libraryFilter = try? c.decodeIfPresent(String.self, forKey: .libraryFilter)
+        favourites = (try? c.decodeIfPresent(Set<Int>.self, forKey: .favourites)) ?? []
+        hiddenGames = (try? c.decodeIfPresent(Set<Int>.self, forKey: .hiddenGames)) ?? []
+        withoutSteam = (try? c.decodeIfPresent(Bool.self, forKey: .withoutSteam)) ?? false
     }
 }
 
@@ -189,7 +201,16 @@ final class AppModel {
     var busyGame: Int?                  // a game whose Steam setting is being changed
     var localRunning = Set<Int>()       // added games whose bottle is running
     var localStarting: [Int: String] = [:]  // added games starting now, with the step for the waiting screen
-    var banner: String?                 // short notice shown at the top
+
+    // Library and app shell (group d). `banner`, the banner's text, is in Banner.swift.
+    var booted = false                  // start() has read the saved state; until then the window shows only the mark
+    var notice: Banner?                 // the banner at the top of the library, a game's page and Settings
+    var librarySheet: LibrarySheet?     // the sheet over the library: a game's page, Settings or the program chooser
+    var pickingGame = false             // the Add game file picker is open
+    var findRequests = 0                // goes up when Find (⌘F) asks for the library's search field
+    var pendingOpens: [URL] = []        // games opened with Unwine from Finder while setup still runs
+    var updateCardHidden = false        // "Later" on the "Unwine is ready" card, until Unwine opens again
+    var menuUpdateCheck = false         // Check for Updates… from the menu runs; the library shows it waiting
 
     // Advice and Online mode
     var highballLoads = 0               // bumps when the Highball list loads, so advice redraws
@@ -491,8 +512,10 @@ final class AppModel {
         }
         let rosetta = try? await Shell.run(URL(fileURLWithPath: "/usr/bin/arch"), ["-x86_64", "/usr/bin/true"], check: false)
         guard rosetta?.status == 0 else { steps[.mac] = .needsUser("Rosetta is missing. Windows games need it."); return false }
-        guard MacSteam.isInstalled else { steps[.mac] = .needsUser("Steam is not in Applications."); return false }
-        steps[.mac] = .done("Apple Silicon, macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion), Rosetta, Steam")
+        // "Use without Steam for now" lets setup go on: games added by their .exe need no Steam.
+        guard MacSteam.isInstalled || stored.withoutSteam else { steps[.mac] = .needsUser("Steam is not in Applications."); return false }
+        steps[.mac] = .done("Apple Silicon, macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion), Rosetta, "
+                            + (MacSteam.isInstalled ? "Steam" : "no Steam for now"))
         return true
     }
 
@@ -579,6 +602,17 @@ final class AppModel {
     }
 
     func checkSteamConnection() {
+        // Set up without Steam: the library opens for games added by their .exe. Steam Play needs
+        // nothing more from Unwine later, because the Steam tool is built already.
+        if stored.withoutSteam && steamPlay != .on {
+            steps[.steam] = .done(MacSteam.isInstalled ? "Skipped for now. Turn on Steam Play in Steam to play Steam games."
+                                                       : "Skipped for now. Install Steam to play Steam games.")
+            if isReady && steps[.mac]?.isDone == true && steps[.runner]?.isDone == true {
+                stored.setupComplete = true
+                save()
+            }
+            return
+        }
         switch steamPlay {
         case .on:
             steps[.steam] = .done("Steam lists Unwine")
@@ -911,7 +945,8 @@ final class AppModel {
             if look.open, verdict != .closedEarly, !steamGamesRunning.contains(game.id) { steamGamesRunning.insert(game.id) }
             if verdict == .closedEarly {
                 steamGamesRunning.remove(game.id)
-                banner = "\(game.name) closed before it showed a window. On its page, Show logs says why."
+                show("\(game.name) closed before it showed a window. Its log says why.", .problem,
+                     action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
                 log.line("\(game.name) closed before it showed a window")
                 return
             }
@@ -920,9 +955,12 @@ final class AppModel {
                 return
             }
             if case .timedOut(let started) = verdict {
-                banner = started
-                    ? "\(game.name) is still starting. Its window shows soon, or Show logs on its page says what it is doing."
-                    : "Steam has not started \(game.name) yet. Look in Steam: it can ask a question or update the game first."
+                if started {
+                    show("\(game.name) is still starting. Its window shows soon. Its log says what it is doing.",
+                         action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
+                } else {
+                    banner = "Steam has not started \(game.name) yet. Look in Steam: it can ask a question or update the game first."
+                }
                 return
             }
         }
@@ -1269,16 +1307,24 @@ final class AppModel {
             }
             if ended {
                 localRunning.remove(game.id)
-                banner = "\(game.name) closed before it showed a window. On its page, Show logs says why."
+                show("\(game.name) closed before it showed a window. Its log says why.", .problem,
+                     action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
                 log.line("The game closed before it showed a window")
                 await offerInstalledPrograms(game, before: before)
             } else {
-                if !shown { banner = "\(game.name) is still starting. Its window shows soon, or Show logs on its page says what it is doing." }
+                if !shown {
+                    show("\(game.name) is still starting. Its window shows soon. Its log says what it is doing.",
+                         action: .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
+                }
                 // Until the bottle closes: playtime, the display kept awake, and leftovers closed.
                 Task { await self.watchLocalSession(game, exited: exited, installsBefore: before, since: launched) }
             }
         } catch {
-            banner = "\(game.name) did not start: \(error.localizedDescription)"
+            // A program that moved: Locate… keeps the game's bottle and saves.
+            let moved: Bool = { if case LocalGamesError.missing = error { return true }; return false }()
+            show("\(game.name) did not start: \(error.localizedDescription)", .problem,
+                 action: moved ? .init("Locate…") { [weak self] in self?.locateLocalGame(game) }
+                               : .init("Show logs") { [weak self] in self?.revealLogs(of: game) })
             log.line("start failed: \(error)")
         }
         await refreshSteam()
@@ -1480,7 +1526,8 @@ final class AppModel {
             }
             let back = willReopenMacSteam ? " Mac Steam comes back by itself." : ""
             if stopped {
-                banner = "Windows Steam closed while it started. Try again. If it happens again, the log in Settings says why."
+                show("Windows Steam closed while it started. Try again. If it closes again, its log says why.", .problem,
+                     action: .init("Show log") { [weak self] in self?.revealLog(named: "online-steam.log") })
                 log.line("online start: Windows Steam quit before it showed a window")
             } else if !shown {
                 banner = "Windows Steam is still starting. Its window shows soon."

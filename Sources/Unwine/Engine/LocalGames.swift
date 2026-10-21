@@ -44,8 +44,9 @@ enum LocalGamesError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        // Adding it again would make a second entry with a new, empty bottle.
-        case .missing(let path): return "The game's file is gone from \(path). Open its page and press Locate…"
+        // Adding it again would make a second entry with a new, empty bottle. The failed-start banner
+        // and the game's page both have Locate….
+        case .missing(let path): return "Its program is not in \(path) now. Press Locate… and pick it where it is now. Its bottle and saves stay."
         case .bottle(let why): return "Unwine could not make the game's Windows bottle: \(why)"
         }
     }
@@ -65,7 +66,7 @@ enum LocalGames {
         SteamGame(id: r.id, name: r.name, installDir: r.root, steamapps: root,
                   sizeOnDisk: 0, state: .installed, lastPlayed: r.lastPlayed, isWindowsBuild: true,
                   localExe: URL(fileURLWithPath: r.exePath), bottleID: r.bottleOf,
-                  playtimeMinutes: r.playtimeMinutes > 0 ? r.playtimeMinutes : nil)
+                  playtimeMinutes: r.playtimeMinutes > 0 ? r.playtimeMinutes : nil, addedAt: r.addedAt)
     }
 
     /// Steam's own order (last played first, then by name), with the added games in it.

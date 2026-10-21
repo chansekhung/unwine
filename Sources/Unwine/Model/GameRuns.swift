@@ -76,6 +76,8 @@ extension AppModel {
 
     /// Why Restart Steam cannot run now, or nil when it can. Steam closes its games when it quits.
     var restartSteamBlocker: String? {
+        // Set up with "Use without Steam for now": there is no Steam to restart.
+        if steamMissing { return Self.steamMissingReason }
         if steamRestartWords != nil { return "Steam is restarting now. Wait for it to finish." }
         if busyGame != nil { return "Steam is restarting for a game's setting. Wait for it to finish." }
         if let name = startingSteamGame { return "\(name) is starting in Steam. Wait for its window, then close the game first." }

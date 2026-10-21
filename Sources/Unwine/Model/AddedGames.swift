@@ -339,7 +339,11 @@ extension AppModel {
         if !shown {
             switch ended.status {
             case 0?: banner = "\(title) ran in the Windows bottle of \(game.name) and finished."
-            case _?: banner = "\(title) closed before it showed a window. Show logs on the game's page says why."
+            case _?:
+                // The programs run in a bottle write to the game's log (added game) or its tools log (Steam game).
+                let logName = game.localExe == nil ? Self.bottleLogName(game.id) : LocalGames.logName(game.id)
+                show("\(title) closed before it showed a window. Its log says why.", .problem,
+                     action: .init("Show log") { [weak self] in self?.revealLog(named: logName) })
             case nil: banner = "\(title) is still running in the Windows bottle of \(game.name), with no window yet."
             }
         }

@@ -27,21 +27,6 @@ struct RestartSteamButton: View {
     }
 }
 
-/// The tile's mark for a game that runs now. It is not a button: the tooltip names where Quit game is.
-struct RunningBadge: View {
-    let help: String
-
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle().fill(Palette.ok).frame(width: 7, height: 7)
-            Text("Running").font(.system(size: 11, weight: .medium))
-        }
-        .padding(.horizontal, 10).padding(.vertical, 6)
-        .background(.ultraThinMaterial, in: Capsule())
-        .help(help)
-    }
-}
-
 /// A game closed, and Windows Steam stays open: it uses battery in the background and keeps Mac Steam
 /// closed. This asks to quit it, as a card in the library or as a row on a game's page.
 struct OnlineQuitOffer: View {

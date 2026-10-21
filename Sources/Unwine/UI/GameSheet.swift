@@ -82,6 +82,14 @@ struct GameSheet: View {
                             .disabled(model.quittingGames.contains(game.id))
                             .help(model.quittingGames.contains(game.id) ? "Unwine is closing \(game.name). Wait a moment."
                                   : "Ends the game and everything in its Windows bottle. Unwine asks first.")
+                    } else if game.state != .installed {
+                        // Nothing to play until Steam finishes: the next step is in Steam.
+                        Button { model.showInSteam(game.id) } label: { Label("Open in Steam", systemImage: "arrow.up.forward.app") }
+                            .buttonStyle(PrimaryButtonStyle())
+                            .disabled(model.macSteamBlocked)
+                            .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason
+                                  : game.state == .needsUpdate ? "Steam has an update for this game. Play works after the update."
+                                  : "Steam is downloading this game. Play works when the download finishes.")
                     } else {
                         let blocker = model.steamPlayBlocker(game)
                         Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
@@ -92,15 +100,11 @@ struct GameSheet: View {
                 }
                 .padding(18)
             }
+            // Pinned under the header, outside the scroll, so the result of a button at the bottom shows.
+            BannerHost()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if let banner = model.banner {
-                        NoticeRow(color: Palette.glow, icon: "info.circle", text: banner) {
-                            Button { model.banner = nil } label: { Image(systemName: "xmark") }
-                                .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Hide this message")
-                        }
-                    }
                     if let words = model.runState(of: game).waitWords {
                         HStack(spacing: 10) {
                             UnwineMark(progress: nil, size: 22)
@@ -261,6 +265,8 @@ struct GameSheet: View {
                         LaunchOptionsEditor(game: game, followed: followed)
                     }
 
+                    section("Controllers") { ControllerRow(steamGame: !isLocal) }
+
                     section("Fix things") {
                         let busy = isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
                         HStack(spacing: 8) {
@@ -416,6 +422,7 @@ struct GameSheet: View {
         var parts: [String] = []
         if let a { parts.append(a.api.label); parts.append(a.is64Bit ? "64-bit" : "32-bit"); if let e = a.engine { parts.append(e) } }
         if game.sizeOnDisk > 0 { parts.append(ByteCountFormatter.string(fromByteCount: game.sizeOnDisk, countStyle: .file)) }
+        if let played = game.playedLine { parts.append(played) }
         return parts.joined(separator: " · ")
     }
 
