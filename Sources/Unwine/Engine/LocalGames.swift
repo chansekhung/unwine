@@ -16,6 +16,15 @@ struct LocalGameRecord: Codable, Equatable, Sendable {
     var rootPath: String? = nil
     var lastPlayed: Date? = nil
     var playtimeMinutes = 0             // while its bottle ran after Play, in whole minutes
+    /// The program's own name from its version info (ProductName), for Highball advice.
+    var productName: String? = nil
+    /// The Steam app id in a steam_appid.txt next to the program, for Highball advice.
+    var steamAppID: Int? = nil
+    /// The program file that `productName`, `steamAppID` and the icon in Covers were read from. Nil
+    /// until Unwine reads them; a program that moved is read again.
+    var productRead: String? = nil
+    /// A picture the user chose for the game: a file name in Unwine's Covers folder.
+    var cover: String? = nil
 
     var folder: URL { URL(fileURLWithPath: exePath).deletingLastPathComponent().standardizedFileURL }
     /// Where the game's own files start: the folder the user picked, else the program's folder.
@@ -35,6 +44,10 @@ extension LocalGameRecord {
         rootPath = try? c.decodeIfPresent(String.self, forKey: .rootPath)
         lastPlayed = try? c.decodeIfPresent(Date.self, forKey: .lastPlayed)
         playtimeMinutes = (try? c.decodeIfPresent(Int.self, forKey: .playtimeMinutes)) ?? 0
+        productName = try? c.decodeIfPresent(String.self, forKey: .productName)
+        steamAppID = try? c.decodeIfPresent(Int.self, forKey: .steamAppID)
+        productRead = try? c.decodeIfPresent(String.self, forKey: .productRead)
+        cover = try? c.decodeIfPresent(String.self, forKey: .cover)
     }
 }
 
@@ -132,26 +145,8 @@ enum LocalGames {
     /// Folders that hold many unrelated things are never one game's folder.
     static let shelves: Set<String> = ["documents", "desktop", "downloads", "applications", "games", "steamapps", "common", "volumes"]
 
-    /// Folders like bin, x64 or Binaries say nothing about the game. Program Files and drive_c are
-    /// where an installer puts it.
-    private static let generic: Set<String> = ["bin", "bin32", "bin64", "x64", "x86", "win32", "win64", "binaries", "game", "games",
-                                               "release", "retail", "shipping", "debug", "system", "data", "downloads", "desktop", "documents",
-                                               "program files", "program files (x86)", "drive_c"]
-
-    /// A readable name from the game's folder ("Romance_of_X_14" becomes "Romance of X 14"): the game
-    /// folder the user picked when it says something, else the program's folder or one above it.
-    static func suggestedName(for exe: URL, root: URL? = nil) -> String {
-        if let root, !generic.contains(root.lastPathComponent.lowercased()) {
-            let name = root.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
-            if !name.isEmpty && name != "/" { return name }
-        }
-        var dir = exe.deletingLastPathComponent()
-        for _ in 0..<3 where generic.contains(dir.lastPathComponent.lowercased()) { dir = dir.deletingLastPathComponent() }
-        let folder = dir.lastPathComponent
-        let base = folder.isEmpty || folder == "/" || generic.contains(folder.lowercased())
-            ? exe.deletingPathExtension().lastPathComponent : folder
-        return base.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
-    }
+    // A new game's name comes from LocalGames.defaultName (GameTitles.swift): its folder, past
+    // generic ones such as bin, Program Files and drive_c, else the program's ProductName.
 
     /// The game's top folder, from the folder the user picked: that folder, or for a folder of many
     /// games (Games, Downloads, a whole drive) the folder in it that holds the program. Nil when that
@@ -342,8 +337,8 @@ enum LocalGames {
             loader = GameModeBundle.matches(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name)
                 ? GameModeBundle.loader(bundle) : engine.wine
         } else {
-            loader = GameModeBundle.ensure(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name, log: log)
-                ?? engine.wine
+            loader = GameModeBundle.ensure(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name,
+                                           icon: ArtCache.iconFile(game.id), log: log) ?? engine.wine
         }
         env["WINELOADER"] = loader.path
         let before = watchInstalls ? installedPrograms(in: pfx) : nil
@@ -371,8 +366,13 @@ enum LocalGames {
 enum GameModeBundle {
     static func loader(_ bundle: URL) -> URL { bundle.appendingPathComponent("Contents/MacOS/wine") }
 
-    private static func info(bundleID: String, name: String) -> Data {
+    /// The icon a bundle shows in the Dock and Command-Tab: the game program's own, made when the
+    /// bundle is built. An icon that turns up later waits for the next build.
+    private static let iconName = "game.icns"
+
+    static func info(bundleID: String, name: String, icon: Bool) -> Data {
         let safe = name.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+        let iconKey = icon ? "\t<key>CFBundleIconFile</key>\n\t<string>\(iconName)</string>\n" : ""
         return Data("""
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -380,7 +380,7 @@ enum GameModeBundle {
             <dict>
             \t<key>CFBundleExecutable</key>
             \t<string>wine</string>
-            \t<key>CFBundleIdentifier</key>
+            \(iconKey)\t<key>CFBundleIdentifier</key>
             \t<string>\(bundleID)</string>
             \t<key>CFBundleInfoDictionaryVersion</key>
             \t<string>6.0</string>
@@ -420,9 +420,11 @@ enum GameModeBundle {
         let fm = FileManager.default
         let source = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
         let macOS = bundle.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        // With or without an icon: an icon alone is no reason to build the bundle again.
+        let plist = try? Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))
         guard let want = try? fm.contentsOfDirectory(atPath: source.path), want.contains("wine"),
               let have = try? fm.contentsOfDirectory(atPath: macOS.path),
-              (try? Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))) == info(bundleID: bundleID, name: name)
+              plist == info(bundleID: bundleID, name: name, icon: false) || plist == info(bundleID: bundleID, name: name, icon: true)
         else { return false }
         let all = links(engine)
         guard Set(have) == Set(want).union(all.compactMap { $0.path.hasPrefix("Contents/MacOS/") ? String($0.path.dropFirst(15)) : nil })
@@ -441,7 +443,8 @@ enum GameModeBundle {
 
     /// The bundle's loader, building the bundle first when it is missing or out of date. Nil when
     /// it cannot be built; the caller then starts Wine from the engine (no Game Mode).
-    static func ensure(engine: InstalledEngine, bundle: URL, bundleID: String, name: String, log: LogFile) -> URL? {
+    /// `icon` is the PNG of the game program's icon; the bundle gets it as an .icns when it is built.
+    static func ensure(engine: InstalledEngine, bundle: URL, bundleID: String, name: String, icon: URL? = nil, log: LogFile) -> URL? {
         if matches(engine: engine, bundle: bundle, bundleID: bundleID, name: name) { return loader(bundle) }
         let fm = FileManager.default
         let source = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
@@ -450,7 +453,14 @@ enum GameModeBundle {
         do {
             let macOS = stage.appendingPathComponent("Contents/MacOS", isDirectory: true)
             try Paths.ensure(macOS)
-            try info(bundleID: bundleID, name: name).write(to: stage.appendingPathComponent("Contents/Info.plist"))
+            // Without an icon the Dock shows a blank app; a failed icon only costs the icon.
+            var hasIcon = false
+            if let icon, fm.fileExists(atPath: icon.path) {
+                let resources = try Paths.ensure(stage.appendingPathComponent("Contents/Resources", isDirectory: true))
+                hasIcon = ExeIcon.writeICNS(from: icon, to: resources.appendingPathComponent(iconName))
+                if !hasIcon { log.line("Could not make the Dock icon for \(name), so its app has none") }
+            }
+            try info(bundleID: bundleID, name: name, icon: hasIcon).write(to: stage.appendingPathComponent("Contents/Info.plist"))
             for file in try fm.contentsOfDirectory(atPath: source.path) {
                 let from = source.appendingPathComponent(file), to = macOS.appendingPathComponent(file)
                 if clonefile(from.path, to.path, 0) != 0 { try fm.copyItem(at: from, to: to) }

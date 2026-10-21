@@ -624,6 +624,18 @@ struct GameTile: View {
         Divider()
         if game.localExe != nil {
             Button { rename() } label: { Label("Rename…", systemImage: "pencil") }
+            // The cover items wait while Unwine copies a picked picture.
+            let copying = ArtState.shared.preparing.contains(game.id)
+            Button { model.chooseCover(for: game) } label: {
+                Label(copying ? "Choose cover… (Unwine is copying a picture)" : "Choose cover…", systemImage: "photo")
+            }
+            .disabled(copying)
+            if model.hasCover(game.id) {
+                Button { model.resetCover(for: game) } label: {
+                    Label(copying ? "Reset cover (Unwine is copying a picture)" : "Reset cover", systemImage: "arrow.uturn.backward")
+                }
+                .disabled(copying)
+            }
             Button(role: .destructive) { remove() } label: {
                 Label(busy ? "Remove from Unwine… (quit the game first)" : "Remove from Unwine…", systemImage: "trash")
             }
@@ -810,48 +822,92 @@ struct ProgramChooser: View {
 
 // MARK: - Art
 
-/// Steam's cached art first (offline), then Steam's CDN, then a lettered placeholder.
+/// A game's picture. A Steam game: Steam's own cache (works offline), then Unwine's copy of Steam's
+/// CDN art, then the CDN; art that failed tries again when the next Steam refresh lands. An added
+/// game: the cover the user chose, else its program's icon on a tile of the game's own colour.
+/// Without either, that tile shows the game's initials.
 struct GameArt: View {
+    @Environment(AppModel.self) private var model
     let appID: Int
     let kind: SteamLibrary.ArtKind
     let title: String
-    @State private var image: NSImage?
-    @State private var failed = false
+    /// The last picture loaded, with the source it came from.
+    @State private var picture: Picture?
+    /// The source whose load finished, with a picture or without one.
+    @State private var settled: String?
+
+    private struct Picture {
+        let source: String
+        let image: NSImage
+        let isIcon: Bool
+    }
+
+    init(appID: Int, kind: SteamLibrary.ArtKind, title: String) {
+        self.appID = appID
+        self.kind = kind
+        self.title = title
+        // A tile that scrolls back into view shows its art at once, or its placeholder when the art
+        // failed, instead of a shimmer.
+        guard !LocalGames.isLocal(appID) else { return }
+        let source = "steam:\(appID):\(kind.rawValue)"
+        if let known = ArtCache.remembered(steamAppID: appID, kind) {
+            _picture = State(initialValue: Picture(source: source, image: NSImage(cgImage: known, size: .zero), isIcon: false))
+            _settled = State(initialValue: source)
+        } else if ArtCache.hasFailed(appID, kind) {
+            _settled = State(initialValue: source)
+        }
+    }
 
     var body: some View {
+        let local = LocalGames.isLocal(appID) ? model.localArt(for: appID) : nil
+        let want = source(local)
+        let failed = local == nil && settled == want && picture?.source != want
         ZStack {
-            if let image {
-                Image(nsImage: image).resizable().scaledToFill()
-            } else if failed {
-                ZStack {
-                    LinearGradient(colors: [Palette.deep, Palette.accentDeep.opacity(0.6)], startPoint: .top, endPoint: .bottom)
-                    Text(initials).font(.system(size: 34, weight: .bold, design: .rounded)).foregroundStyle(Palette.text.opacity(0.8))
+            if local?.waiting == true {
+                Shimmer()
+            } else if let picture, picture.source == want || settled != want {
+                // The new picture, or the old one while the new one loads.
+                if picture.isIcon {
+                    ArtPlaceholder(title: title, wide: kind == .hero, icon: picture.image)
+                } else {
+                    Image(nsImage: picture.image).resizable().scaledToFill()
                 }
+            } else if settled == want {
+                ArtPlaceholder(title: title, wide: kind == .hero, icon: nil)
             } else {
                 Shimmer()
             }
         }
-        .task(id: appID) { await load() }
+        // Only a tile whose Steam art failed watches the refreshes.
+        .task(id: failed ? "\(want)#\(ArtState.shared.refreshes)" : want) { await load(want, local) }
     }
 
-    private var initials: String {
-        title.split(separator: " ").prefix(2).compactMap(\.first).map(String.init).joined().uppercased()
+    /// Which picture this game should show now.
+    private func source(_ local: LocalArt?) -> String {
+        guard let local else { return "steam:\(appID):\(kind.rawValue)" }
+        if local.waiting { return "wait" }
+        if let cover = local.cover { return "cover:\(cover.lastPathComponent)" }
+        if let icon = local.icon { return "icon:\(icon.lastPathComponent)|\(local.stamp)" }
+        return "none"
     }
 
-    private func load() async {
-        if let local = SteamLibrary.cachedArt(kind, appID: appID), let img = NSImage(contentsOf: local) {
-            image = img
-            return
-        }
-        // A game added by its .exe has no Steam art: it gets the lettered tile.
-        for url in LocalGames.isLocal(appID) ? [] : SteamLibrary.remoteArt(kind, appID: appID) {
-            if let (data, response) = try? await URLSession.shared.data(from: url),
-               (response as? HTTPURLResponse)?.statusCode == 200, let img = NSImage(data: data) {
-                image = img
-                return
+    private func load(_ want: String, _ local: LocalArt?) async {
+        var image: CGImage?
+        var isIcon = false
+        if let local {
+            guard !local.waiting else { return }
+            if let cover = local.cover { image = await ArtCache.picture(at: cover) }
+            // A cover file that went missing gives way to the icon.
+            if image == nil, let icon = local.icon {
+                image = await ArtCache.picture(at: icon)
+                isIcon = image != nil
             }
+        } else {
+            image = await ArtCache.steamPicture(appID, kind)
         }
-        failed = true
+        guard !Task.isCancelled else { return }
+        if let image { picture = Picture(source: want, image: NSImage(cgImage: image, size: .zero), isIcon: isIcon) }
+        settled = want
     }
 }
 

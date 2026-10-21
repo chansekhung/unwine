@@ -201,7 +201,7 @@ extension AppModel {
     func useInstalledProgram(_ id: Int, exe: URL) {
         guard let i = stored.localGames.firstIndex(where: { $0.id == id }) else { return }
         let old = stored.localGames[i].name
-        var name = LocalGames.suggestedName(for: exe)
+        var name = LocalGames.defaultName(for: exe, picked: nil)
         if let role = LocalGames.role(of: exe) { name += " · \(role)" }
         stored.localGames[i].name = uniqueLocalName(name, exe: exe, except: id)
         installedPrograms[id] = nil
