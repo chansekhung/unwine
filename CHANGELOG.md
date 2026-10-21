@@ -22,7 +22,7 @@ How to keep this list. The build reads it, so follow these rules.
    commands to tag and publish.
 -->
 
-## 1.0.4 · not released yet
+## 1.0.4 · 2026-10-21
 
 - **Automatic battery mode.** On battery, in Low Power Mode or when your Mac is hot, games start with a frame cap of 60 fps. In Low Power Mode or heat, the cap is 40 fps (30 fps on a 60 Hz screen). 120 fps mode waits until you plug in. Plugged in, nothing changes.
   - Each game page has the switch **Save battery when unplugged**. A line under it says what the game gets now. Your own frame cap always stays.
@@ -77,7 +77,9 @@ How to keep this list. The build reads it, so follow these rules.
   - Then Settings says that Steam is not installed and has a **Get Steam** button. **Restart Steam** stays off until you install Steam.
 - A game page shows the controllers that are connected.
 
-## 1.0.3 · not released yet
+## 1.0.3 · 2026-10-21
+
+Unwine 1.0.3 was not published by itself. Its changes come to you in 1.0.4.
 
 - **A game and its launcher share one Windows bottle.** (A bottle is the small Windows system that Unwine makes for each game.) Add two programs from one game folder, such as a launcher and its game. Settings that you make in the launcher now go to the game.
   - Did you add a launcher and its game before this version? Unwine puts them into one bottle when it opens. The bottle that it does not need goes to the Trash.
