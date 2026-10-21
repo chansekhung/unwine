@@ -46,14 +46,18 @@ extension AppModel {
 
     /// Opens a Steam game in Steam once a bottle write in progress is done: a few seconds, and only
     /// right after a change. NotProton stops every Wine program in the bottle as the game starts, so a
-    /// game started during the write would cut it short.
-    func startWhenBottleReady(_ game: SteamGame) {
-        guard let task = bottleTasks[game.id] else { MacSteam.play(game.id); return }
+    /// game started during the write would cut it short. `begin` runs just before Steam is asked, and
+    /// returns false when the start was called off meanwhile (Stop waiting, Quit game): Steam is not asked.
+    func startWhenBottleReady(_ game: SteamGame, begin: @escaping @MainActor () -> Bool = { true }) {
+        guard let task = bottleTasks[game.id] else {
+            if begin() { MacSteam.play(game.id) }
+            return
+        }
         bottlePlayQueued.insert(game.id)
         Task { [weak self] in
             await task.value
             self?.bottlePlayQueued.remove(game.id)
-            MacSteam.play(game.id)
+            if begin() { MacSteam.play(game.id) }
         }
     }
 
@@ -66,7 +70,9 @@ extension AppModel {
             for game in windowsGames where runsThroughUnwine(game) { prepareBottle(for: game.id) }
             return
         }
-        for id in bottleWaiting where !bottleWriting.contains(id) {
+        // Not while Steam starts the game: its bottle closes for a moment between Steam's install
+        // scripts and the game, and NotProton would stop the write's Wine run as the game starts.
+        for id in bottleWaiting where !bottleWriting.contains(id) && steamStarting[id] == nil {
             guard let game = games.first(where: { $0.id == id }) else { bottleWaiting.remove(id); continue }
             let prefix = game.compatData.appendingPathComponent("pfx", isDirectory: true)
             guard FileManager.default.fileExists(atPath: prefix.appendingPathComponent("user.reg").path),

@@ -271,6 +271,12 @@ extension AppModel {
             if localStarting[game.id] != nil { return "Wait until the game has started." }
         } else {
             if let tool = mappings[game.id], tool != Runner.toolName { return "Steam runs this game with another tool (\(tool)), so its bottle is not Unwine's." }
+            // NotProton stops every program in the bottle as the game starts, and Quit game ends them all.
+            switch runState(of: game) {
+            case .starting: return "Wait until the game has started."
+            case .closing: return "\(game.name) is closing. Wait a moment."
+            case .idle, .running: break
+            }
         }
         if !bottleExists(game) {
             return "Play the game once first. \(game.localExe == nil ? "Steam" : "Unwine") makes its Windows bottle then."
