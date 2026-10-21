@@ -22,6 +22,10 @@ How to keep this list. The build reads it, so follow these rules.
    commands to tag and publish.
 -->
 
+## 1.0.5 · not released yet
+
+- **Faster x87 math is off for now.** With this Wine engine, it stopped every 32-bit game at start, Age of Mythology too. Unwine turns it off by itself, and the switch says why. Your games start again. A later engine with the newer x87 hook can bring it back.
+
 ## 1.0.4 · 2026-10-21
 
 - **Automatic battery mode.** On battery, in Low Power Mode or when your Mac is hot, games start with a frame cap of 60 fps. In Low Power Mode or heat, the cap is 40 fps (30 fps on a 60 Hz screen). 120 fps mode waits until you plug in. Plugged in, nothing changes.

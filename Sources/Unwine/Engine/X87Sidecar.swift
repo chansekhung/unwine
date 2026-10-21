@@ -9,8 +9,9 @@ import Foundation
 /// The engine's ntdll.so (Sikarugir Wine 11.0) has the older hook: it runs each 32-bit process through
 /// the program in ROSETTA_X87_PATH (that program first, then Wine's own arguments). It has no
 /// x87sidecar handshake (no X87_SIDECAR_BOOTSTRAP), so the plain build would refuse to attach. The
-/// "entitled" build attaches by itself, and macOS asks once per login session to allow it Developer
-/// Tools access.
+/// "entitled" build attaches by itself (macOS asks once per login session to allow it Developer Tools
+/// access), but every 32-bit program then stops at start. So Unwine offers the switch only on an engine
+/// with the handshake (`engineHasHook`); on this engine it stays off and says why.
 enum X87Sidecar {
     static let version = "1.9.0"
     static let url = URL(string: "https://github.com/athei/x87sidecar/releases/download/v1.9.0/x87sidecar_entitled.tar.xz")!
@@ -56,11 +57,15 @@ enum X87Sidecar {
     /// Every name `exports` can set. Making a bottle runs without them (LocalGames.withoutX87).
     static let variables: Set<String> = ["ROSETTA_X87_PATH", "X87_PRECISE_FAULTS"]
 
-    /// True when this engine's Wine runs 32-bit processes through ROSETTA_X87_PATH. Read once per engine.
+    /// True when this engine's Wine has the x87sidecar handshake (X87_SIDECAR_BOOTSTRAP). Read once per
+    /// engine. The older hook alone (ROSETTA_X87_PATH, in Sikarugir's Wine 11.0) is not enough: there
+    /// the entitled build attaches and every 32-bit program stops at once, before it shows anything.
+    /// Measured on 21 Oct 2026 (macOS 27.0.1, x87sidecar 1.9.0): a 32-bit "hello" and a DXMT window
+    /// both ended with status 1, and Age of Mythology's start crashed, although --probe passed.
     @MainActor static func engineHasHook(_ engine: InstalledEngine) -> Bool {
         if let known = hooks[engine.folder] { return known }
         let ntdll = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix/ntdll.so")
-        let found = (try? Data(contentsOf: ntdll, options: .alwaysMapped))?.range(of: Data("ROSETTA_X87_PATH\0".utf8)) != nil
+        let found = (try? Data(contentsOf: ntdll, options: .alwaysMapped))?.range(of: Data("X87_SIDECAR_BOOTSTRAP\0".utf8)) != nil
         hooks[engine.folder] = found
         return found
     }
@@ -384,7 +389,7 @@ extension AppModel {
     var x87Blocker: String? {
         guard let engine else { return "Finish Unwine's setup first." }
         if !X87Sidecar.engineHasHook(engine) {
-            return "Unwine's engine has no x87 hook (the part of Wine that starts x87sidecar), so x87sidecar cannot attach to games. An engine update can bring the hook back."
+            return "Unwine's engine does not have the newer x87 hook (the part of Wine that starts x87sidecar). With the older hook, x87sidecar stops every 32-bit game at start, so it stays off. An engine update with the newer hook can bring it back."
         }
         if let p = stored.x87Probe, p.isCurrent, !p.passed {
             return "x87sidecar \(p.sidecarVersion) does not support the Rosetta in macOS \(p.macOSVersion) yet."
