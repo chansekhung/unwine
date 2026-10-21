@@ -18,8 +18,10 @@ struct SteamGame: Identifiable, Hashable, Sendable {
     let isWindowsBuild: Bool
     /// Set for a game the user added by its .exe (it runs without Steam).
     var localExe: URL? = nil
+    /// An added game that shares another added game's bottle (one game folder, one bottle).
+    var bottleID: Int? = nil
 
-    var compatData: URL { steamapps.appendingPathComponent("compatdata/\(id)", isDirectory: true) }
+    var compatData: URL { steamapps.appendingPathComponent("compatdata/\(bottleID ?? id)", isDirectory: true) }
     var runLog: URL {
         localExe == nil ? compatData.appendingPathComponent("notproton-run.log") : Paths.logs.appendingPathComponent(LocalGames.logName(id))
     }

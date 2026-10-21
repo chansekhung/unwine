@@ -626,7 +626,7 @@ enum OnlineSteam {
         env["WINEDLLPATH_DXMT"] = engine.renderer("dxmt").path
         env["DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN"] = "1"
         // Unwine's copy of DXVK's DirectX 9 layer, when ready, like the default game profile.
-        let d9vk = RendererPatches.asyncDir("d9vk", engine: engine) ?? engine.renderer("d9vk")
+        let d9vk = RendererPatches.fixedDir("d9vk", engine: engine) ?? engine.renderer("d9vk")
         if engine.supports("WINEDLLPATH_D9VK") { env["WINEDLLPATH_D9VK"] = d9vk.path }
         if engine.supports("WINEDLLPATH_CNCD") { env["WINEDLLPATH_CNCD"] = engine.renderer("cnc_ddraw").path }
         let vulkan = RendererPatches.vulkanICD(engine: engine)

@@ -8,6 +8,12 @@ struct LocalGameRecord: Codable, Equatable, Sendable {
     var name: String
     var exePath: String
     var addedAt: Date
+    /// The added game whose Windows bottle this one uses. Programs from one game folder share a
+    /// bottle, as on Windows they share one registry: a launcher's settings then reach the game.
+    var bottleOf: Int? = nil
+
+    var folder: URL { URL(fileURLWithPath: exePath).deletingLastPathComponent().standardizedFileURL }
+    var bottle: Int { bottleOf ?? id }
 }
 
 enum LocalGamesError: LocalizedError {
@@ -34,7 +40,58 @@ enum LocalGames {
     static func game(from r: LocalGameRecord) -> SteamGame {
         let exe = URL(fileURLWithPath: r.exePath)
         return SteamGame(id: r.id, name: r.name, installDir: exe.deletingLastPathComponent(), steamapps: root,
-                         sizeOnDisk: 0, state: .installed, lastPlayed: nil, isWindowsBuild: true, localExe: exe)
+                         sizeOnDisk: 0, state: .installed, lastPlayed: nil, isWindowsBuild: true, localExe: exe,
+                         bottleID: r.bottleOf)
+    }
+
+    /// True when a program's file lies inside an added game's bottle (an installer put it there).
+    static func isInside(_ exe: URL, bottle: Int) -> Bool {
+        let dir = root.appendingPathComponent("compatdata/\(bottle)", isDirectory: true).standardizedFileURL.path + "/"
+        return exe.standardizedFileURL.path.hasPrefix(dir)
+    }
+
+    /// What a program is for when it is not the game itself, from its file name. Version info does
+    /// not help: Romance of the Three Kingdoms XIV's launcher describes itself with the game's name.
+    static func role(of exe: URL) -> String? {
+        let n = exe.deletingPathExtension().lastPathComponent.lowercased()
+        if n.contains("launch") { return "Launcher" }
+        if ["config", "setting", "option"].contains(where: n.contains) { return "Settings" }
+        if ["tool", "editor"].contains(where: n.contains) { return "Tool" }
+        return nil
+    }
+
+    /// True when an added game's bottle holds files a program wrote itself (saves, settings files).
+    /// Caches do not count, and Documents, Desktop and the like are links to the Mac's own folders.
+    static func bottleHoldsOwnFiles(_ bottle: Int) -> Bool {
+        let users = root.appendingPathComponent("compatdata/\(bottle)/pfx/drive_c/users", isDirectory: true)
+        let skip: Set<String> = ["temp", "microsoft", "dxvk", "mesa_shader_cache", "d3dscache", "nvidia", "cache", "caches", "crashdumps"]
+        let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey]
+        guard let walk = FileManager.default.enumerator(at: users, includingPropertiesForKeys: keys) else { return false }
+        for case let url as URL in walk {
+            let v = try? url.resourceValues(forKeys: Set(keys))
+            if v?.isSymbolicLink == true || skip.contains(url.lastPathComponent.lowercased()) { walk.skipDescendants(); continue }
+            if v?.isRegularFile == true { return true }
+        }
+        return false
+    }
+
+    /// An added game from the same game folder as `exe`, whose bottle a new program should share:
+    /// the same folder, or one folder inside the other at most two levels down (a launcher next to
+    /// a bin folder). Further apart is more likely a folder of several games.
+    static func bottleMate(for exe: URL, in records: [LocalGameRecord]) -> LocalGameRecord? {
+        // A program an installer put inside another added program's bottle runs in that bottle:
+        // its files, registry entries and helpers are there.
+        if let host = records.first(where: { isInside(exe, bottle: $0.bottle) }) { return host }
+        let dir = exe.deletingLastPathComponent().standardizedFileURL.pathComponents
+        // Folders that hold many unrelated things are never one game's folder.
+        let shelves: Set<String> = ["documents", "desktop", "downloads", "applications", "games", "steamapps", "common", "volumes"]
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.pathComponents
+        func near(_ a: [String], _ b: [String]) -> Bool {
+            let (short, long) = a.count <= b.count ? (a, b) : (b, a)
+            if short.count <= home.count || shelves.contains(short.last?.lowercased() ?? "") { return false }
+            return long.count - short.count <= 2 && Array(long.prefix(short.count)) == short
+        }
+        return records.first { near($0.folder.pathComponents, dir) }
     }
 
     /// A readable name from the game's folder ("Romance_of_X_14" becomes "Romance of X 14").
@@ -132,7 +189,8 @@ enum LocalGames {
         // The game runs from an app bundle that says "game", so macOS can give it Game Mode. A
         // bundle is only rebuilt while the bottle is closed: running processes use its files.
         await phase("Starting \(game.name)…")
-        let bundle = game.compatData.appendingPathComponent("Game.app", isDirectory: true)
+        // Programs that share a bottle each keep their own app, with their own name.
+        let bundle = game.compatData.appendingPathComponent(game.bottleID == nil ? "Game.app" : "Game-\(game.id).app", isDirectory: true)
         let loader: URL
         if isRunning(game) {
             loader = GameModeBundle.matches(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name)

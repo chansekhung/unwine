@@ -23,14 +23,22 @@ Mac Steam, and it runs through Unwine's free engine, like Proton on a Steam Deck
   120 fps mode (DXMT, for games that ask for 60 Hz on a faster screen). Your own choices always win:
   the advisor only suggests, and nothing is locked.
 - Add game: any Windows program outside Steam, by its .exe or its folder. Each one gets its own Wine
-  bottle and the same per-game settings.
+  bottle and the same per-game settings. Programs from one game folder (a launcher and its game)
+  share one bottle, so the launcher's settings reach the game. Right-click a game to play, rename or
+  remove it.
 - Fewer stutters: Unwine makes patched copies of DXVK's d3d9.dll (background shader building then also
   covers the screen's back buffers) and of the KosmicKrisp driver (the right memory budget under
   Rosetta). The downloaded files stay as they are.
+- No crash and no black screen when a game shares a texture: some games decode videos with a
+  DirectX 9 device and show them with DirectX 10/11 (Romance of the Three Kingdoms XIV). A Mac cannot
+  share that picture, and DXVK then closed the game. Unwine's copies of DXVK's d3d9, d3d11 and dxgi
+  DLLs carry on without the share, and the hidden DirectX 9 device no longer covers the game's window.
 - No more DXMT freezes in 32-bit games: Unwine's copy of Wine lets the game's .exe decide DEP (Data
   Execution Prevention, a memory guard), as Windows does.
 - Font stand-ins: Windows fonts such as Palatino Linotype use the Mac's Palatino, so launchers do not
-  show blank buttons.
+  show blank buttons. Chinese, Japanese and Korean fonts (MS UI Gothic, SimSun, PMingLiU, Gulim and
+  others) use the Mac's PingFang, Hiragino, Songti and Apple SD Gothic Neo, so dialogs in those
+  languages show text, not boxes.
 - Online mode for Valve Anti-Cheat (VAC) games (experimental): Windows Steam runs inside Unwine's engine,
   like CrossOver. It sees only the Windows games that need it, never your Mac versions of games, and uses
   the same game files as Mac Steam. Mac Steam closes while it runs. High Resolution Mode gives sharp
@@ -57,6 +65,9 @@ Mac Steam, and it runs through Unwine's free engine, like Proton on a Steam Deck
   nothing with them; Unwine's Low latency switch uses DXVK's own latency sleep instead.
 - Games with kernel anti-cheat (Easy Anti-Cheat, BattlEye, Vanguard and others) do not run online on
   any Mac Wine tool, CrossOver included.
+- A picture that a game shares between DirectX devices stays black, because the Mac's Vulkan driver
+  cannot share it. In Romance of the Three Kingdoms XIV the videos are black (sound plays); Esc skips
+  them, and the menus and the game itself draw normally.
 - Some games run in CrossOver and not here: CodeWeavers has a paid team that fixes single games.
 - GPTK 4 is an Apple beta. Rosetta 2 is fully supported through macOS 27 only.
 

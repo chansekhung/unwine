@@ -180,6 +180,7 @@ final class AppModel {
     private var onlineStartedAt = Date.distantPast
     private var onlineGoneTicks = 0
     private var tickCount = 0
+    private var wasVisible = true
     private var fontsChecked = Set<String>()    // bottles already given the font stand-ins this run
     private var localLogs: [Int: LogFile] = [:]   // one writer per added game's log
     private var lastHighballCheck = Date()
@@ -220,6 +221,7 @@ final class AppModel {
         started = true
         if LegacyFolder.renameAppIfNeeded() { return }
         load()
+        mergeLocalBottles()
         EngineStore.cleanStaging()
         Runner.pruneOldRunners()
         let engines = EngineStore.installed()
@@ -290,10 +292,15 @@ final class AppModel {
     }
 
     /// Runs every few seconds: refresh Steam, finish work that waited for games to close.
-    /// While a game runs, Unwine looks only every third tick, so it takes less from the game.
+    /// While a game runs (Steam Play, Online mode or an added game), Unwine looks only every third
+    /// tick, so it takes less from the game. While no Unwine window shows, it looks every eighth
+    /// (about 30 s), and at once when a window shows again.
     private func tick() async {
         tickCount += 1
-        if (gameRunning || online.inUse) && !onlineBusy && tickCount % 3 != 0 { return }
+        let visible = AppVisibility.shared.visible
+        defer { wasVisible = visible }
+        let every = !visible && !online.inUse ? 8 : (gameRunning || online.inUse || !localRunning.isEmpty) ? 3 : 1
+        if !onlineBusy && !(visible && !wasVisible) && tickCount % every != 0 { return }
         await refreshSteam()
         if Date().timeIntervalSince(lastHighballCheck) > 600 {
             lastHighballCheck = Date()
@@ -735,12 +742,21 @@ final class AppModel {
         let pfx = game.compatData.appendingPathComponent("pfx")
         guard !Runner.isPrefixRunning(pfx) else { banner = "\(game.name) is running. Quit the game first."; return }
         guard FileManager.default.fileExists(atPath: pfx.path) else { banner = "\(game.name) has no Windows bottle yet."; return }
+        if game.localExe != nil,
+           let installed = stored.localGames.first(where: { LocalGames.isInside(URL(fileURLWithPath: $0.exePath), bottle: game.bottleID ?? game.id) }) {
+            banner = installed.id == game.id
+                ? "\(game.name) is installed inside its own Windows bottle, so a fresh bottle would delete the game. The bottle stays."
+                : "\(installed.name) is installed inside this Windows bottle, so a fresh bottle would delete it. The bottle stays. To start over anyway, remove \(installed.name) first."
+            return
+        }
         do {
             try FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
             for marker in ["notproton-build", "notproton-game-drive", "notproton-hidden-controllers"] {
                 try? FileManager.default.removeItem(at: game.compatData.appendingPathComponent(marker))
             }
+            let shared = bottleSharers(of: game).map(\.name)
             banner = "Windows bottle for \(game.name) moved to the Trash. \(game.localExe == nil ? "Steam" : "Unwine") builds a fresh one on next Play."
+                + (shared.isEmpty ? "" : " \(shared.joined(separator: ", ")) shared it, so it starts fresh too.")
         } catch {
             banner = "Could not move the bottle to the Trash: \(error.localizedDescription)"
         }
@@ -757,9 +773,17 @@ final class AppModel {
         let id = max(LocalGames.idBase, stored.lastLocalID, stored.localGames.map(\.id).max() ?? 0) + 1
         stored.lastLocalID = id
         // Named after the folder the user picked, else the folder the program sits in.
-        let name = folder.map { $0.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces) }
+        var name = folder.map { $0.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces) }
             .flatMap { $0.isEmpty ? nil : $0 } ?? LocalGames.suggestedName(for: exe)
-        let record = LocalGameRecord(id: id, name: name, exePath: exe.path, addedAt: Date())
+        // A second program from the same game (often its launcher) shares the first one's bottle.
+        // A launcher or tool says so in its name, so the tiles differ.
+        let mate = LocalGames.bottleMate(for: exe, in: stored.localGames)
+        if let role = LocalGames.role(of: exe) {
+            name += " · \(role)"
+        } else if stored.localGames.contains(where: { $0.name == name }) {
+            name += " (\(exe.deletingPathExtension().lastPathComponent))"
+        }
+        let record = LocalGameRecord(id: id, name: name, exePath: exe.path, addedAt: Date(), bottleOf: mate?.bottle)
         stored.localGames.append(record)
         save()
         let game = LocalGames.game(from: record)
@@ -767,26 +791,109 @@ final class AppModel {
         let lower = exe.lastPathComponent.lowercased()
         banner = ["setup", "install", "unins"].contains(where: lower.contains)
             ? "\(record.name) looks like an installer. Play runs it inside the game's own bottle. When it finishes, use Add game again and pick the installed program (Unwine's LocalGames folder holds the bottle)."
-            : "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
+            : mate.map { m in LocalGames.isInside(exe, bottle: m.bottle)
+                ? "\(record.name) is in your library. It runs in the Windows bottle that \(m.name) installed it into."
+                : "\(record.name) is in your library. It shares a Windows bottle with \(m.name), so settings you make in one, such as in a launcher, reach the other." }
+                ?? "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
         Task { await analyze(game) }
     }
 
+    /// Programs from one game folder added before Unwine 1.0.3 each got their own bottle, so a
+    /// launcher's settings never reached its game. This moves each such pair into one bottle. It
+    /// keeps the bottle that holds files a program wrote (saves), else the launcher's (its settings
+    /// are in that bottle's registry), else the older one; the other goes to the Trash. A pair whose
+    /// bottles both hold files stays apart, because Unwine cannot tell which saves count. Bottles
+    /// in use are left for the next start. A launcher or tool also gets its role in its name.
+    private func mergeLocalBottles() {
+        var owners: [LocalGameRecord] = []
+        var notes: [String] = []
+        for r in stored.localGames.sorted(by: { $0.addedAt < $1.addedAt }) where r.bottleOf == nil {
+            guard let mate = LocalGames.bottleMate(for: URL(fileURLWithPath: r.exePath), in: owners) else { owners.append(r); continue }
+            let pfx = { (id: Int) in LocalGames.root.appendingPathComponent("compatdata/\(id)/pfx", isDirectory: true) }
+            guard !OnlineSteam.serverIsAlive(pfx(r.id)), !OnlineSteam.serverIsAlive(pfx(mate.id)) else { continue }
+            let files = (r: LocalGames.bottleHoldsOwnFiles(r.id), mate: LocalGames.bottleHoldsOwnFiles(mate.id))
+            // A program installed inside the other's bottle must move there: that bottle holds it.
+            let installedInMate = LocalGames.isInside(URL(fileURLWithPath: r.exePath), bottle: mate.bottle)
+            guard !(files.r && (files.mate || installedInMate)) else {
+                log.line("\(r.name) and \(mate.name) keep their own bottles: both hold files the programs wrote")
+                owners.append(r); continue
+            }
+            let isLauncher = { (x: LocalGameRecord) in LocalGames.role(of: URL(fileURLWithPath: x.exePath)) == "Launcher" }
+            let keep = !installedInMate && (files.r || (!files.mate && isLauncher(r) && !isLauncher(mate))) ? r : mate
+            let drop = keep.id == r.id ? mate : r
+            for i in stored.localGames.indices where stored.localGames[i].bottle == drop.id {
+                stored.localGames[i].bottleOf = keep.id
+            }
+            if keep.id == r.id { owners.removeAll { $0.id == mate.id }; owners.append(r) }
+            try? FileManager.default.trashItem(at: LocalGames.root.appendingPathComponent("compatdata/\(drop.id)", isDirectory: true), resultingItemURL: nil)
+            for i in stored.localGames.indices where [r.id, mate.id].contains(stored.localGames[i].id) {
+                let exe = URL(fileURLWithPath: stored.localGames[i].exePath)
+                if let role = LocalGames.role(of: exe), !stored.localGames[i].name.hasSuffix(" · \(role)") {
+                    stored.localGames[i].name += " · \(role)"
+                }
+            }
+            let now = { (id: Int) in self.stored.localGames.first { $0.id == id }?.name ?? "" }
+            log.line("\(now(drop.id)) now uses the Windows bottle of \(now(keep.id)); its own went to the Trash")
+            notes.append("\(now(r.id)) and \(now(mate.id))")
+        }
+        guard !notes.isEmpty else { return }
+        save()
+        banner = "\(notes.joined(separator: "; ")) now share one Windows bottle, so a launcher's settings reach its game. The bottle that was left over is in the Trash."
+    }
+
+    /// The game whose settings a launcher (or tool) runs with: the program without a role in the same
+    /// bottle. Whatever the launcher starts inherits everything the launcher got, so the game's own
+    /// settings must ride along with the launcher. Nil for the game itself and for lone programs.
+    func settingsSource(for game: SteamGame) -> LocalGameRecord? {
+        guard let exe = game.localExe, LocalGames.role(of: exe) != nil else { return nil }
+        return bottleSharers(of: game).first { LocalGames.role(of: URL(fileURLWithPath: $0.exePath)) == nil }
+    }
+
+    /// What "Remove from Unwine" does to an added game's files, said before it happens.
+    func removeNote(for game: SteamGame) -> String {
+        if let mate = bottleSharers(of: game).first {
+            let installed = LocalGames.isInside(URL(fileURLWithPath: mate.exePath), bottle: game.bottleID ?? game.id)
+            return "The game's own files stay in \(game.installDir.path). Its Windows bottle stays too, because \(mate.name) \(installed ? "is installed in it" : "uses it")."
+        }
+        return game.installDir.path.hasPrefix(game.compatData.path)
+            ? "This game was installed inside its Windows bottle, so the game itself goes to the Trash with the bottle."
+            : "The game's own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the game kept inside it, goes to the Trash."
+    }
+
+    /// The other added games that use this game's Windows bottle, or whose program an installer put
+    /// inside it. Trashing the bottle would take those games with it.
+    func bottleSharers(of game: SteamGame) -> [LocalGameRecord] {
+        guard game.localExe != nil else { return [] }
+        let bottle = game.bottleID ?? game.id
+        return stored.localGames.filter {
+            $0.id != game.id && ($0.bottle == bottle || LocalGames.isInside(URL(fileURLWithPath: $0.exePath), bottle: bottle))
+        }
+    }
+
     /// Takes an added game out of the library. Its files stay where they are; its Windows bottle
-    /// (settings and saves the game kept inside it) goes to the Trash.
+    /// (settings and saves the game kept inside it) goes to the Trash, unless another added game
+    /// from the same folder still uses it.
     func removeLocalGame(_ game: SteamGame) {
         guard game.localExe != nil else { return }
         guard !localRunning.contains(game.id) else { banner = "\(game.name) is running. Quit it first."; return }
+        let sharers = bottleSharers(of: game)
         stored.localGames.removeAll { $0.id == game.id }
         stored.games[game.id] = nil
         stored.analyses[game.id] = nil
         stored.presetChoice[game.id] = nil
         save()
         Profiles.remove(appID: game.id)
-        if FileManager.default.fileExists(atPath: game.compatData.path) {
-            try? FileManager.default.trashItem(at: game.compatData, resultingItemURL: nil)
+        if sharers.isEmpty {
+            if FileManager.default.fileExists(atPath: game.compatData.path) {
+                try? FileManager.default.trashItem(at: game.compatData, resultingItemURL: nil)
+            }
+        } else {
+            try? FileManager.default.removeItem(at: game.compatData.appendingPathComponent(game.bottleID == nil ? "Game.app" : "Game-\(game.id).app"))
         }
         games.removeAll { $0.id == game.id }
-        banner = "\(game.name) is out of your library. Its files stay in \(game.installDir.path)."
+        banner = sharers.isEmpty
+            ? "\(game.name) is out of your library. Its files stay in \(game.installDir.path)."
+            : "\(game.name) is out of your library. Its Windows bottle stays, because \(sharers[0].name) uses it too."
     }
 
     /// Points an added game at its program's new place (moved folder, other drive), keeping its bottle.
@@ -821,12 +928,15 @@ final class AppModel {
         if localRunning.contains(game.id) { banner = "\(game.name) is already running."; return }
         localStarting[game.id] = "Getting \(game.name) ready…"
         defer { localStarting[game.id] = nil }
-        // The first start waits for the file check, so the settings fit the game.
-        if stored.analyses[game.id] == nil { await analyze(game) }
-        writeProfile(for: game.id)
+        // The first start waits for the file check, so the settings fit the game. A launcher runs
+        // with its game's settings, because the game it starts inherits them.
+        let source = settingsSource(for: game).flatMap { s in games.first { $0.id == s.id } } ?? game
+        if stored.analyses[source.id] == nil { await analyze(source) }
+        writeProfile(for: source.id)
         let log = localLog(game.id)
+        if source.id != game.id { log.line("\(game.name) starts with the settings of \(source.name), so the game it opens gets them") }
         do {
-            try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: game.id), log: log,
+            try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: source.id), log: log,
                                        phase: { [weak self] words in self?.localStarting[game.id] = words },
                                        onExit: { status in log.line("The game's process ended with status \(status)") })
             // Wait for the game to show a window, so the waiting screen covers the slow part. Stop
@@ -1140,7 +1250,7 @@ final class AppModel {
         let s = settings(for: id)
         let r = renderer(for: id)
         let dir = games.first { $0.id == id }?.installDir
-        do { try Profiles.write(appID: id, settings: s, renderer: r, engine: engine, d3dmetal: d3dmetal, gameDir: dir) }
+        do { try Profiles.write(appID: id, settings: s, renderer: r, api: stored.analyses[id]?.api, engine: engine, d3dmetal: d3dmetal, gameDir: dir) }
         catch { log.line("profile \(id) failed: \(error)") }
     }
 

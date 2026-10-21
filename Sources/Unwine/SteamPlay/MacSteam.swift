@@ -8,16 +8,7 @@ enum MacSteam {
         FileManager.default.fileExists(atPath: SteamPlayPaths.steamApp.appendingPathComponent("Contents/MacOS/steam_osx").path)
     }
 
-    static var isRunning: Bool {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        p.arguments = ["-x", "steam_osx"]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try? p.run()
-        p.waitUntilExit()
-        return p.terminationStatus == 0
-    }
+    static var isRunning: Bool { Processes.anyNamed("steam_osx") }
 
     static func open(_ url: String) {
         if let u = URL(string: url) { NSWorkspace.shared.open(u) }
@@ -43,16 +34,29 @@ enum MacSteam {
         return !isRunning
     }
 
-    /// The client build, e.g. 1792192922, from Steam's own log.
+    /// The client build, e.g. 1792192922, from Steam's own log. The log grows to megabytes and the
+    /// refresh loop asks every few seconds, so a read is kept until the file changes, and the search
+    /// starts from the end (the newest line wins). Reading and splitting the whole log each time was
+    /// most of Unwine's idle CPU.
     static func clientVersion() -> String? {
         let log = SteamPlayPaths.steamLogs.appendingPathComponent("console_log.txt")
-        guard let text = try? String(contentsOf: log, encoding: .utf8) else { return nil }
-        var found: String?
-        for line in text.split(whereSeparator: \.isNewline) where line.contains("Client version: ") {
-            found = line.components(separatedBy: "Client version: ").last?.trimmingCharacters(in: .whitespaces)
+        guard let a = try? FileManager.default.attributesOfItem(atPath: log.path),
+              let size = (a[.size] as? NSNumber)?.intValue, let date = a[.modificationDate] as? Date else { return nil }
+        versionLock.lock()
+        defer { versionLock.unlock() }
+        if let c = versionCache, c.size == size, c.date == date { return c.version }
+        var version: String?
+        if let data = try? Data(contentsOf: log, options: .mappedIfSafe),
+           let hit = data.range(of: Data("Client version: ".utf8), options: .backwards) {
+            let rest = data[hit.upperBound...]
+            let end = rest.firstIndex { $0 == 0x0A || $0 == 0x0D } ?? rest.endIndex
+            version = String(decoding: rest[..<end], as: UTF8.self).trimmingCharacters(in: .whitespaces)
         }
-        return found
+        versionCache = (size, date, version)
+        return version
     }
+    private static let versionLock = NSLock()
+    private static var versionCache: (size: Int, date: Date, version: String?)?
 
     // MARK: Steam Play status (read only)
 

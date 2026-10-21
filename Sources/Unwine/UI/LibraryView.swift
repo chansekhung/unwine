@@ -8,6 +8,9 @@ struct LibraryView: View {
     @State private var addingGame = false
     @State private var choosingProgram: [(url: URL, size: Int64)] = []
     @State private var choosingFolder: URL?
+    @State private var renaming: SteamGame?
+    @State private var newName = ""
+    @State private var removing: SteamGame?
 
     private let columns = [GridItem(.adaptive(minimum: 150, maximum: 190), spacing: 18)]
 
@@ -30,7 +33,9 @@ struct LibraryView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 22) {
                         ForEach(model.windowsGames) { game in
-                            GameTile(game: game) { selected = game }
+                            GameTile(game: game, open: { selected = game },
+                                     rename: { newName = game.name; renaming = game },
+                                     remove: { removing = game })
                         }
                     }
                     .padding(24)
@@ -42,6 +47,18 @@ struct LibraryView: View {
         }
         .sheet(isPresented: $showSettings) {
             SettingsView().environment(model)
+        }
+        .alert("Rename \(renaming?.name ?? "")", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
+            TextField("Name", text: $newName)
+            Button("Rename") { if let game = renaming { model.renameLocalGame(game.id, to: newName) } }
+            Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog("Remove \(removing?.name ?? "") from Unwine?",
+                            isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
+                            presenting: removing) { game in
+            Button("Remove", role: .destructive) { model.removeLocalGame(game) }
+        } message: { game in
+            Text(model.removeNote(for: game))
         }
         .fileImporter(isPresented: $addingGame, allowedContentTypes: [UTType(filenameExtension: "exe") ?? .data, .folder]) { result in
             guard case .success(let url) = result else { return }
@@ -183,7 +200,11 @@ struct GameTile: View {
     @Environment(AppModel.self) private var model
     let game: SteamGame
     let open: () -> Void
+    let rename: () -> Void
+    let remove: () -> Void
     @State private var hovering = false
+
+    private var busy: Bool { model.localStarting[game.id] != nil || model.localRunning.contains(game.id) }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -202,14 +223,40 @@ struct GameTile: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture(perform: open)
+        .contextMenu { menu }
         .task(id: game.state) { await model.analyze(game) }
-        .help("Settings for \(game.name)")
+        .help("Settings for \(game.name). Right-click for more.")
+    }
+
+    /// Right-click: the actions people look for on a game, without opening its page first. A menu
+    /// item cannot show a tooltip, so a blocked one says why in its own title.
+    @ViewBuilder private var menu: some View {
+        if game.localExe != nil {
+            Button { model.play(game) } label: { Label(busy ? "Play (already running)" : "Play", systemImage: "play.fill") }
+                .disabled(busy)
+            Button { open() } label: { Label("Settings…", systemImage: "slider.horizontal.3") }
+            Divider()
+            Button { rename() } label: { Label("Rename…", systemImage: "pencil") }
+            Button(role: .destructive) { remove() } label: {
+                Label(busy ? "Remove from Unwine… (quit the game first)" : "Remove from Unwine…", systemImage: "trash")
+            }
+            .disabled(busy)
+        } else {
+            Button { model.play(game) } label: {
+                Label(model.macSteamBlocked ? "Play (Steam is closed while Online mode runs)" : "Play in Steam", systemImage: "play.fill")
+            }
+            .disabled(model.macSteamBlocked || game.state != .installed)
+            Button { open() } label: { Label("Settings…", systemImage: "slider.horizontal.3") }
+            Divider()
+            Button { model.showInSteam(game.id) } label: { Label("Show in Steam (rename or uninstall it there)", systemImage: "arrow.up.forward.app") }
+                .disabled(model.macSteamBlocked)
+        }
     }
 
     private var subtitle: String {
         let r = model.resolvedRenderer(for: game)
         let api = model.analysis(for: game)?.api.label
-        return [r.short, api].compactMap { $0 }.joined(separator: " · ")
+        return [game.localExe.flatMap(LocalGames.role(of:)), r.short, api].compactMap { $0 }.joined(separator: " · ")
     }
 
     @ViewBuilder private var overlay: some View {

@@ -18,32 +18,82 @@ enum RendererPatches {
         let edits: [Edit]
     }
 
-    // MARK: Async shaders for the game's main picture (DirectX 9)
+    // MARK: DXVK 3.1.1 (Sikarugir's async build)
 
-    /// Sikarugir's DXVK 3.1.1-async builds a new shader in the background and skips that draw for a
-    /// frame or two, but only for render targets bound in 5 frames in a row. Direct3D 9 swaps its
-    /// back buffers on every Present, so draws into the game's main picture never qualified: each one
-    /// built its shader while the whole game waited. That is the in-game freeze (the sound loops for a
-    /// moment). The fix counts a binding within 4 frames as "in a row" ('addl $1; jne' becomes
-    /// 'addl $4; ja'), which covers 3 rotating back buffers plus the front buffer.
-    static let asyncBackBuffer: [Recipe] = [
+    /// Async shaders for the game's main picture (DirectX 9). Sikarugir's DXVK 3.1.1-async builds a
+    /// new shader in the background and skips that draw for a frame or two, but only for render
+    /// targets bound in 5 frames in a row. Direct3D 9 swaps its back buffers on every Present, so
+    /// draws into the game's main picture never qualified: each one built its shader while the whole
+    /// game waited. That is the in-game freeze (the sound loops for a moment). The fix counts a
+    /// binding within 4 frames as "in a row" ('addl $1; jne' becomes 'addl $4; ja'), which covers 3
+    /// rotating back buffers plus the front buffer. With async shaders off the count is never read.
+    private static let asyncBackBuffer32 = [Edit(offset: 0x15e89d, old: [0x01], new: [0x04]), Edit(offset: 0x15e8a2, old: [0x75], new: [0x77])]
+    private static let asyncBackBuffer64 = [Edit(offset: 0x142712, old: [0x01], new: [0x04]), Edit(offset: 0x142717, old: [0x75], new: [0x77])]
+
+    /// Shared textures the Mac cannot share. A Direct3D 9Ex or 11 game can ask for a texture that
+    /// another device opens too: Romance of the Three Kingdoms XIV decodes its videos in Direct3D 9
+    /// and shows them in Direct3D 11. Sharing needs VK_KHR_external_memory_win32, which KosmicKrisp
+    /// lacks. DXVK sees that and makes a plain texture, but still tells the memory allocator to make
+    /// a handle for it, and the allocator calls the driver's missing vkGetMemoryWin32HandleKHR: a
+    /// jump to address 0 that closed the game. DXVK's own source still has this bug. The fix gives
+    /// the plain texture no handle type (0x7fffffff), as every unshared texture has, in the code
+    /// all three DLLs build in. The game keeps running; what it wanted to share stays black.
+    /// 64-bit: 'movl $0,0x84(%rsp)' becomes 'movl $0x7fffffff,%eax; movups %xmm0,0x78(%rsp); nop'.
+    /// 32-bit: 'movl $0,-0xc4(%ebp); pxor; movl $0,-0xc0(%ebp)' becomes
+    /// 'movl $0x7fffffff,%eax; pxor; movq %xmm0,-0xc4(%ebp); nopl'. Both clear the same 8 bytes as before.
+    private static func plainNotShared64(_ offset: Int) -> Edit {
+        Edit(offset: offset, old: [0xc7, 0x84, 0x24, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+             new: [0xb8, 0xff, 0xff, 0xff, 0x7f, 0x0f, 0x11, 0x44, 0x24, 0x78, 0x90])
+    }
+    private static func plainNotShared32(_ offset: Int) -> Edit {
+        Edit(offset: offset, old: [0xc7, 0x85, 0x3c, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x66, 0x0f,
+                                   0xef, 0xc0, 0xc7, 0x85, 0x40, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00],
+             new: [0xb8, 0xff, 0xff, 0xff, 0x7f, 0x66, 0x0f, 0xef, 0xc0, 0x66, 0x0f, 0xd6,
+                   0x85, 0x3c, 0xff, 0xff, 0xff, 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00])
+    }
+
+    /// DXVK's Direct3D 9 layer, in both folders that carry it.
+    private static let d3d9Fixes: [Recipe] = [
         Recipe(path: "wine/i386-windows/d3d9.dll",
                cleanSHA256: "7cc1b4f37f19783a3d356e4a5c47aa163b6b791ccadaee3d672d7dba44718d68",
-               patchedSHA256: "d782fbc1f828985e798b5b1d9af181446c8c23c799ba74ef0d98e539cfd76ac5",
-               edits: [Edit(offset: 0x15e89d, old: [0x01], new: [0x04]), Edit(offset: 0x15e8a2, old: [0x75], new: [0x77])]),
+               patchedSHA256: "d9b0855368d9a62c23e129f01db1c8bf3fddf245d969efb8578cb4a6e739399a",
+               edits: asyncBackBuffer32 + [plainNotShared32(0x1ad88d)]),
         Recipe(path: "wine/x86_64-windows/d3d9.dll",
                cleanSHA256: "ab26d9ea248127922ec038c7e3ce10ca3627af923bc4c057100a9a7ab0c70ca2",
-               patchedSHA256: "ecd5ff023636544917cf4df08d6b878fb870b278a533a1dbad5aec6965bda5eb",
-               edits: [Edit(offset: 0x142712, old: [0x01], new: [0x04]), Edit(offset: 0x142717, old: [0x75], new: [0x77])]),
+               patchedSHA256: "b537fba7faece1a6dbe53a637b1befb7bf537c4a17cbe4e9bccbd163eda3bcf8",
+               edits: asyncBackBuffer64 + [plainNotShared64(0x18b836)]),
     ]
 
-    /// The renderers that carry DXVK's Direct3D 9 layer.
-    static let d3d9Renderers = ["d9vk", "dxvk3"]
+    /// DXVK's Direct3D 10/11 layer (DXVK as the game's graphics layer).
+    private static let d3d11Fixes: [Recipe] = [
+        Recipe(path: "wine/i386-windows/d3d11.dll",
+               cleanSHA256: "2e356566e51d764b7dd97757b69c0322f0a798519dec345cf41cee60620611df",
+               patchedSHA256: "0251878c84d3984ce3ab13c42d91b06e5684cc89ce535998bd0c22fd0d264231",
+               edits: [plainNotShared32(0x128ccd)]),
+        Recipe(path: "wine/x86_64-windows/d3d11.dll",
+               cleanSHA256: "38eb97953a1f77c236dd8903de41cf0fcb9308c61e699d5216ef1438e504cfe1",
+               patchedSHA256: "15a23a4e99da35695f766d364a3a6e0c9288fd458f67950dcaf0130794a97154",
+               edits: [plainNotShared64(0xf36f6)]),
+        Recipe(path: "wine/i386-windows/dxgi.dll",
+               cleanSHA256: "6b4cfbcce7416e08be09753d464a47e2814a64397587b54dfa3243232d68f99a",
+               patchedSHA256: "6d6c271b44c65dcb89fadf6116659d5298306256cea8e69501a55c3e31bd4c11",
+               edits: [plainNotShared32(0x47f0d)]),
+        Recipe(path: "wine/x86_64-windows/dxgi.dll",
+               cleanSHA256: "660790b21c1e78dd565e96c95e02cb7a0fdee5a345243e2dcac0f2f3326ff083",
+               patchedSHA256: "acc33d1badca36e43db69e25ff6e4293c64e02e7069b3796544afba7b0e41052",
+               edits: [plainNotShared64(0x42c76)]),
+    ]
 
-    /// renderer/<name>-unwine/wine when its patched copy is ready, else nil (the game uses stock files).
-    static func asyncDir(_ name: String, engine: InstalledEngine) -> URL? {
+    /// The DXVK folders Unwine makes fixed copies of, and the fixes each copy gets.
+    static let dxvkRenderers = ["d9vk", "dxvk3"]
+    private static func recipes(for name: String) -> [Recipe] {
+        name == "dxvk3" ? d3d9Fixes + d3d11Fixes : d3d9Fixes
+    }
+
+    /// renderer/<name>-unwine/wine when its fixed copy is ready, else nil (the game uses stock files).
+    static func fixedDir(_ name: String, engine: InstalledEngine) -> URL? {
         let copy = engine.rendererRoot.appendingPathComponent("\(name)-unwine", isDirectory: true)
-        guard (try? String(contentsOf: copy.appendingPathComponent(markerName), encoding: .utf8)) == marker(asyncBackBuffer) else { return nil }
+        guard (try? String(contentsOf: copy.appendingPathComponent(markerName), encoding: .utf8)) == marker(recipes(for: name)) else { return nil }
         return copy.appendingPathComponent("wine", isDirectory: true)
     }
 
@@ -151,9 +201,13 @@ enum RendererPatches {
 
     /// The Vulkan driver file games should load: Unwine's fixed copy when ready, else KosmicKrisp,
     /// else MoltenVK. KosmicKrisp is a full Vulkan driver on Apple chips; MoltenVK lacks features
-    /// DXVK 3 needs.
+    /// DXVK 3 needs. KosmicKrisp is built for macOS 26 and later (its minos is 26.0), so on macOS 15
+    /// to 25 it does not load at all, and MoltenVK (macOS 11 and later) is the only driver that runs.
     static func vulkanICD(engine: InstalledEngine) -> URL {
         let icd = engine.runtime.appendingPathComponent("Resources/vulkan/icd.d", isDirectory: true)
+        guard ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0)) else {
+            return icd.appendingPathComponent("MoltenVK_icd.json")
+        }
         let fixed = icd.appendingPathComponent(patchedICD)
         if FileManager.default.fileExists(atPath: fixed.path),
            (try? String(contentsOf: engine.frameworks.appendingPathComponent(patchedDriver + ".unwine"), encoding: .utf8)) == marker([vulkanBudget]) {
@@ -167,9 +221,10 @@ enum RendererPatches {
 
     /// Makes the patched copies for this engine once. Cheap when they exist. Safe to call often.
     static func prepare(engine: InstalledEngine, log: LogFile) {
-        for name in d3d9Renderers where asyncDir(name, engine: engine) == nil {
+        for name in dxvkRenderers where fixedDir(name, engine: engine) == nil {
             prepareCopy(of: engine.rendererRoot.appendingPathComponent(name, isDirectory: true),
-                        to: engine.rendererRoot.appendingPathComponent("\(name)-unwine", isDirectory: true), log: log)
+                        to: engine.rendererRoot.appendingPathComponent("\(name)-unwine", isDirectory: true),
+                        recipes: recipes(for: name), log: log)
         }
         if windowsDir("i386-windows", engine: engine) != windowsCopy(engine: engine) { prepareWindowsCopy(engine: engine, log: log) }
         prepareDriver(engine: engine, log: log)
@@ -178,24 +233,24 @@ enum RendererPatches {
     private static let markerName = ".unwine-patch"
     private static func marker(_ recipes: [Recipe]) -> String { recipes.map(\.patchedSHA256).joined(separator: "\n") + "\n" }
 
-    private static func prepareCopy(of source: URL, to copy: URL, log: LogFile) {
+    private static func prepareCopy(of source: URL, to copy: URL, recipes: [Recipe], log: LogFile) {
         let fm = FileManager.default
         guard fm.fileExists(atPath: source.path) else { return }
         // Only when every file is the exact build a recipe was made for.
-        for r in asyncBackBuffer {
+        for r in recipes {
             guard (try? Downloader.sha256(of: source.appendingPathComponent(r.path))) == r.cleanSHA256 else {
-                log.line("\(source.lastPathComponent): not the DXVK build Unwine's async fix was made for, so its games use it unchanged")
+                log.line("\(source.lastPathComponent): not the DXVK build Unwine's fixes were made for, so its games use it unchanged")
                 return
             }
         }
         let stage = copy.deletingLastPathComponent().appendingPathComponent(".\(copy.lastPathComponent)-\(UUID().uuidString)", isDirectory: true)
         do {
             try clone(source, to: stage)
-            for r in asyncBackBuffer { try apply(r, to: stage.appendingPathComponent(r.path)) }
-            try marker(asyncBackBuffer).write(to: stage.appendingPathComponent(markerName), atomically: true, encoding: .utf8)
+            for r in recipes { try apply(r, to: stage.appendingPathComponent(r.path)) }
+            try marker(recipes).write(to: stage.appendingPathComponent(markerName), atomically: true, encoding: .utf8)
             try? fm.removeItem(at: copy)
             try fm.moveItem(at: stage, to: copy)
-            log.line("Made \(copy.lastPathComponent): DXVK's async shaders now also cover the game's main picture")
+            log.line("Made \(copy.lastPathComponent): DXVK's async shaders now also cover the game's main picture, and a texture the Mac cannot share no longer closes the game")
         } catch {
             try? fm.removeItem(at: stage)
             log.line("Could not make \(copy.lastPathComponent): \(error.localizedDescription)")
