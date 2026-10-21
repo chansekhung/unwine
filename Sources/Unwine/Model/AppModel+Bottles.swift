@@ -139,7 +139,7 @@ extension GameSettings {
         retina = other.retina
         fillScreen = other.fillScreen
         commandIsCtrl = other.commandIsCtrl
-        forceSDR = other.forceSDR
+        hdr = other.hdr
         dxmtD3D12 = other.dxmtD3D12
         ddrawMode = other.ddrawMode
     }

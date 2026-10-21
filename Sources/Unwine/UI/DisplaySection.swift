@@ -20,9 +20,8 @@ struct DisplayControls: View {
             Toggle("Command key acts as Ctrl", isOn: binding(\.commandIsCtrl))
             settingNote("On: both Command keys reach the game as Ctrl, and both Option keys as Alt. Off: Wine's own keys. Command acts as Alt, and Option types special characters.")
             bottleState()
-            Picker("HDR", selection: binding(\.forceSDR)) {
-                Text("Automatic").tag(false)
-                Text("Off (force SDR)").tag(true)
+            Picker("HDR", selection: binding(\.hdr)) {
+                ForEach(HDRChoice.allCases) { Text($0.title).tag($0) }
             }
             let hdr = hdrNote(s)
             settingNote(hdr.text, warn: hdr.warn)
@@ -132,24 +131,40 @@ struct DisplayControls: View {
 
     // MARK: HDR
 
-    /// DXMT reads dxgi.forceSDR and DXVK dxgi.enableHDR; D3DMetal and WineD3D have no switch.
+    /// DXMT gives a game HDR by itself and reads dxgi.forceSDR. DXVK reads dxgi.enableHDR, which stays off
+    /// unless On asks for it. D3DMetal and WineD3D have no switch. Each note says what this game gets.
     private func hdrNote(_ s: GameSettings) -> (text: String, warn: Bool) {
         let r = model.resolvedRenderer(for: game)
         let api = model.analysis(for: game)?.api
+        let picked = s.hdr != .auto     // a choice that does nothing for this game turns its note orange
         if let api, api == .vulkan || api == .opengl {
-            return ("\(api.label) games draw without DXMT or DXVK, so this choice does nothing for them.", s.forceSDR)
+            return ("\(api.label) games draw without DXMT or DXVK, so this choice does nothing for them.", picked)
         }
         if model.usesDirectDraw(game) && api != .dx9 && api != .dx8 {
-            return ("DirectDraw games have no HDR, so this choice does nothing for this game.", s.forceSDR)
+            return ("DirectDraw games have no HDR, so this choice does nothing for this game.", picked)
         }
-        if r == .wined3d { return ("WineD3D has no HDR, so this choice does nothing for this game.", s.forceSDR) }
-        if r == .d3dmetal { return ("D3DMetal has no switch for HDR, so this choice does nothing for this game.", s.forceSDR) }
+        if r == .wined3d { return ("WineD3D has no HDR, so this choice does nothing for this game.", picked) }
+        if r == .d3dmetal { return ("D3DMetal has no switch for HDR, so this choice does nothing for this game.", picked) }
         if let api, api == .dx9 || api == .dx8 {
-            return ("\(api.label) games have no HDR, so this choice does nothing for them.", s.forceSDR)
+            return ("\(api.label) games have no HDR picture, so this choice does nothing for them.", picked)
         }
-        return (s.forceSDR
-            ? "Off: DXMT and DXVK tell the game that the screen has no HDR, so the game draws a normal (SDR) picture."
-            : "Automatic: a game with HDR can use it on a screen that shows HDR. HDR makes the screen brighter, and on an XDR Mac screen it uses more power. To save battery, pick Off.", false)
+        let power = "HDR makes the screen brighter, and on an XDR Mac screen it uses more power."
+        let sdr = "so the game draws a normal (SDR) picture."
+        if r == .dxvk {
+            // Online mode runs a DXVK game on DXMT, which gives HDR by itself (only Off stops it there).
+            let online = game.localExe == nil && model.online.installed
+                ? " In Online mode, the game runs on DXMT, so Automatic and On both let it use HDR there." : ""
+            switch s.hdr {
+            case .auto: return ("Automatic: DXVK tells the game that the screen has no HDR, \(sdr) To try HDR, pick On.\(online)", false)
+            case .on: return ("On (test): DXVK tells the game that the screen has HDR, so a game with HDR can use it on a screen that shows HDR. DXVK's HDR on a Mac has no public test yet. If the picture looks wrong, pick Automatic. \(power)\(online)", false)
+            case .off: return ("Off: DXMT and DXVK tell the game that the screen has no HDR, \(sdr)", false)
+            }
+        }
+        switch s.hdr {
+        case .auto: return ("Automatic: a game with HDR can use it on a screen that shows HDR. \(power) To save battery, pick Off.", false)
+        case .on: return ("On: DXMT gives HDR to a game by itself, so On is the same as Automatic for this game. A game with HDR can use it on a screen that shows HDR. \(power) To save battery, pick Off.", false)
+        case .off: return ("Off: DXMT tells the game that the screen has no HDR, \(sdr)", false)
+        }
     }
 
     // MARK: DirectDraw

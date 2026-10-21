@@ -438,9 +438,8 @@ struct GameSheet: View {
     private func restartMessage(_ ask: OnlineRestartAsk) -> String {
         let what = ask.changes.isEmpty ? "settings Windows Steam did not start with"
                                        : "settings Windows Steam did not start with: " + ask.changes.joined(separator: ", ")
-        // A D3DMetal game's cap reaches DXMT through Windows Steam's own settings, so it is in the list then.
-        let either = ask.changes.contains(OnlineSteam.d3dmetalCapName) ? "Low latency applies either way." : "Low latency and frame caps apply either way."
-        return "\(ask.game.name) uses \(what). Games take Windows Steam's settings, so it restarts to use them (Steam Cloud saves sync first). Without a restart the game plays with the settings Steam has now. \(either)"
+        // These reach the game through the files Unwine fills before each start (OnlineSteam.stageConfigs).
+        return "\(ask.game.name) uses \(what). Games take Windows Steam's settings, so it restarts to use them (Steam Cloud saves sync first). Without a restart the game plays with the settings Steam has now. Low latency, frame caps, HDR and the DirectDraw picture apply either way."
     }
 
     private func facts(_ game: SteamGame, _ a: GameAnalysis?) -> String {

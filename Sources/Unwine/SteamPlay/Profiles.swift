@@ -22,7 +22,7 @@ struct GameSettings: Codable, Equatable, Sendable {
     var retina = false                  // added games: Wine's Retina mode and 192 DPI (Steam Play: NOTPROTON_RETINA=1 in Steam)
     var fillScreen = false              // Wine's CaptureDisplaysForFullscreen: a full-screen game takes the whole display
     var commandIsCtrl = false           // both Command keys reach the game as Ctrl (and Option as Alt)
-    var forceSDR = false                // HDR off: DXMT and DXVK tell the game the screen has no HDR
+    var hdr: HDRChoice = .auto          // Automatic: DXMT passes HDR on; On: DXVK too (a test); Off: DXMT and DXVK say no HDR
     var dxmtD3D12 = false               // experimental: a DirectX 12 game runs on DXMT's own DirectX 12 part
     var ddrawMode: DirectDrawMode = .auto   // DirectDraw games (cnc-ddraw): the game's own mode, a window, or full screen
     // Faster x87 math (x87sidecar group)
@@ -30,7 +30,27 @@ struct GameSettings: Codable, Equatable, Sendable {
     var x87PreciseFaults = false        // set by Unwine after the game stopped on an x87 fault (X87_PRECISE_FAULTS=1)
 }
 
+/// The HDR choice in a game's Display section. DXMT gives a game HDR by itself when the Mac screen shows
+/// HDR. DXVK gives it only when asked (dxgi.enableHDR, off by default), so On asks it too. D3DMetal and
+/// WineD3D have no switch, and DirectX 8 and 9 games have no HDR picture at all.
+enum HDRChoice: String, Codable, CaseIterable, Identifiable, Sendable {
+    case auto, on, off
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .auto: return "Automatic"
+        case .on: return "On (test)"
+        case .off: return "Off (force SDR)"
+        }
+    }
+}
+
 extension GameSettings {
+    /// HDR was one switch before it had three choices: forceSDR true meant Off.
+    private enum LegacyKeys: String, CodingKey { case forceSDR }
+
     /// Every field decodes with a default, so settings saved by an older Unwine keep working.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -53,7 +73,8 @@ extension GameSettings {
         retina = (try? c.decodeIfPresent(Bool.self, forKey: .retina)) ?? d.retina
         fillScreen = (try? c.decodeIfPresent(Bool.self, forKey: .fillScreen)) ?? d.fillScreen
         commandIsCtrl = (try? c.decodeIfPresent(Bool.self, forKey: .commandIsCtrl)) ?? d.commandIsCtrl
-        forceSDR = (try? c.decodeIfPresent(Bool.self, forKey: .forceSDR)) ?? d.forceSDR
+        let wasOff = (try? decoder.container(keyedBy: LegacyKeys.self).decodeIfPresent(Bool.self, forKey: .forceSDR)) == true
+        hdr = (try? c.decodeIfPresent(HDRChoice.self, forKey: .hdr)) ?? (wasOff ? .off : d.hdr)
         dxmtD3D12 = (try? c.decodeIfPresent(Bool.self, forKey: .dxmtD3D12)) ?? d.dxmtD3D12
         ddrawMode = (try? c.decodeIfPresent(DirectDrawMode.self, forKey: .ddrawMode)) ?? d.ddrawMode
         x87 = (try? c.decodeIfPresent(Bool.self, forKey: .x87)) ?? d.x87
@@ -201,8 +222,14 @@ enum Profiles {
             // to the window, and the DirectX 9 one never draws, so it hid the whole game: a black
             // screen with music. With this, DXVK makes that layer only when DirectX 9 really presents.
             if api != .dx9 && api != .dx8 { dxvk.append("d3d9.deferSurfaceCreation = True") }
-            // HDR off (the game's Display choice): DXVK tells a DirectX 10/11 game the screen has no HDR.
-            if s.forceSDR { dxvk.append("dxgi.enableHDR = False") }
+            // HDR (the game's Display choice). DXVK tells a DirectX 10/11 game the screen has HDR only when
+            // asked, so Automatic gives it none. On asks (a test: DXVK's HDR through KosmicKrisp has no
+            // public test yet). Off says no, also over a DXVK_HDR=1 in Steam's launch options.
+            switch s.hdr {
+            case .on: dxvk.append("dxgi.enableHDR = True")
+            case .off: dxvk.append("dxgi.enableHDR = False")
+            case .auto: break
+            }
         }
         var dxmt: [String] = []
         // DXMT runs every layer choice except DXVK, WineD3D and a real D3DMetal (which has its own cap).
@@ -224,11 +251,13 @@ enum Profiles {
             }
             if let tess = s.maxTessFactor { dxmt.append("d3d11.maxTessFactor = \(min(64, max(4, tess)))") }
         }
-        // Online mode runs a DXVK game on DXMT and gives DXMT this file. The cap reached DXMT through
-        // DXVK_FRAME_RATE before, which only DXVK 1.x reads, so the profile no longer carries it.
-        if renderer == .dxvk, let cap = s.fpsCap { dxmt.append("d3d11.preferredMaxFrameRate = \(cap)") }
-        // HDR off: DXMT tells the game the screen has no HDR (Online mode runs DXVK games on DXMT too).
-        if s.forceSDR && (renderer == .dxmt || renderer == .auto || renderer == .dxvk) { dxmt.append("dxgi.forceSDR = True") }
+        // Online mode runs a DXVK or D3DMetal game on DXMT and gives DXMT this file, so the game's cap holds
+        // there with no Windows Steam restart. DXVK_FRAME_RATE (only DXVK 1.x reads it) and D3DM_MAX_FPS
+        // mean nothing to DXMT, and Online mode drops them.
+        if renderer == .dxvk || renderer == .d3dmetal, let cap = s.fpsCap { dxmt.append("d3d11.preferredMaxFrameRate = \(cap)") }
+        // HDR Off: DXMT tells the game the screen has no HDR (Online mode runs DXVK games on DXMT too).
+        // Automatic and On leave DXMT as it is: it gives a game HDR when the Mac screen shows HDR.
+        if s.hdr == .off && (renderer == .dxmt || renderer == .auto || renderer == .dxvk) { dxmt.append("dxgi.forceSDR = True") }
         // A game's own dxvk.conf or dxmt.conf counts too: Unwine's file replaces the game's, so it carries it.
         let header = "# Written by Unwine. Settings from Steam's launch options still apply on top.\n"
         let ownDXVK = renderer != .wined3d ? shipped("dxvk.conf") : "", ownDXMT = shipped("dxmt.conf")
@@ -302,6 +331,8 @@ enum Profiles {
                 if hasMetal4 { export("D3DM_MTL4", s.metal4 ? "1" : "0") }
                 if let cap = s.fpsCap { export("D3DM_MAX_FPS", String(cap)) }
             }
+            // D3DMetal never reads this. Online mode runs the game on DXMT, and its cap reaches DXMT through this file.
+            if hasDXMTConfig { export("DXMT_CONFIG_FILE", dxmtConfig(for: appID).path) }
         case .dxvk:
             let three = engine.renderer("dxvk3")
             let patched = RendererPatches.fixedDir("dxvk3", engine: engine)

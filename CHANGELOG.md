@@ -49,10 +49,12 @@ How to keep this list. The build reads it, so follow these rules.
 - **Steam games show when they start and when they run.** If a game closes before it shows a window, Unwine tells you. You can quit a running Steam game from its page or its right-click menu.
 - Right-click a game that you added to quit it while it runs.
 - **Restart Steam** shows each step. It waits until Steam Play is ready.
-- **Display** is a new part of each game page: **Sharp picture (Retina)**, **Game takes the whole screen**, **Command key acts as Ctrl**, an **HDR** Off choice, and a window or full screen for old DirectDraw games.
+- **Display** is a new part of each game page: **Sharp picture (Retina)**, **Game takes the whole screen**, **Command key acts as Ctrl**, an **HDR** choice, and a window or full screen for old DirectDraw games.
+  - **HDR** has three choices: Automatic, On and Off. On the DXMT layer, Automatic lets a game with HDR use it. **On** is a test for the DXVK layer: DXVK then tells the game that the screen has HDR. A game without HDR of its own keeps its normal picture.
 - **Faster x87 math (experimental)** for old 32-bit games. (x87 is how old PCs calculate with decimal numbers. Rosetta runs it slowly.) The switch is off at the start.
   - The first time you turn it on, Unwine downloads x87sidecar (181 KB, free, from github.com/athei/x87sidecar) and checks it.
   - macOS asks for your password once after each login. Allow it. If you do not, the game does not start.
+  - x87sidecar now stays off for wineboot (the Windows program that makes a game's bottle) and for the programs that wineboot starts.
   - A few games can glitch. Then turn the switch off for that game.
   - It is always off in Online mode, so nothing attaches to Windows Steam or to a game with Valve Anti-Cheat (VAC).
 - **Last session** on each game page (macOS 27): frames each second, GPU time for each frame and shader time, with one tip.
@@ -67,6 +69,7 @@ How to keep this list. The build reads it, so follow these rules.
 - **Added games look like themselves.** They show their own icon. You can choose a cover. They get Highball advice too.
 - **Online mode:** after your game closes, Unwine asks if you want to quit Windows Steam. macOS can now slow down Windows Steam's hidden windows to save battery.
   - Windows Steam restarts one time after this update, because its log settings changed.
+  - Windows Steam asks to restart less often. The settings of old DirectDraw games and the frame cap of D3DMetal games now apply without a restart.
 - Messages have a button for the next step. Problems show in red.
 - New menu items: Settings… (⌘,), Add Game… (⌘O), Find… (⌘F), and Report a Problem in the Help menu.
 - You can use the library with the keyboard and VoiceOver. Reduce Motion stops the waiting animations.

@@ -29,6 +29,12 @@ enum DirectDrawConfig {
     /// The path as Windows programs name it: Wine's Z: drive is the Mac's /.
     static func windowsPath(_ url: URL) -> String { "Z:" + url.path.replacingOccurrences(of: "/", with: "\\") }
 
+    /// The Mac file of a Windows path on the Z: drive (the reverse of `windowsPath`), or nil for another drive.
+    static func macPath(_ windows: String) -> URL? {
+        guard windows.count > 2, windows.prefix(2).lowercased() == "z:" else { return nil }
+        return URL(fileURLWithPath: windows.dropFirst(2).replacingOccurrences(of: "\\", with: "/"))
+    }
+
     private static let header = "; Written by Unwine. cnc-ddraw reads this file, not a ddraw.ini in the game's folder, so the game's files stay as they are."
 
     /// DirectDraw games read as "unknown" (DirectDraw alone), or as DirectX 8 or 9 when they use those too.

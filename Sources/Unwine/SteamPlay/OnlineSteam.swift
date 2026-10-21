@@ -689,11 +689,13 @@ enum OnlineSteam {
             }
         }
 
-        // Games read DXVK's and DXMT's settings from a file when they start. Windows Steam always names
-        // the same two files, and Unwine fills them for each game just before Steam starts it, so
-        // those settings (Low latency, frame caps) never need a Steam restart.
+        // Games read DXVK's and DXMT's settings from a file when they start, and so does cnc-ddraw (the
+        // DirectDraw part) with its ddraw.ini. Windows Steam always names the same three files, and Unwine
+        // fills them for each game just before Steam starts it, so those settings (Low latency, frame
+        // caps, HDR, the DirectDraw picture) never need a Steam restart.
         env["DXVK_CONFIG_FILE"] = onlineDXVKConfig.path
         env["DXMT_CONFIG_FILE"] = onlineDXMTConfig.path
+        if engine.supports("WINEDLLPATH_CNCD") { env["CNC_DDRAW_CONFIG_FILE"] = DirectDrawConfig.windowsPath(onlineDDrawConfig) }
         // Not read by Wine: it puts the bottle's High Resolution Mode into the settings Unwine compares,
         // so a change asks for a Steam restart like any other.
         env["UNWINE_HIGH_RESOLUTION"] = highResolution ? "1" : "0"
@@ -708,13 +710,15 @@ enum OnlineSteam {
 
     static var onlineDXVKConfig: URL { Runner.profiles.appendingPathComponent("online.dxvk.conf") }
     static var onlineDXMTConfig: URL { Runner.profiles.appendingPathComponent("online.dxmt.conf") }
+    static var onlineDDrawConfig: URL { Runner.profiles.appendingPathComponent("online.ddraw.ini") }
 
-    /// Copies a game's DXVK and DXMT setting files into the two files Windows Steam names, or empties
-    /// them, just before Steam starts that game.
+    /// Copies a game's DXVK, DXMT and DirectDraw setting files into the three files Windows Steam names,
+    /// or empties them, just before Steam starts that game.
     private static func stageConfigs(profile: URL?) {
+        let keys: Set<String> = ["DXVK_CONFIG_FILE", "DXMT_CONFIG_FILE", "CNC_DDRAW_CONFIG_FILE"]
         var wanted: [String: String] = [:]
         if let profile, let text = try? String(contentsOf: profile, encoding: .utf8) {
-            for (key, raw) in profileAssignments(text) where key == "DXVK_CONFIG_FILE" || key == "DXMT_CONFIG_FILE" {
+            for (key, raw) in profileAssignments(text) where keys.contains(key) {
                 if let path = shellWord(raw, env: [:]) { wanted[key] = path }
             }
         }
@@ -724,6 +728,21 @@ enum OnlineSteam {
             _ = try? Paths.ensure(target.deletingLastPathComponent())
             do { try text.write(to: target, atomically: true, encoding: .utf8) }
             catch { log.line("Could not write \(target.lastPathComponent): \(error.localizedDescription)") }
+        }
+        // The profile names the game's ddraw.ini as a Windows path. With no file there, Unwine's goes too:
+        // cnc-ddraw then writes its defaults (with its fixes for named games) there, as it does for the
+        // game in Steam Play. A file that cannot be filled goes as well, so no other game's settings stay.
+        let ddraw = onlineDDrawConfig
+        if let source = wanted["CNC_DDRAW_CONFIG_FILE"].flatMap(DirectDrawConfig.macPath),
+           let data = try? Data(contentsOf: source) {
+            do { try data.write(to: ddraw, options: .atomic) }
+            catch {
+                log.line("Could not write \(ddraw.lastPathComponent): \(error.localizedDescription)")
+                try? FileManager.default.removeItem(at: ddraw)
+            }
+        } else if FileManager.default.fileExists(atPath: ddraw.path) {
+            do { try FileManager.default.removeItem(at: ddraw) }
+            catch { log.line("Could not remove \(ddraw.lastPathComponent): \(error.localizedDescription)") }
         }
     }
 
@@ -743,7 +762,7 @@ enum OnlineSteam {
                      "ROSETTA_X87_PATH": "Faster x87 math", "X87_PRECISE_FAULTS": "Faster x87 math",
                      "CNC_DDRAW_CONFIG_FILE": "DirectDraw picture",
                      "LANG": "game language", "LC_ALL": "game language", "WINEUSERLOCALE": "game language",
-                     "WINEDLLOVERRIDES": "DLL overrides", "DXMT_CONFIG": d3dmetalCapName, "TZ": "time zone"]
+                     "WINEDLLOVERRIDES": "DLL overrides", "TZ": "time zone"]
         // WINELOADER names the same Steam each time. An older Unwine set WINEESYNC, which this Wine
         // does not use (WineEnvironment), so its change changes nothing.
         let unused: Set<String> = ["WINELOADER", "WINEESYNC"]
@@ -759,10 +778,6 @@ enum OnlineSteam {
         return out
     }
 
-    /// The restart question's name for a D3DMetal game's frame cap. DXMT gets that cap from Windows
-    /// Steam's own settings (`apply`), so unlike the caps in DXVK's and DXMT's files it waits for a restart.
-    static let d3dmetalCapName = "frame rate cap"
-
     /// DXMT draws Steam's windows too, so its frame cap holds for them.
     private static func dxmtCaps(_ env: [String: String]) -> Bool {
         if env["DXMT_CONFIG"]?.contains("preferredMaxFrameRate") == true { return true }
@@ -776,9 +791,9 @@ enum OnlineSteam {
     /// Steam's own window draws only with DXMT, and every game Steam starts inherits Steam's
     /// environment. So a D3DMetal profile loses its D3DMetal lines (and the DYLD line that only adds
     /// D3DMetal's folder), and a DXVK profile loses its DXVK folder, which the engine would load
-    /// ahead of DXMT. DXVK's DirectX 9 layer (D9VK) stays. A dropped frame cap becomes DXMT's, unless
-    /// the profile already gives DXMT one. Lines Unwine cannot read are skipped. Returns true when
-    /// lines were dropped.
+    /// ahead of DXMT. DXVK's DirectX 9 layer (D9VK) stays. The game's frame cap reaches DXMT through
+    /// its DXMT file (Profiles.configs), which `stageConfigs` hands to Steam for each game. Lines Unwine
+    /// cannot read are skipped. Returns true when lines were dropped.
     @discardableResult
     static func applyProfile(_ text: String, to env: inout [String: String]) -> Bool {
         let applied = apply(text, to: &env)
@@ -792,24 +807,19 @@ enum OnlineSteam {
         let items = profileAssignments(text)
         let usesD3DMetal = items.contains { $0.key == "WINEDLLPATH_D3DMETAL" }
         let usesDXVK = items.contains { $0.key == "WINEDLLPATH_DXVK" }
-        var cap: Int?
         var skipped: [String] = []
         for (key, raw) in items {
+            // Every D3DMetal-only line goes (D3DM_MAX_FPS, D3DM_MTL4, D3DM_SUPPORT_DXR, D3DM_ENABLE_METALFX
+            // and the rest): DXMT reads none of them, so kept, they would only ask for a Steam restart.
             let dropped = (usesD3DMetal && (key == "WINEDLLPATH_D3DMETAL" || key == "CX_APPLEGPTK_LIBD3DSHARED_PATH"
                                             || key.hasPrefix("D3DM_") || key == "DYLD_FALLBACK_LIBRARY_PATH"))
                 || (usesDXVK && (key == "WINEDLLPATH_DXVK" || key == "DXVK_ASYNC" || key == "DXVK_FRAME_RATE"))
+            if dropped { continue }
             guard let value = shellWord(raw, env: env) else {
                 skipped.append(key)
                 continue
             }
-            if dropped {
-                if key == "D3DM_MAX_FPS" || key == "DXVK_FRAME_RATE", let n = Int(value), n > 0 { cap = n }
-                continue
-            }
             env[key] = value
-        }
-        if let cap, env["DXMT_CONFIG"] == nil, env["DXMT_CONFIG_FILE"] == nil {
-            env["DXMT_CONFIG"] = "d3d11.preferredMaxFrameRate=\(cap);"
         }
         return (usesD3DMetal || usesDXVK, skipped)
     }

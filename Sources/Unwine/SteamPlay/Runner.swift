@@ -20,7 +20,8 @@ enum Runner {
     /// 7: a 32-bit game's DLLs no longer turn DEP off (only its .exe can).
     /// 8: quiet logs (Wine's at -all, DXVK's and DXMT's at warn) unless a game's Detailed logs or Steam's
     /// launch options ask for more; no WINEESYNC (this Wine has no esync).
-    static let format = 8
+    /// 9: wineboot, and the programs it starts, run without Faster x87 math.
+    static let format = 9
 
     static var base: URL { SteamPlayPaths.runners.appendingPathComponent("crossover-\(build)", isDirectory: true) }
     static var root: URL { base.appendingPathComponent("CrossOver", isDirectory: true) }
@@ -224,6 +225,21 @@ enum Runner {
         [ -z "$asked_dxmt_log" ] || export DXMT_LOG_LEVEL="$asked_dxmt_log"
         """
 
+    /// After the profile: making a bottle runs without Faster x87 math. NotProton runs `wine wineboot --init`
+    /// to make a bottle (the template new games copy, or a game's own bottle), and x87sidecar would attach to
+    /// wineboot and to the programs it starts: macOS could then ask for the password while only a bottle is
+    /// made. Wine starts those programs through this wrapper too, with the game's profile, so a mark that
+    /// they inherit keeps it off for them. The game starts from NotProton, without the mark.
+    static let bootWithoutX87 = """
+        case "${1:-}" in
+          wineboot|wineboot.exe|*/wineboot|*/wineboot.exe|*'\\'wineboot|*'\\'wineboot.exe) DECANT_NO_X87=1 ;;
+        esac
+        if [ -n "${DECANT_NO_X87:-}" ]; then
+          unset -v ROSETTA_X87_PATH X87_PRECISE_FAULTS
+          export DECANT_NO_X87
+        fi
+        """
+
     static func profileSourcing() -> String {
         """
         profiles=\(shellQuote(profiles.path))
@@ -245,6 +261,7 @@ enum Runner {
         . "$DECANT_RUNNER/decant/engine.env"
         \(profileSourcing())
         \(restoreAskedLogs)
+        \(bootWithoutX87)
         # /bin/sh drops DYLD_* on entry, so restore the Steam overlay the game launcher asked for.
         if [ -n "${NOTPROTON_GAME_CWD:-}" ] && [ -n "${STEAM_DYLD_INSERT_LIBRARIES:-}" ]; then
           if [ -n "${NOTPROTON_OVERLAY_SHIM:-}" ] && [ -f "$NOTPROTON_OVERLAY_SHIM" ]; then
