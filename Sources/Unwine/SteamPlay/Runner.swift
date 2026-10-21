@@ -17,7 +17,11 @@ enum Runner {
     static let build = "decant-1"
 
     /// Bump when the wrappers or engine.env change shape, so existing runners get rewritten.
-    static let format = 7      // 7: a 32-bit game's DLLs no longer turn DEP off (only its .exe can)
+    /// 7: a 32-bit game's DLLs no longer turn DEP off (only its .exe can).
+    /// 8: quiet logs (Wine's at -all, DXVK's and DXMT's at warn) unless a game's Detailed logs or Steam's
+    /// launch options ask for more; no WINEESYNC (this Wine has no esync).
+    /// 9: wineboot, and the programs it starts, run without Faster x87 math.
+    static let format = 9
 
     static var base: URL { SteamPlayPaths.runners.appendingPathComponent("crossover-\(build)", isDirectory: true) }
     static var root: URL { base.appendingPathComponent("CrossOver", isDirectory: true) }
@@ -193,11 +197,51 @@ enum Runner {
             "export GST_PLUGIN_PATH=\(shellQuote("\(fw)/GStreamer.framework/Versions/1.0/lib/gstreamer-1.0"))",
             "export VK_DRIVER_FILES=\(shellQuote(vk.path))",
             "export VK_ICD_FILENAMES=\(shellQuote(vk.path))",
-            "export WINEESYNC=0",
+            // Quiet logs. A game's profile can ask for Detailed logs, and the wrappers keep a level
+            // that Steam's launch options set.
+            "export WINEDEBUG=\(shellQuote(WineEnvironment.quietDebug))",
+            "export DXVK_LOG_LEVEL=\(shellQuote(WineEnvironment.quietLayerLog))",
+            "export DXMT_LOG_LEVEL=\(shellQuote(WineEnvironment.quietLayerLog))",
             "DECANT_RENDERERS=\(shellQuote(engine.rendererRoot.path))",
         ]
         return lines.joined(separator: "\n") + "\n"
     }
+
+    /// NotProton's run script exports WINEDEBUG="${WINEDEBUG:-err+all,fixme-all}", so the wrappers see
+    /// this value when Steam's launch options set none. It is NotProton's default, not the user's choice.
+    static let notProtonDebug = "err+all,fixme-all"
+
+    /// Before engine.env: the log levels the game was started with. Steam passes the ones its launch
+    /// options set (WINEDEBUG, DXVK_*, DXMT_*), and those win over Unwine's. NotProton's default does not count.
+    static let keepAskedLogs = """
+        asked_winedebug="${WINEDEBUG:-}" asked_dxvk_log="${DXVK_LOG_LEVEL:-}" asked_dxmt_log="${DXMT_LOG_LEVEL:-}"
+        """
+
+    /// After the profile: puts the asked levels back. A process the game starts gets the levels its
+    /// parent ran with, so every process of the game agrees.
+    static let restoreAskedLogs = """
+        case "$asked_winedebug" in ''|\(shellQuote(notProtonDebug))) ;; *) export WINEDEBUG="$asked_winedebug" ;; esac
+        [ -z "$asked_dxvk_log" ] || export DXVK_LOG_LEVEL="$asked_dxvk_log"
+        [ -z "$asked_dxmt_log" ] || export DXMT_LOG_LEVEL="$asked_dxmt_log"
+        """
+
+    /// After the profile: making a bottle runs without Faster x87 math. NotProton runs `wine wineboot --init`
+    /// to make a bottle (the template new games copy, or a game's own bottle), and x87sidecar would attach to
+    /// wineboot and to the programs it starts: macOS could then ask for the password while only a bottle is
+    /// made. Wine starts those programs through this wrapper too, with the game's profile, so a mark that
+    /// they inherit keeps it off for them. The game starts from NotProton, without the mark.
+    /// NotProton also runs `wine reg import` at every start; when the bottle is not there yet, Wine makes
+    /// it from inside that reg.exe, so reg counts as making a bottle too.
+    static let bootWithoutX87 = """
+        case "${1:-}" in
+          wineboot|wineboot.exe|*/wineboot|*/wineboot.exe|*'\\'wineboot|*'\\'wineboot.exe) DECANT_NO_X87=1 ;;
+          reg|reg.exe|*/reg|*/reg.exe|*'\\'reg|*'\\'reg.exe) DECANT_NO_X87=1 ;;
+        esac
+        if [ -n "${DECANT_NO_X87:-}" ]; then
+          unset -v ROSETTA_X87_PATH X87_PRECISE_FAULTS
+          export DECANT_NO_X87
+        fi
+        """
 
     static func profileSourcing() -> String {
         """
@@ -216,8 +260,11 @@ enum Runner {
         # Unwine: give every Wine process the free engine's settings and this game's profile, then run Wine.
         # NotProton hard-links this file into a per-game app bundle (for macOS Game Mode), so paths are absolute.
         DECANT_RUNNER=\(shellQuote(runner.path))
+        \(keepAskedLogs)
         . "$DECANT_RUNNER/decant/engine.env"
         \(profileSourcing())
+        \(restoreAskedLogs)
+        \(bootWithoutX87)
         # /bin/sh drops DYLD_* on entry, so restore the Steam overlay the game launcher asked for.
         if [ -n "${NOTPROTON_GAME_CWD:-}" ] && [ -n "${STEAM_DYLD_INSERT_LIBRARIES:-}" ]; then
           if [ -n "${NOTPROTON_OVERLAY_SHIM:-}" ] && [ -f "$NOTPROTON_OVERLAY_SHIM" ]; then
@@ -267,8 +314,10 @@ enum Runner {
         #!/bin/sh
         # Unwine: wineserver needs the engine's support libraries and the same sync mode as the game.
         DECANT_RUNNER=\(shellQuote(runner.path))
+        \(keepAskedLogs)
         . "$DECANT_RUNNER/decant/engine.env"
         \(profileSourcing())
+        \(restoreAskedLogs)
         exec "$DECANT_RUNNER/bin/wineserver.decant-real" "$@"
 
         """

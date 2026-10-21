@@ -6,6 +6,7 @@ import Foundation
 struct StoredState: Codable {
     var games: [Int: GameSettings] = [:]
     var analyses: [Int: GameAnalysis] = [:]
+    var sessions: [Int: SessionSummary] = [:]   // how each game ran last time, measured by macOS 27
     var defaults = GameSettings()
     var autoUpdate = true
     var setupComplete = false
@@ -25,6 +26,23 @@ struct StoredState: Codable {
     var presetChoice: [Int: String] = [:]   // the preset last clicked per game, to break ties
     var localGames: [LocalGameRecord] = []  // Windows games the user added by their .exe
     var lastLocalID = 0                     // the highest id ever given to an added game, so none is reused
+    var lastSeenVersion: String?            // the Unwine whose "What's new" the user has seen; nil on a fresh install
+    var launchOptions: [Int: LaunchOptions] = [:]   // each game's launch options, mods and language (its page's "Launch options and mods")
+    // Storage, logs, updates and safety
+    var updateChecked: [String: Date] = [:]  // last good check per update source, so one that fails does not repeat the rest
+    var deferredEngine: EngineRelease?       // a new engine found while the Mac saved battery or data; "Update now" fetches it
+    var heldEngine: HeldEngine?              // an installed engine Unwine did not switch to: a fix does not fit it yet
+    var skippedEngine: String?               // release key of the engine the user went back from; updates leave it out
+    var pendingRelease: EngineRelease?       // pendingEngine in full, so its archives stay for a newer Unwine
+    var pendingSince: String?                // the Unwine that found pendingEngine; a newer one tries it again
+    // Library and app shell (group d)
+    var librarySort: String?                // how the library orders games (LibrarySort); nil = recently played
+    var libraryFilter: String?              // which games the library shows (LibraryFilter); nil = all
+    var favourites: Set<Int> = []           // games in the Favourites shelf at the top of the library
+    var hiddenGames: Set<Int> = []          // games the user hid; "Hidden games" under the grid shows them
+    var withoutSteam = false                // setup finished without Mac Steam, for games added by their .exe
+    // Faster x87 math (x87sidecar group)
+    var x87Probe: X87Probe?                 // x87sidecar's last check of Rosetta, and the macOS build it ran on
 
     init() {}
 
@@ -32,6 +50,7 @@ struct StoredState: Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         games = (try? c.decodeIfPresent([Int: GameSettings].self, forKey: .games)) ?? [:]
         analyses = (try? c.decodeIfPresent([Int: GameAnalysis].self, forKey: .analyses)) ?? [:]
+        sessions = (try? c.decodeIfPresent([Int: SessionSummary].self, forKey: .sessions)) ?? [:]
         defaults = (try? c.decodeIfPresent(GameSettings.self, forKey: .defaults)) ?? GameSettings()
         autoUpdate = (try? c.decodeIfPresent(Bool.self, forKey: .autoUpdate)) ?? true
         setupComplete = (try? c.decodeIfPresent(Bool.self, forKey: .setupComplete)) ?? false
@@ -51,6 +70,25 @@ struct StoredState: Codable {
         presetChoice = (try? c.decodeIfPresent([Int: String].self, forKey: .presetChoice)) ?? [:]
         localGames = (try? c.decodeIfPresent([LocalGameRecord].self, forKey: .localGames)) ?? []
         lastLocalID = (try? c.decodeIfPresent(Int.self, forKey: .lastLocalID)) ?? 0
+        // Unwine 1.0.2 and older did not keep this. Someone who set one of them up sees what came after 1.0.2.
+        lastSeenVersion = (try? c.decodeIfPresent(String.self, forKey: .lastSeenVersion)) ?? (setupComplete ? "1.0.2" : nil)
+        launchOptions = (try? c.decodeIfPresent([Int: LaunchOptions].self, forKey: .launchOptions)) ?? [:]
+        // Storage, logs, updates and safety
+        updateChecked = (try? c.decodeIfPresent([String: Date].self, forKey: .updateChecked)) ?? [:]
+        deferredEngine = try? c.decodeIfPresent(EngineRelease.self, forKey: .deferredEngine)
+        heldEngine = try? c.decodeIfPresent(HeldEngine.self, forKey: .heldEngine)
+        skippedEngine = try? c.decodeIfPresent(String.self, forKey: .skippedEngine)
+        pendingRelease = try? c.decodeIfPresent(EngineRelease.self, forKey: .pendingRelease)
+        pendingSince = try? c.decodeIfPresent(String.self, forKey: .pendingSince)
+        // Library and app shell (group d)
+        librarySort = try? c.decodeIfPresent(String.self, forKey: .librarySort)
+        libraryFilter = try? c.decodeIfPresent(String.self, forKey: .libraryFilter)
+        favourites = (try? c.decodeIfPresent(Set<Int>.self, forKey: .favourites)) ?? []
+        hiddenGames = (try? c.decodeIfPresent(Set<Int>.self, forKey: .hiddenGames)) ?? []
+        withoutSteam = (try? c.decodeIfPresent(Bool.self, forKey: .withoutSteam)) ?? false
+        // Faster x87 math (x87sidecar group). An unreadable check counts as none: x87sidecar checks
+        // Rosetta again before a game uses it.
+        x87Probe = try? c.decodeIfPresent(X87Probe.self, forKey: .x87Probe)
     }
 }
 
@@ -107,10 +145,12 @@ struct OnlineStatus: Equatable, Sendable {
     var running = false                 // the Windows Steam client itself
     var inUse = false                   // anything alive in its bottle: Steam, a game or a helper
     var signedIn = false
+    var games = 0                       // games running beside Windows Steam
 
     static func read() -> OnlineStatus {
-        OnlineStatus(installed: OnlineSteam.isInstalled, installing: OnlineSteam.isInstalling, running: OnlineSteam.isRunning,
-                     inUse: OnlineSteam.isInUse, signedIn: OnlineSteam.isSignedIn)
+        let look = OnlineSteam.look()   // one look at the bottle's processes answers both
+        return OnlineStatus(installed: OnlineSteam.isInstalled, installing: OnlineSteam.isInstalling, running: look.steam,
+                            inUse: OnlineSteam.isInUse, signedIn: OnlineSteam.isSignedIn, games: look.games)
     }
 }
 
@@ -164,16 +204,27 @@ final class AppModel {
     var games: [SteamGame] = []
     var mappings: [Int: String] = [:]
     var gameRunning = false             // any game or helper running through Unwine
+    var steamChecked = false            // the first look at Steam and at what runs is done
     var busyGame: Int?                  // a game whose Steam setting is being changed
     var localRunning = Set<Int>()       // added games whose bottle is running
     var localStarting: [Int: String] = [:]  // added games starting now, with the step for the waiting screen
-    var banner: String?                 // short notice shown at the top
+
+    // Library and app shell (group d). `banner`, the banner's text, is in Banner.swift.
+    var booted = false                  // start() has read the saved state; until then the window shows only the mark
+    var notice: Banner?                 // the banner at the top of the library, a game's page and Settings
+    var librarySheet: LibrarySheet?     // the sheet over the library: a game's page, Settings or the program chooser
+    var pickingGame = false             // the Add game file picker is open
+    var findRequests = 0                // goes up when Find (⌘F) asks for the library's search field
+    var pendingOpens: [URL] = []        // games opened with Unwine from Finder while setup still runs
+    var updateCardHidden = false        // "Later" on the "Unwine is ready" card, until Unwine opens again
+    var menuUpdateCheck = false         // Check for Updates… from the menu runs; the library shows it waiting
 
     // Advice and Online mode
     var highballLoads = 0               // bumps when the Highball list loads, so advice redraws
     var online = OnlineStatus()
     var onlineStep: StepStatus = .pending
     var onlineWords: [String]?          // phase words while Unwine opens, restarts or closes Windows Steam
+    var onlineStarting: Int?            // the game Unwine starts in Windows Steam now, until its window shows (its tile's badge)
     var onlineRestartAsk: OnlineRestartAsk?   // a game needs settings Windows Steam did not start with
     var onlineForceQuit: [String]?      // games still running when the user asked to quit Windows Steam
     var onlineClosing = false           // Windows Steam is closing (it syncs Steam Cloud saves first)
@@ -185,6 +236,38 @@ final class AppModel {
     private var localLogs: [Int: LogFile] = [:]   // one writer per added game's log
     private var lastHighballCheck = Date()
     private var runnerNeedsRefresh = false  // the runner is from an older Unwine and was in use at launch
+
+    // Engine environment, Mac Driver options and renderer extras (group f). See AppModel+Bottles.swift.
+    @ObservationIgnored var bottleTasks: [Int: Task<Void, Never>] = [:]  // each Steam game's last bottle write, run in order
+    @ObservationIgnored var bottlesChecked = false  // every Steam game's bottle was checked once since Unwine opened
+    var bottleWriting = Set<Int>()      // Steam games whose bottle gets its display settings now
+    var bottleWaiting = Set<Int>()      // Steam games whose settings wait for their bottle (open, or not made yet)
+    var bottleFailed = Set<Int>()       // Steam games whose last bottle write did not take
+    var bottlePlayQueued = Set<Int>()   // Play waits for a bottle write to finish
+
+    // Added games, bottles, mods and Wine tools (group b). See AddedGames.swift.
+    var bottleToolStarting: [Int: String] = [:]     // a program or Wine tool starting in a game's bottle, with the step to show
+    var installedPrograms: [Int: [(url: URL, size: Int64)]] = [:]   // after an installer ended: programs it put in its bottle
+    var steamCopyAsk: SteamCopyAsk?                 // an added .exe that the Steam library has already: add it anyway?
+    var templateTask: Task<URL?, Never>?            // the engine's bottle template while it is made (one at a time)
+    var templateFailed = Set<String>()              // engines whose template failed this run: their bottles use wineboot
+    var toolLogs: [Int: LogFile] = [:]              // one writer per Steam game's log of programs run in its bottle
+    var bottleRuns: [String: Int] = [:]             // programs Unwine ran in a bottle (by its path) that still run
+    var watchedBottles = Set<String>()              // added games' bottles (by path) whose session Unwine follows now
+
+    // Steam game feedback, running state and Online mode (group c): what starts, runs and stops now.
+    var steamStarting: [Int: [String]] = [:]    // Steam games starting now, with the words for the wait
+    var steamGamesRunning = Set<Int>()          // Steam games whose Windows bottle is open
+    var quittingGames = Set<Int>()              // Steam games that Quit game is closing
+    var steamRestartWords: [String]?            // phase words while Unwine restarts Mac Steam
+    var onlineQuitOffer: String?                // a game closed and Windows Steam stays open ("" when Unwine did not start it)
+    var onlineRebuilds: [Int: Int] = [:]        // picture rebuilds per game in its latest online session
+    private var startTokens: [Int: UUID] = [:]  // the watcher that owns each Steam game's start
+    private var onlineSession: SteamGame?       // the game Unwine last started in Windows Steam
+    private var onlineGameSeen = false          // a game ran in Windows Steam since the last offer
+    private var onlineGameLooks = 0             // refreshes in a row with a game in Windows Steam
+    private var onlineGoneLooks = 0             // refreshes in a row with no game in Windows Steam
+    private var onlineLogRead: UInt64?          // how far the session's log is counted
 
     /// Switching between Mac Steam and Windows Steam.
     var onlineBusy: Bool { onlineWords != nil }
@@ -199,11 +282,34 @@ final class AppModel {
     var isCheckingUpdates = false
     let appUpdater = AppUpdater()
 
+    // Storage, logs, updates and safety
+    var engineSwitching: [String]?              // phase words while Unwine moves its Steam tool to another engine
+    var engineDownload: EngineStore.Step?       // an engine update's step while it downloads and unpacks
+    var storageReport: StorageReport?           // Unwine's disk use, from the last measure in Settings
+    var storageProgress: Double?                // 0...1 while Settings measures it, else nil
+    var storageWork: [String]?                  // phase words while a clean-up in Storage runs
+    var storageNote: String?                    // what the last clean-up in Storage did
+    var highballRefreshing = false              // Settings' Refresh now is asking Highball for its list
+    var highballNote: String?                   // what the last Refresh now found
+    private var updateLoop: Task<Void, Never>?  // checks for updates about every 6 hours while Unwine stays open
+
+    // Measured session summary (metalperftrace): open game bottles and the sessions being read
+    let sessionWatch = SessionWatch()
+
+    // Faster x87 math (x87sidecar group; see Engine/X87Sidecar.swift)
+    var x87Task: X87Task?               // x87sidecar being downloaded or checked, or why that failed
+    var x87Rechecked = false            // x87sidecar's check after a macOS update already ran this time
+
     var stored = StoredState()
     let log = LogFile("unwine.log")
     private var started = false
+    private(set) var loaded = false     // state.json is read; a save before that would replace it with defaults
     private var refreshing = false
     private var pendingProfiles = Set<Int?>()
+
+    // Battery mode, presets and frame pacing (group a)
+    private var powerWatched = false
+    private var powerSeen: BatteryOverlay?  // the power state the profiles were last written for
 
     static let storeURL = Paths.support.appendingPathComponent("state.json")
 
@@ -252,6 +358,7 @@ final class AppModel {
         } else if stored.setupComplete {
             stored.setupComplete = false     // parts went missing; setup repairs them
         }
+        watchPower()
         Task { await refreshSteam() }
         Task { await refreshHighball() }
         runTestSwitches()
@@ -312,6 +419,7 @@ final class AppModel {
             }
             flushProfiles()
             addBottleFonts()
+            prepareWaitingBottles()
             // Windows Steam runs on the engine too, so an engine switch waits for it as well.
             if stored.stagedEngine != nil, !isCheckingUpdates, !online.inUse, !onlineStep.isRunning { await activateStagedEngine() }
         }
@@ -337,13 +445,17 @@ final class AppModel {
         steamPlay = snap.play
         steamVersion = snap.version
         mappings = snap.mappings
-        games = snap.games + stored.localGames.map(LocalGames.game(from:))
+        games = LocalGames.inLibraryOrder(snap.games + stored.localGames.map(LocalGames.game(from:)))
         localRunning = Set(games.filter { $0.localExe != nil && LocalGames.isRunning($0) }.map(\.id))
+        refreshArtAndIdentities()
         gameRunning = snap.runnerInUse
         online = snap.online
         // A closed bottle has no settings left to compare with, so the next start sets them fresh.
         if !online.inUse, stored.onlineEnvHash != nil, !onlineBusy { stored.onlineEnvHash = nil; stored.onlineEnv = nil; save() }
         reopenMacSteamIfOnlineEnded()
+        await refreshRunState()
+        watchSessions()     // macOS 27: note each game's Wine processes, read the session once they end
+        steamChecked = true
     }
 
     /// Brings Mac Steam back once Windows Steam is gone. Waits three reads in a row,
@@ -385,6 +497,9 @@ final class AppModel {
         guard !isSettingUp else { return }
         isSettingUp = true
         defer { isSettingUp = false }
+        // Setup downloads, unpacks and copies for minutes: idle sleep would cut it off.
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: "Setting up Unwine")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
         guard await checkMac() else { return }
         guard await installEngine() else { return }
         guard await installKit() else { return }
@@ -414,8 +529,10 @@ final class AppModel {
         }
         let rosetta = try? await Shell.run(URL(fileURLWithPath: "/usr/bin/arch"), ["-x86_64", "/usr/bin/true"], check: false)
         guard rosetta?.status == 0 else { steps[.mac] = .needsUser("Rosetta is missing. Windows games need it."); return false }
-        guard MacSteam.isInstalled else { steps[.mac] = .needsUser("Steam is not in Applications."); return false }
-        steps[.mac] = .done("Apple Silicon, macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion), Rosetta, Steam")
+        // "Use without Steam for now" lets setup go on: games added by their .exe need no Steam.
+        guard MacSteam.isInstalled || stored.withoutSteam else { steps[.mac] = .needsUser("Steam is not in Applications."); return false }
+        steps[.mac] = .done("Apple Silicon, macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion), Rosetta, "
+                            + (MacSteam.isInstalled ? "Steam" : "no Steam for now"))
         return true
     }
 
@@ -502,6 +619,17 @@ final class AppModel {
     }
 
     func checkSteamConnection() {
+        // Set up without Steam: the library opens for games added by their .exe. Steam Play needs
+        // nothing more from Unwine later, because the Steam tool is built already.
+        if stored.withoutSteam && steamPlay != .on {
+            steps[.steam] = .done(MacSteam.isInstalled ? "Skipped for now. Turn on Steam Play in Steam to play Steam games."
+                                                       : "Skipped for now. Install Steam to play Steam games.")
+            if isReady && steps[.mac]?.isDone == true && steps[.runner]?.isDone == true {
+                stored.setupComplete = true
+                save()
+            }
+            return
+        }
         switch steamPlay {
         case .on:
             steps[.steam] = .done("Steam lists Unwine")
@@ -518,15 +646,40 @@ final class AppModel {
         }
     }
 
-    /// Restarts Steam, but never while a game runs (Steam's quit would close the game).
+    /// Restarts Steam, but never while a game runs (Steam's quit would close the game), and one
+    /// restart at a time. Then it waits until Steam runs again and its Steam Play add-on has reported
+    /// back, looking once a second for a minute at most, so Unwine shows the new state when it ends.
     func restartSteam() async {
-        guard !gameRunning else { banner = "A game is running. Close it first, then restart Steam."; return }
+        guard steamRestartWords == nil, busyGame == nil else { return }
+        if let name = startingSteamGame { banner = "\(name) is starting in Steam. Wait for its window, then close the game first."; return }
+        guard !gameRunning else { banner = "\(closeRunningFirst()), then restart Steam."; return }
         guard macSteamAllowed() else { return }
+        steamRestartWords = ["Closing Steam…"]
+        defer { steamRestartWords = nil }
         guard await MacSteam.quit() else { banner = "Steam did not close. Close it yourself, then open it again."; return }
+        // The add-on writes its lines for the new start after this point of its log.
+        let mark = MacSteam.addOnLogEnd(), addOn = MacSteam.hasAddOn
+        steamRestartWords = ["Opening Steam again…"]
         MacSteam.start()
-        try? await Task.sleep(nanoseconds: 8_000_000_000)
+        var open = false, ready = false
+        let start = Date()
+        while Date().timeIntervalSince(start) < 60 {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let look = await Task.detached(priority: .utility) { () -> (running: Bool, settled: Bool) in
+                (MacSteam.isRunning, addOn && MacSteam.addOnSettled(since: mark))
+            }.value
+            if look.running, !open {
+                open = true
+                if addOn { steamRestartWords = ["Waiting for Steam Play…"] }
+            }
+            if look.running, !addOn || look.settled { ready = true; break }
+        }
         await refreshSteam()
         if !stored.setupComplete { checkSteamConnection() }
+        if !ready {
+            banner = open ? "Steam is open, but Steam Play did not answer within a minute. If Steam does not list Unwine, restart Steam again."
+                          : "Steam did not open within a minute. It can be updating itself. Unwine keeps checking."
+        }
     }
 
     // MARK: GPTK 4
@@ -574,10 +727,14 @@ final class AppModel {
 
     func analyze(_ game: SteamGame) async {
         guard case .installed = game.state else { return }
-        // A newer analyzer reads games better, so its results replace older ones at once.
-        if let a = stored.analyses[game.id], a.isCurrent, Date().timeIntervalSince(a.analyzedAt) < 7 * 86_400 { return }
-        let dir = game.installDir, exe = game.localExe
-        let result = await Task.detached(priority: .utility) { GameAnalyzer.analyze(installDir: dir, mainExe: exe) }.value
+        let id = game.id, apps = game.steamapps, dir = game.installDir, exe = game.localExe
+        // The game is read again only when it changed (a Steam update gives a new build id, a new
+        // program a new size or date), or when a newer analyzer reads games better. A fingerprint
+        // that cannot be read now (Steam is writing its file) keeps what Unwine knows.
+        let stamp = await Task.detached(priority: .utility) { GameAnalyzer.fingerprint(appID: id, steamapps: apps, exe: exe) }.value
+        if let a = stored.analyses[id], a.isCurrent, stamp == nil || a.fingerprint == stamp { return }
+        var result = await Task.detached(priority: .utility) { GameAnalyzer.analyze(installDir: dir, mainExe: exe) }.value
+        result.fingerprint = stamp
         guard games.contains(where: { $0.id == game.id }) else { return }   // removed while it was being read
         stored.analyses[game.id] = result
         save()
@@ -599,9 +756,11 @@ final class AppModel {
 
     private func advice(appID: Int, name: String) -> Advice {
         _ = highballLoads       // read so SwiftUI redraws when the Highball list arrives
+        // Added games are found in Highball by steam_appid.txt or by title (see highballMatch).
+        let match = highballMatch(for: appID)
         return Advisor.advise(appID: appID, name: name, analysis: stored.analyses[appID],
-                              highball: HighballDB.game(appID), hasD3DMetal: d3dmetal != nil,
-                              d3dmetalIsV4: d3dmetal?.isVersion4 ?? false, screenPixels: Self.screenPixels)
+                              highball: match?.game, hasD3DMetal: d3dmetal != nil,
+                              d3dmetalIsV4: d3dmetal?.isVersion4 ?? false, screenPixels: Self.screenPixels).found(by: match)
     }
 
     private static var screenPixels: CGSize {
@@ -610,16 +769,13 @@ final class AppModel {
     }
 
     /// Applies one of the advisor's setting sets. The layer goes back to Automatic (which is the
-    /// advised layer), and the Metal overlay stays as the user set it: it is a display choice.
-    /// The Metal overlay, Low latency, background shader building and 120 fps mode stay as the user
-    /// set them: they are the user's choices, not speed or battery settings.
+    /// advised layer). The Metal overlay, MetalFX sharpening, Low latency, background shader building,
+    /// 120 fps mode, Save battery when unplugged, Faster x87 math and the logs, display and experimental
+    /// choices stay as the user set them: they are the user's choices, not speed or battery settings.
     func apply(_ preset: Preset, to game: SteamGame) {
         let now = settings(for: game.id)
         var s = settings(preset, for: game, advice: advice(for: game))
-        s.metalHUD = now.metalHUD
-        s.lowLatency = now.lowLatency
-        s.asyncShaders = now.asyncShaders
-        s.fps120 = now.fps120
+        s.keepPlayerChoices(from: now)      // the one list of them (AppModel+Bottles)
         stored.games[game.id] = s
         stored.presetChoice[game.id] = preset.rawValue
         save()
@@ -635,18 +791,15 @@ final class AppModel {
         let gptk4 = d3dmetal?.isVersion4 == true
         func normal(_ s: GameSettings) -> GameSettings {
             var s = s
+            s.dropPlayerChoices()           // the user's own choices, the ones a preset keeps (AppModel+Bottles)
             let real = s.renderer == .auto ? a.renderer
                 : Profiles.resolve(s.renderer, analysis: stored.analyses[game.id], hasD3DMetal: d3dmetal != nil)
             if s.renderer == a.renderer { s.renderer = .auto }
-            s.metalHUD = false
-            s.lowLatency = false
-            s.asyncShaders = true
-            s.fps120 = false
             if !(real == .d3dmetal && gptk4) { s.metal4 = true }
             if real == .wined3d || (real == .d3dmetal && !gptk4) || (real == .dxvk && api == .dx12) { s.fpsCap = nil }
             if !((api == .dx11 || api == .dx12) && (real == .d3dmetal || real == .dxmt)) { s.metalFX = false }
-            if !(real == .dxmt && (api == .dx10 || api == .dx11)) { s.metalFXSpatial = false }
             if real != .d3dmetal { s.rayTracing = nil }
+            if !(real == .dxmt && api == .dx11) { s.maxTessFactor = nil }
             return s
         }
         let now = normal(settings(for: game.id))
@@ -655,15 +808,58 @@ final class AppModel {
         return matches.first
     }
 
-    /// A preset's full settings for one game: exactly what a click stores.
+    /// A preset's full settings for one game: what a click stores, apart from the user's own choices
+    /// that `apply` keeps. MetalFX sharpening is one of those: it buys a sharper picture with GPU
+    /// time, not battery, so no preset turns it on.
     func settings(_ preset: Preset, for game: SteamGame, advice a: Advice) -> GameSettings {
         var s = preset == .speed ? a.performance : a.battery
         s.renderer = .auto
-        // MetalFX sharpening lets a DirectX 10/11 game draw at half size and still fill the
-        // screen sharply. It costs a little GPU time, so only the battery set turns it on.
-        s.metalFXSpatial = preset == .battery && canSharpen(game, renderer: a.renderer)
         return s
     }
+
+    /// The game's layer takes a frame cap from Unwine: DXMT and DXVK do, D3DMetal from GPTK 4.
+    /// WineD3D does not, nor does Wine's own DirectX 12 on the DXVK layer.
+    func takesFrameCap(_ game: SteamGame) -> Bool {
+        let r = renderer(for: game.id)
+        return r != .wined3d && !(r == .d3dmetal && d3dmetal?.isVersion4 != true)
+            && !(r == .dxvk && stored.analyses[game.id]?.api == .dx12)
+    }
+
+    /// "New games start with" in Settings. Best battery leaves its marks in the settings for new
+    /// games (ray tracing off, a tessellation cap), so the choice needs no field of its own.
+    var newGamesPreset: Preset {
+        stored.defaults.rayTracing == false && stored.defaults.maxTessFactor != nil ? .battery : .speed
+    }
+
+    /// Gives new games a preset. Unwine knows nothing about a new game yet, so this is the preset
+    /// without what needs the game's own files (MetalFX for DLSS); a game page can add that. The
+    /// layer stays Automatic, and the user's own choices (overlay, sharpening, ...) stay.
+    func applyToNewGames(_ preset: Preset) {
+        updateDefaults { s in
+            let battery = preset == .battery
+            s.renderer = .auto
+            s.msync = true
+            s.advertiseAVX = true
+            s.metal4 = true
+            s.metalFX = false
+            s.fpsCap = battery ? 60 : nil
+            s.rayTracing = battery ? false : nil
+            s.maxTessFactor = battery ? 16 : nil
+        }
+    }
+
+    /// Changes the settings that every game without its own uses, and rewrites their profiles.
+    func updateDefaults(_ change: (inout GameSettings) -> Void) {
+        var s = stored.defaults
+        change(&s)
+        guard s != stored.defaults else { return }
+        stored.defaults = s
+        save()
+        writeAllProfiles()
+    }
+
+    /// The games in the library that use the settings for new games: none of their own yet.
+    var gamesOnDefaults: Int { windowsGames.filter { stored.games[$0.id] == nil }.count }
 
     /// DXMT's MetalFX sharpening works only for DirectX 10/11 games running on DXMT.
     func canSharpen(_ game: SteamGame, renderer: Renderer? = nil) -> Bool {
@@ -702,27 +898,140 @@ final class AppModel {
 
     func play(_ game: SteamGame) {
         if game.localExe != nil { Task { await playLocal(game) }; return }
+        // One start at a time: a second click would ask Steam for a second launch.
+        guard runState(of: game) == .idle else {
+            if runState(of: game) == .running { banner = "\(game.name) is already running." }
+            return
+        }
+        // Steam that is closing for a restart could lose the start, or open again too early.
+        guard steamRestartWords == nil, busyGame == nil else { banner = "Steam is restarting. Wait for it to finish, then press Play again."; return }
         guard macSteamAllowed() else { return }
         writeProfile(for: game.id)
-        MacSteam.play(game.id)
-        // Steam starts the game in the background; bring its window to the front once it shows,
-        // so the keyboard and mouse go to the game at once.
         let pfx = game.compatData.appendingPathComponent("pfx")
-        Task { [weak self] in
-            for _ in 0..<120 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                let pids = await Task.detached(operation: { Self.bottlePIDs(prefix: pfx) }).value
-                if let pid = Self.withWindows(pids).first {
-                    self?.bringToFront(pid)
-                    return
+        // Steam Play builds the bottle on the first start, which takes longer. The words say so.
+        let building = !FileManager.default.fileExists(atPath: pfx.path)
+        steamStarting[game.id] = ["Steam is starting \(game.name)…"] + (building ? ["Building the Windows bottle…"] : [])
+            + ["Windows games start slowly on a Mac"]
+        let token = UUID()
+        startTokens[game.id] = token
+        // Steam is asked once a display write in the game's bottle is done (AppModel+Bottles), and the
+        // watch starts then: the write's own Wine run opens and closes the bottle, which the watch
+        // would take for the game's.
+        startWhenBottleReady(game) { [weak self] in
+            guard let self, self.startTokens[game.id] == token else { return false }   // Stop waiting or Quit game ended it
+            let mark = SteamRunLog.end(of: game.runLog)     // this start's lines come after it
+            Task { await self.watchSteamStart(game, prefix: pfx, logMark: mark, token: token) }
+            return true
+        }
+    }
+
+    /// Waits for a Steam game's first window and brings it to the front, so the keyboard and mouse go
+    /// to the game at once. Until then the tile and page show the start, and Play waits. NotProton's run
+    /// log and the bottle's lock say how the start goes (see SteamStartWatch). The lock check and the
+    /// log read are cheap; the process scan runs only while the bottle is open.
+    private func watchSteamStart(_ game: SteamGame, prefix pfx: URL, logMark: UInt64, token: UUID) async {
+        defer {
+            if startTokens[game.id] == token { startTokens[game.id] = nil; steamStarting[game.id] = nil }
+        }
+        let start = Date(), runLog = game.runLog
+        var watch = SteamStartWatch(start: start)
+        var read = logMark
+        while true {
+            try? await Task.sleep(nanoseconds: Self.watchInterval(since: start))
+            guard startTokens[game.id] == token else { return }     // Quit game or Stop waiting ended the start
+            let from = read
+            let look = await Task.detached(priority: .utility) { () -> (open: Bool, pids: [pid_t], log: (events: [SteamRunLog.Event], end: UInt64)) in
+                let open = Runner.isPrefixRunning(pfx)
+                return (open, open ? Self.bottlePIDs(prefix: pfx) : [], SteamRunLog.events(in: runLog, since: from))
+            }.value
+            guard startTokens[game.id] == token else { return }
+            read = look.log.end
+            let verdict = watch.look(open: look.open, events: look.log.events, logGrew: look.log.end != from, now: Date())
+            // Play stays off after the start, and Quit game shows for a start that hangs.
+            if look.open, verdict != .closedEarly, !steamGamesRunning.contains(game.id) { steamGamesRunning.insert(game.id) }
+            if verdict == .closedEarly {
+                steamGamesRunning.remove(game.id)
+                show("\(game.name) closed before it showed a window. Its log says why.", .problem,
+                     action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
+                log.line("\(game.name) closed before it showed a window")
+                return
+            }
+            if look.open, let pid = Self.withWindows(look.pids).first {
+                bringToFront(pid)
+                return
+            }
+            if case .timedOut(let started) = verdict {
+                if started {
+                    show("\(game.name) is still starting. Its window shows soon. Its log says what it is doing.",
+                         action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
+                } else {
+                    banner = "Steam has not started \(game.name) yet. Look in Steam: it can ask a question or update the game first."
                 }
+                return
             }
         }
     }
 
+    /// Ends the wait for a Steam game's window and leaves the game alone. When Steam asked something
+    /// and the start was cancelled there, Play works again at once instead of after two minutes.
+    func stopWaiting(for game: SteamGame) {
+        startTokens[game.id] = nil
+        steamStarting[game.id] = nil
+    }
+
+    /// A start watcher looks every second while a window is most likely, then every two seconds, so a
+    /// slow start takes less from the game.
+    nonisolated private static func watchInterval(since start: Date) -> UInt64 {
+        Date().timeIntervalSince(start) < 15 ? 1_000_000_000 : 2_000_000_000
+    }
+
+    /// Ends a running Steam game, as Quit game does for an added game: `wineserver -k` ends every
+    /// program in its Windows bottle, and Steam then sees the game end. It is the runner's own
+    /// wineserver, given the game's bottle and Steam's folder for it, so the wrapper loads the game's
+    /// profile (the same sync mode as the running server) and the request reaches that bottle.
+    func quitSteamGame(_ game: SteamGame) async {
+        guard game.localExe == nil, !quittingGames.contains(game.id) else { return }
+        guard let engine else { banner = "Unwine's engine is not set up yet."; return }
+        let pfx = game.compatData.appendingPathComponent("pfx")
+        quittingGames.insert(game.id)
+        defer { quittingGames.remove(game.id) }
+        startTokens[game.id] = nil      // a start that hangs ends here, without a "closed early" notice
+        steamStarting[game.id] = nil
+        var env = WineEnvironment.base(engine: engine, prefix: pfx)
+        let server = Runner.root.appendingPathComponent("bin/wineserver")
+        env["WINESERVER"] = server.path
+        env["WINELOADER"] = Runner.root.appendingPathComponent("lib/wine/x86_64-unix/wine").path
+        env["STEAM_COMPAT_DATA_PATH"] = game.compatData.path
+        log.line("Quit game: ending everything in the Windows bottle of \(game.name)")
+        // wineserver -k waits until the server is gone (about 10 seconds at most), so this look is current.
+        _ = try? await Shell.run(FileManager.default.isExecutableFile(atPath: server.path) ? server : engine.wineserver,
+                                 ["-k"], env: env, log: log, check: false)
+        if await Task.detached(priority: .utility, operation: { Runner.isPrefixRunning(pfx) }).value {
+            banner = "\(game.name) did not close. Try Quit game again in a moment."
+        } else {
+            steamGamesRunning.remove(game.id)   // at once: a refresh already under way would skip the next one
+        }
+        await refreshSteam()
+    }
+
+    /// Which Steam games have their Windows bottle open: the same lock check as added games, a stat and
+    /// a file lock per game, no process scan. Then Online mode's game. Runs with every refresh. A
+    /// display write (AppModel+Bottles) opens a closed bottle for a few seconds: that is Unwine, not
+    /// the game, so it shows no Running badge and no Quit game.
+    private func refreshRunState() async {
+        let writing = bottleWriting
+        let bottles = windowsGames.filter { $0.localExe == nil && !writing.contains($0.id) }
+            .map { (id: $0.id, pfx: $0.compatData.appendingPathComponent("pfx")) }
+        let open = await Task.detached(priority: .utility) { Set(bottles.filter { Runner.isPrefixRunning($0.pfx) }.map(\.id)) }.value
+        if open != steamGamesRunning { steamGamesRunning = open }
+        await watchOnlineSession()
+    }
+
     /// Sets this game to use Unwine in Steam. Steam must restart for that.
     func useDecant(_ on: Bool, for game: SteamGame) async {
-        guard !gameRunning else { banner = "A game is running. Close it first: Steam restarts for this."; return }
+        guard steamRestartWords == nil, busyGame == nil else { return }    // one Steam restart at a time
+        if let name = startingSteamGame { banner = "\(name) is starting in Steam. Wait for its window, then close the game first."; return }
+        guard !gameRunning else { banner = "\(closeRunningFirst()): Steam restarts for this."; return }
         busyGame = game.id
         defer { busyGame = nil }
         let wasRunning = MacSteam.isRunning
@@ -740,6 +1049,9 @@ final class AppModel {
     /// Moves this game's Windows bottle to the Trash (not the game, not its Steam Cloud saves).
     func resetBottle(_ game: SteamGame) {
         let pfx = game.compatData.appendingPathComponent("pfx")
+        // The page turns Fresh bottle off while the game starts, runs or closes; a start the page
+        // has not seen yet still stops here.
+        if let why = bottleBusyReason(game) { banner = why; return }
         guard !Runner.isPrefixRunning(pfx) else { banner = "\(game.name) is running. Quit the game first."; return }
         guard FileManager.default.fileExists(atPath: pfx.path) else { banner = "\(game.name) has no Windows bottle yet."; return }
         if game.localExe != nil,
@@ -765,37 +1077,130 @@ final class AppModel {
     // MARK: Games added by their .exe
 
     /// Adds a Windows game or program by its .exe. It shows in the library like a Steam game.
-    func addLocalGame(exe: URL, folder: URL? = nil) {
-        if let known = stored.localGames.first(where: { $0.exePath == exe.path }) {
+    /// `folder` is the game folder the user picked, if any. A program that Steam's library already has
+    /// is added only `anyway`: until then Unwine asks (`steamCopyAsk`).
+    func addLocalGame(exe: URL, folder: URL? = nil, anyway: Bool = false) {
+        let path = exe.standardizedFileURL.path
+        if let known = stored.localGames.first(where: { URL(fileURLWithPath: $0.exePath).standardizedFileURL.path == path }) {
             banner = "\(known.name) is already in your library."
+            return
+        }
+        if !anyway, let ask = steamCopy(of: exe, folder: folder) {
+            steamCopyAsk = ask
             return
         }
         let id = max(LocalGames.idBase, stored.lastLocalID, stored.localGames.map(\.id).max() ?? 0) + 1
         stored.lastLocalID = id
-        // Named after the folder the user picked, else the folder the program sits in.
-        var name = folder.map { $0.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces) }
-            .flatMap { $0.isEmpty ? nil : $0 } ?? LocalGames.suggestedName(for: exe)
+        // Named after the game folder the user picked, else the folder the program sits in. When those
+        // folders say nothing about the game ("Game", "Downloads"), the program's own ProductName.
+        let root = LocalGames.gameRoot(for: exe, picked: folder)
+        var name = LocalGames.defaultName(for: exe, picked: root ?? folder)
         // A second program from the same game (often its launcher) shares the first one's bottle.
         // A launcher or tool says so in its name, so the tiles differ.
         let mate = LocalGames.bottleMate(for: exe, in: stored.localGames)
-        if let role = LocalGames.role(of: exe) {
-            name += " · \(role)"
-        } else if stored.localGames.contains(where: { $0.name == name }) {
-            name += " (\(exe.deletingPathExtension().lastPathComponent))"
-        }
-        let record = LocalGameRecord(id: id, name: name, exePath: exe.path, addedAt: Date(), bottleOf: mate?.bottle)
+        if let role = LocalGames.role(of: exe) { name += " · \(role)" }
+        name = uniqueLocalName(name, exe: exe)
+        let record = LocalGameRecord(id: id, name: name, exePath: exe.path, addedAt: Date(), bottleOf: mate?.bottle, rootPath: root?.path)
         stored.localGames.append(record)
         save()
         let game = LocalGames.game(from: record)
-        games.append(game)
-        let lower = exe.lastPathComponent.lowercased()
-        banner = ["setup", "install", "unins"].contains(where: lower.contains)
-            ? "\(record.name) looks like an installer. Play runs it inside the game's own bottle. When it finishes, use Add game again and pick the installed program (Unwine's LocalGames folder holds the bottle)."
+        games = LocalGames.inLibraryOrder(games + [game])
+        readLocalIdentities()       // the program's icon and Highball details, in the background
+        banner = LocalGames.looksLikeInstaller(exe)
+            ? "\(record.name) looks like an installer. Press Play to run it in a Windows bottle of its own. When it ends, its page offers the program it installed, in the same bottle."
             : mate.map { m in LocalGames.isInside(exe, bottle: m.bottle)
                 ? "\(record.name) is in your library. It runs in the Windows bottle that \(m.name) installed it into."
                 : "\(record.name) is in your library. It shares a Windows bottle with \(m.name), so settings you make in one, such as in a launcher, reach the other." }
                 ?? "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
         Task { await analyze(game) }
+        // The first Play then only copies a bottle: the template is made while the user looks around.
+        warmBottleTemplate()
+    }
+
+    /// A name no other game in the library has: the program's name goes after a name that is taken.
+    func uniqueLocalName(_ base: String, exe: URL, except id: Int? = nil) -> String {
+        let taken = Set(games.filter { $0.id != id }.map { $0.name.lowercased() })
+            .union(stored.localGames.filter { $0.id != id }.map { $0.name.lowercased() })
+        guard taken.contains(base.lowercased()) else { return base }
+        let named = "\(base) (\(exe.deletingPathExtension().lastPathComponent))"
+        guard taken.contains(named.lowercased()) else { return named }
+        var n = 2
+        while taken.contains("\(named) \(n)".lowercased()) { n += 1 }
+        return "\(named) \(n)"
+    }
+
+    /// Programs from one game folder added before Unwine 1.0.3 each got their own bottle, so a
+    /// launcher's settings never reached its game. This moves each such pair into one bottle. It
+    /// keeps the bottle that holds files a program wrote (saves), else the launcher's (its settings
+    /// are in that bottle's registry), else the older one; the other goes to the Trash. A pair whose
+    /// bottles both hold files stays apart, because Unwine cannot tell which saves count. Bottles
+    /// in use are left for the next start. A launcher or tool also gets its role in its name.
+    private func mergeLocalBottles() {
+        // start() calls this right after it reads state.json, before it picks the engine and writes the profiles.
+        startAddedGames()
+        var owners: [LocalGameRecord] = []
+        var notes: [String] = []
+        for r in stored.localGames.sorted(by: { $0.addedAt < $1.addedAt }) where r.bottleOf == nil {
+            guard let mate = LocalGames.bottleMate(for: URL(fileURLWithPath: r.exePath), in: owners) else { owners.append(r); continue }
+            let pfx = { (id: Int) in LocalGames.root.appendingPathComponent("compatdata/\(id)/pfx", isDirectory: true) }
+            guard !OnlineSteam.serverIsAlive(pfx(r.id)), !OnlineSteam.serverIsAlive(pfx(mate.id)) else { continue }
+            let files = (r: LocalGames.bottleHoldsOwnFiles(r.id), mate: LocalGames.bottleHoldsOwnFiles(mate.id))
+            // A program installed inside the other's bottle must move there: that bottle holds it.
+            let installedInMate = LocalGames.isInside(URL(fileURLWithPath: r.exePath), bottle: mate.bottle)
+            guard !(files.r && (files.mate || installedInMate)) else {
+                log.line("\(r.name) and \(mate.name) keep their own bottles: both hold files the programs wrote")
+                owners.append(r); continue
+            }
+            let isLauncher = { (x: LocalGameRecord) in LocalGames.role(of: URL(fileURLWithPath: x.exePath)) == "Launcher" }
+            let keep = !installedInMate && (files.r || (!files.mate && isLauncher(r) && !isLauncher(mate))) ? r : mate
+            let drop = keep.id == r.id ? mate : r
+            for i in stored.localGames.indices where stored.localGames[i].bottle == drop.id {
+                stored.localGames[i].bottleOf = keep.id
+            }
+            if keep.id == r.id { owners.removeAll { $0.id == mate.id }; owners.append(r) }
+            try? FileManager.default.trashItem(at: LocalGames.root.appendingPathComponent("compatdata/\(drop.id)", isDirectory: true), resultingItemURL: nil)
+            for i in stored.localGames.indices where [r.id, mate.id].contains(stored.localGames[i].id) {
+                let exe = URL(fileURLWithPath: stored.localGames[i].exePath)
+                if let role = LocalGames.role(of: exe), !stored.localGames[i].name.hasSuffix(" · \(role)") {
+                    stored.localGames[i].name += " · \(role)"
+                }
+            }
+            let now = { (id: Int) in self.stored.localGames.first { $0.id == id }?.name ?? "" }
+            log.line("\(now(drop.id)) now uses the Windows bottle of \(now(keep.id)); its own went to the Trash")
+            notes.append("\(now(r.id)) and \(now(mate.id))")
+        }
+        guard !notes.isEmpty else { return }
+        save()
+        banner = "\(notes.joined(separator: "; ")) now share one Windows bottle, so a launcher's settings reach its game. The bottle that was left over is in the Trash."
+    }
+
+    /// The game whose settings a launcher (or tool) runs with: the program without a role in the same
+    /// bottle. Whatever the launcher starts inherits everything the launcher got, so the game's own
+    /// settings must ride along with the launcher. Nil for the game itself and for lone programs.
+    func settingsSource(for game: SteamGame) -> LocalGameRecord? {
+        guard let exe = game.localExe, LocalGames.role(of: exe) != nil else { return nil }
+        return bottleSharers(of: game).first { LocalGames.role(of: URL(fileURLWithPath: $0.exePath)) == nil }
+    }
+
+    /// What "Remove from Unwine" does to an added game's files, said before it happens.
+    func removeNote(for game: SteamGame) -> String {
+        if let mate = bottleSharers(of: game).first {
+            let installed = LocalGames.isInside(URL(fileURLWithPath: mate.exePath), bottle: game.bottleID ?? game.id)
+            return "The game's own files stay in \(game.installDir.path). Its Windows bottle stays too, because \(mate.name) \(installed ? "is installed in it" : "uses it")."
+        }
+        return game.installDir.path.hasPrefix(game.compatData.path)
+            ? "This game was installed inside its Windows bottle, so the game itself goes to the Trash with the bottle."
+            : "The game's own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the game kept inside it, goes to the Trash."
+    }
+
+    /// The other added games that use this game's Windows bottle, or whose program an installer put
+    /// inside it. Trashing the bottle would take those games with it.
+    func bottleSharers(of game: SteamGame) -> [LocalGameRecord] {
+        guard game.localExe != nil else { return [] }
+        let bottle = game.bottleID ?? game.id
+        return stored.localGames.filter {
+            $0.id != game.id && ($0.bottle == bottle || LocalGames.isInside(URL(fileURLWithPath: $0.exePath), bottle: bottle))
+        }
     }
 
     /// Programs from one game folder added before Unwine 1.0.3 each got their own bottle, so a
@@ -872,36 +1277,54 @@ final class AppModel {
 
     /// Takes an added game out of the library. Its files stay where they are; its Windows bottle
     /// (settings and saves the game kept inside it) goes to the Trash, unless another added game
-    /// from the same folder still uses it.
+    /// from the same folder still uses it. The bottle goes first: when it cannot go to the Trash, the
+    /// game stays in the library, so no bottle is ever left behind without a game.
     func removeLocalGame(_ game: SteamGame) {
         guard game.localExe != nil else { return }
-        guard !localRunning.contains(game.id) else { banner = "\(game.name) is running. Quit it first."; return }
+        guard !localRunning.contains(game.id), localStarting[game.id] == nil else { banner = "\(game.name) is running. Quit it first."; return }
         let sharers = bottleSharers(of: game)
-        stored.localGames.removeAll { $0.id == game.id }
-        stored.games[game.id] = nil
-        stored.analyses[game.id] = nil
-        stored.presetChoice[game.id] = nil
-        save()
-        Profiles.remove(appID: game.id)
         if sharers.isEmpty {
             if FileManager.default.fileExists(atPath: game.compatData.path) {
-                try? FileManager.default.trashItem(at: game.compatData, resultingItemURL: nil)
+                do {
+                    try FileManager.default.trashItem(at: game.compatData, resultingItemURL: nil)
+                } catch {
+                    banner = "\(game.name) stays in your library, because Unwine could not move its Windows bottle to the Trash: \(error.localizedDescription)"
+                    log.line("Could not move the bottle of \(game.name) to the Trash: \(error)")
+                    return
+                }
             }
         } else {
             try? FileManager.default.removeItem(at: game.compatData.appendingPathComponent(game.bottleID == nil ? "Game.app" : "Game-\(game.id).app"))
         }
+        stored.localGames.removeAll { $0.id == game.id }
+        stored.games[game.id] = nil
+        stored.analyses[game.id] = nil
+        stored.presetChoice[game.id] = nil
+        stored.launchOptions[game.id] = nil
+        save()
+        LaunchOptions.publish(stored.launchOptions)
+        Profiles.remove(appID: game.id)
+        // Its log goes too, with the part kept when it moved on at 10 MB: no page can show it once the game is gone.
+        localLogs[game.id] = nil
+        let gameLog = Paths.logs.appendingPathComponent(LocalGames.logName(game.id))
+        for file in [gameLog, LogFile.previous(of: gameLog)] { try? FileManager.default.removeItem(at: file) }
+        installedPrograms[game.id] = nil
         games.removeAll { $0.id == game.id }
         banner = sharers.isEmpty
             ? "\(game.name) is out of your library. Its files stay in \(game.installDir.path)."
             : "\(game.name) is out of your library. Its Windows bottle stays, because \(sharers[0].name) uses it too."
     }
 
-    /// Points an added game at its program's new place (moved folder, other drive), keeping its bottle.
+    /// Points an added game at another program, or at its program's new place (moved folder, other
+    /// drive), keeping its bottle and saves. The game folder follows when the whole game moved.
     func relocateLocalGame(_ id: Int, exe: URL) {
         guard let i = stored.localGames.firstIndex(where: { $0.id == id }) else { return }
+        stored.localGames[i].rootPath = LocalGames.movedRoot(of: stored.localGames[i], to: exe)?.path
         stored.localGames[i].exePath = exe.path
         stored.analyses[id] = nil
+        installedPrograms[id] = nil     // the entry has its program now
         save()
+        readLocalIdentities()       // the moved program's icon and name are read again
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
         banner = "\(stored.localGames[i].name) now starts \(exe.lastPathComponent) from \(exe.deletingLastPathComponent().path)."
         if let g = games.first(where: { $0.id == id }) { Task { await analyze(g) } }
@@ -915,7 +1338,7 @@ final class AppModel {
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
     }
 
-    private func localLog(_ id: Int) -> LogFile {
+    func localLog(_ id: Int) -> LogFile {
         if let log = localLogs[id] { return log }
         let log = LogFile(LocalGames.logName(id))
         localLogs[id] = log
@@ -926,6 +1349,10 @@ final class AppModel {
         guard let engine else { banner = "Unwine's engine is not set up yet."; return }
         guard localStarting[game.id] == nil else { return }
         if localRunning.contains(game.id) { banner = "\(game.name) is already running."; return }
+        guard let arguments = LaunchOptions.words(launchOptions(for: game.id).arguments) else {
+            banner = "\(game.name) did not start: a quote in its launch options is not closed. Open its page to fix them."
+            return
+        }
         localStarting[game.id] = "Getting \(game.name) ready…"
         defer { localStarting[game.id] = nil }
         // The first start waits for the file check, so the settings fit the game. A launcher runs
@@ -935,31 +1362,50 @@ final class AppModel {
         writeProfile(for: source.id)
         let log = localLog(game.id)
         if source.id != game.id { log.line("\(game.name) starts with the settings of \(source.name), so the game it opens gets them") }
+        let exited = ExitFlag()
         do {
-            try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: source.id), log: log,
-                                       phase: { [weak self] words in self?.localStarting[game.id] = words },
-                                       onExit: { status in log.line("The game's process ended with status \(status)") })
+            let before = try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: source.id), arguments: arguments, log: log,
+                                                    template: { [weak self] in await self?.bottleTemplate() },
+                                                    watchInstalls: game.localExe.map(LocalGames.looksLikeInstaller) ?? false,
+                                                    phase: { [weak self] words in self?.localStarting[game.id] = words },
+                                                    onExit: { status in log.line("The game's process ended with status \(status)"); exited.set(status) })
+            let launched = Date()
+            markPlayed(game.id)
             // Wait for the game to show a window, so the waiting screen covers the slow part. Stop
-            // when the bottle closes (the game ended).
+            // when the bottle closes (the game ended). The process scan runs only while it is open.
             var seenAlive = false, ended = false, shown = false
-            for second in 0..<90 {
-                let alive = await Task.detached(operation: { LocalGames.isRunning(game) }).value
-                if alive { seenAlive = true; localRunning.insert(game.id) }
-                if let pid = Self.withWindows(await Task.detached(operation: { Self.bottlePIDs(prefix: LocalGames.prefix(game)) }).value).first {
+            let watchStart = Date()
+            while Date().timeIntervalSince(watchStart) < 90 {
+                let look = await Task.detached(priority: .utility) { () -> (alive: Bool, pids: [pid_t]) in
+                    LocalGames.isRunning(game) ? (true, Self.bottlePIDs(prefix: LocalGames.prefix(game))) : (false, [])
+                }.value
+                if look.alive { seenAlive = true; localRunning.insert(game.id) }
+                if let pid = Self.withWindows(look.pids).first {
                     bringToFront(pid); shown = true; break
                 }
-                if !alive && (seenAlive || second >= 10) { ended = true; break }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if !look.alive && (seenAlive || Date().timeIntervalSince(watchStart) >= 10) { ended = true; break }
+                try? await Task.sleep(nanoseconds: Self.watchInterval(since: watchStart))
             }
             if ended {
                 localRunning.remove(game.id)
-                banner = "\(game.name) closed before it showed a window. On its page, Show logs says why."
+                show("\(game.name) closed before it showed a window. Its log says why.", .problem,
+                     action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
                 log.line("The game closed before it showed a window")
-            } else if !shown {
-                banner = "\(game.name) is still starting. Its window shows soon, or Show logs on its page says what it is doing."
+                await offerInstalledPrograms(game, before: before)
+            } else {
+                if !shown {
+                    show("\(game.name) is still starting. Its window shows soon. Its log says what it is doing.",
+                         action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
+                }
+                // Until the bottle closes: playtime, the display kept awake, and leftovers closed.
+                Task { await self.watchLocalSession(game, exited: exited, installsBefore: before, since: launched) }
             }
         } catch {
-            banner = "\(game.name) did not start: \(error.localizedDescription)"
+            // A program that moved: Locate… keeps the game's bottle and saves.
+            let moved: Bool = { if case LocalGamesError.missing = error { return true }; return false }()
+            show("\(game.name) did not start: \(error.localizedDescription)", .problem,
+                 action: moved ? .init("Locate…") { [weak self] in self?.locateLocalGame(game) }
+                               : .init("Show logs") { [weak self] in self?.showLogs(of: game) })
             log.line("start failed: \(error)")
         }
         await refreshSteam()
@@ -976,15 +1422,26 @@ final class AppModel {
     /// The processes, of those given, that opened a window. A Wine program turns into a normal Mac app
     /// when it shows its first window, even one that Stage Manager keeps as a tile in its strip, so
     /// this works where looking at window sizes cannot.
-    private static func withWindows(_ pids: [pid_t]) -> Set<pid_t> {
+    static func withWindows(_ pids: [pid_t]) -> Set<pid_t> {
         Set(pids.filter { NSRunningApplication(processIdentifier: $0)?.activationPolicy == .regular })
     }
 
-    /// Every process whose Wine bottle is `prefix`.
-    nonisolated private static func bottlePIDs(prefix: URL) -> [pid_t] {
+    /// Every process whose Wine bottle is `prefix`. Wine's processes all run a file whose name starts
+    /// with "wine", so a look at the file name comes first: reading every process's arguments and
+    /// environment cost about six times more (11 ms against 1.8 ms a scan on 800 processes).
+    /// Not private: programs run in a game's bottle (AddedGames) look for their window with it too.
+    nonisolated static func bottlePIDs(prefix: URL) -> [pid_t] {
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
-        return pids.prefix(max(0, count)).filter { $0 > 0 && processUsesPrefix($0, prefix.path) }
+        var path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        var out: [pid_t] = []
+        for pid in pids.prefix(max(0, count)) where pid > 0 {
+            let length = Int(proc_pidpath(pid, &path, UInt32(path.count)))
+            guard length > 0, String(decoding: path.prefix(length), as: UTF8.self).split(separator: "/").last?.hasPrefix("wine") == true,
+                  processUsesPrefix(pid, prefix.path) else { continue }
+            out.append(pid)
+        }
+        return out
     }
 
     /// The process of this bottle that shows a real window, once there is one. With `small`, a small
@@ -1060,6 +1517,10 @@ final class AppModel {
     /// sign-in window. Mac Steam closes first, so the two never write the same game files at once.
     func openOnline(_ game: SteamGame?, restart: Bool? = nil) async {
         guard let engine, online.installed, !onlineBusy, !onlineStep.isRunning else { return }
+        // Online mode closes Mac Steam, which would cut a restart of Mac Steam short.
+        guard steamRestartWords == nil else { banner = "Mac Steam is restarting. Wait for it to finish, then try again."; return }
+        // A start in Mac Steam has no open bottle yet, so the check below cannot see it.
+        if let name = startingSteamGame { banner = "\(name) is starting in Mac Steam. Wait for its window, then close it first."; return }
         guard !Runner.isInUse() else { banner = "A game is running in Mac Steam. Close it first."; return }
         // After an engine update the bottle needs the new engine's files once (no new download).
         // Its progress shows in the Online play section like the first setup.
@@ -1068,7 +1529,7 @@ final class AppModel {
             guard stored.onlineEngine == engine.folder else { return }
         }
         onlineWords = ["Getting Windows Steam ready…"]
-        defer { onlineWords = nil }
+        defer { onlineWords = nil; onlineStarting = nil }
         // Without a game, Windows Steam opens with the settings for new games, so a game that keeps
         // those settings starts in the same Steam with no restart.
         let profile = Profiles.file(for: game?.id)
@@ -1083,6 +1544,8 @@ final class AppModel {
             onlineRestartAsk = OnlineRestartAsk(game: game, changes: OnlineSteam.describeChanges(from: stored.onlineEnv ?? [:], to: now))
             return
         }
+        // The game's start: its words show in the library's Online mode card, its tile says Starting.
+        onlineStarting = game?.id
         if steamUp, let last = stored.onlineEnvHash, last != hash, restart == true {
             onlineWords = ["Restarting Windows Steam with this game's settings…", "Steam Cloud saves sync first"]
             onlineClosing = true
@@ -1114,6 +1577,7 @@ final class AppModel {
                 try OnlineSteam.shareGames(onlineGames(adding: game))
             }
             let before = Self.withWindows(await Task.detached(priority: .userInitiated, operation: { OnlineSteam.processIDs() }).value)
+            if let game { beginOnlineSession(game) }
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
             if !steamUp {
                 stored.onlineEnvHash = hash
@@ -1145,7 +1609,8 @@ final class AppModel {
             }
             let back = willReopenMacSteam ? " Mac Steam comes back by itself." : ""
             if stopped {
-                banner = "Windows Steam closed while it started. Try again. If it happens again, the log in Settings says why."
+                show("Windows Steam closed while it started. Try again. If it closes again, its log says why.", .problem,
+                     action: .init("Show log") { [weak self] in self?.showLogs(of: nil, log: "online") })
                 log.line("online start: Windows Steam quit before it showed a window")
             } else if !shown {
                 banner = "Windows Steam is still starting. Its window shows soon."
@@ -1156,6 +1621,7 @@ final class AppModel {
         } catch {
             banner = "Windows Steam did not start: \(error.localizedDescription)"
             log.line("online start failed: \(error)")
+            onlineSession = nil
         }
         await refreshSteam()
     }
@@ -1165,6 +1631,7 @@ final class AppModel {
     func stopOnline(force: Bool = false) async {
         guard let engine, !onlineBusy, !onlineStep.isRunning else { return }
         onlineForceQuit = nil
+        onlineQuitOffer = nil
         onlineWords = force ? ["Asking the game to close…", "Closing Windows Steam…", "Syncing Steam Cloud saves…"]
                             : ["Closing Windows Steam…", "Syncing Steam Cloud saves…", "This can take a minute"]
         onlineClosing = true
@@ -1182,6 +1649,69 @@ final class AppModel {
             setReopenMacSteam(false)
             if !MacSteam.isRunning { MacSteam.start() }
         }
+    }
+
+    /// A game starts in Windows Steam: its picture rebuilds count from here, and its end is watched.
+    private func beginOnlineSession(_ game: SteamGame) {
+        onlineSession = game
+        if onlineQuitOffer != nil { onlineQuitOffer = nil }
+        onlineGameSeen = false
+        onlineGameLooks = 0
+        onlineGoneLooks = 0
+        onlineRebuilds[game.id] = nil
+        onlineLogRead = OnlineSteam.logEnd()
+    }
+
+    /// Online mode, on each refresh. It counts the picture rebuilds of the game Unwine started, for
+    /// the tip on its page. It also sees when the last game closes while Windows Steam stays open:
+    /// Windows Steam then only uses battery and keeps Mac Steam closed, so Unwine offers to quit it.
+    /// Both take two looks in a row: a game counts once it runs for two looks, so a helper of a moment
+    /// does not; and its end needs two looks without one, so a launcher that hands over to its game,
+    /// or a game that restarts itself, is not the end.
+    private func watchOnlineSession() async {
+        guard !onlineBusy else { return }       // Unwine is opening or closing Windows Steam: the next look counts
+        guard online.running else {
+            if onlineQuitOffer != nil { onlineQuitOffer = nil }
+            if onlineSession != nil || onlineGameSeen || onlineGameLooks > 0 || onlineLogRead != nil {
+                onlineSession = nil
+                onlineGameSeen = false
+                onlineGameLooks = 0
+                onlineGoneLooks = 0
+                onlineLogRead = nil
+            }
+            return
+        }
+        if let game = onlineSession, let from = onlineLogRead {
+            let read = await Task.detached(priority: .utility) { OnlineSteam.pictureRebuilds(since: from) }.value
+            guard !onlineBusy, onlineSession?.id == game.id, onlineLogRead == from else { return }   // a new start began meanwhile
+            onlineLogRead = read.end
+            if read.count > 0 { onlineRebuilds[game.id, default: 0] += read.count }
+        }
+        if online.games > 0 {
+            onlineGoneLooks = 0
+            onlineGameLooks += 1
+            guard onlineGameLooks >= 2 else { return }
+            onlineGameSeen = true
+            if onlineQuitOffer != nil { onlineQuitOffer = nil }     // a game runs again
+        } else {
+            onlineGameLooks = 0
+            guard onlineGameSeen else { return }
+            onlineGoneLooks += 1
+            guard onlineGoneLooks >= 2 else { return }
+            onlineQuitOffer = onlineSession?.name ?? ""
+            onlineGameSeen = false
+            onlineGoneLooks = 0
+            onlineSession = nil         // its count stays for its page; a later game is a new session
+            onlineLogRead = nil
+        }
+    }
+
+    /// High Resolution Mode for Windows Steam's bottle, from a game's page as from Settings. It applies
+    /// the next time Windows Steam starts.
+    func setOnlineHighResolution(_ on: Bool) {
+        stored.onlineHighResolution = on
+        OnlineSteam.highResolution = on
+        save()
     }
 
     /// Gives every closed Windows bottle the font stand-ins (see BottleFonts), once per run.
@@ -1247,11 +1777,14 @@ final class AppModel {
             pendingProfiles.insert(id)
             return
         }
-        let s = settings(for: id)
+        let s = profileSettings(for: id)        // Faster x87 math only where it can work (X87Sidecar.swift)
         let r = renderer(for: id)
         let dir = games.first { $0.id == id }?.installDir
-        do { try Profiles.write(appID: id, settings: s, renderer: r, api: stored.analyses[id]?.api, engine: engine, d3dmetal: d3dmetal, gameDir: dir) }
-        catch { log.line("profile \(id) failed: \(error)") }
+        do {
+            try Profiles.write(appID: id, settings: s, renderer: r, api: stored.analyses[id]?.api, engine: engine, d3dmetal: d3dmetal,
+                               gameDir: dir, battery: s.saveBatteryUnplugged ? batteryOverlayNow : nil)
+        } catch { log.line("profile \(id) failed: \(error)") }
+        prepareBottle(for: id)          // a Steam game's display values and DLSS files (AppModel+Bottles)
     }
 
     func writeAllProfiles() {
@@ -1260,9 +1793,56 @@ final class AppModel {
             pendingProfiles.insert(nil)
         } else {
             let r = Profiles.resolve(stored.defaults.renderer, analysis: nil, hasD3DMetal: d3dmetal != nil)
-            try? Profiles.write(appID: nil, settings: stored.defaults, renderer: r, engine: engine, d3dmetal: d3dmetal)
+            try? Profiles.write(appID: nil, settings: stored.defaults, renderer: r, engine: engine, d3dmetal: d3dmetal,
+                                battery: stored.defaults.saveBatteryUnplugged ? batteryOverlayNow : nil)
         }
-        for id in Set(stored.games.keys).union(stored.analyses.keys) { writeProfile(for: id) }
+        // A game with only launch options has a profile of its own too (AddedGames), which must follow
+        // the engine and the battery overlay like the others.
+        for id in Set(stored.games.keys).union(stored.analyses.keys).union(stored.launchOptions.keys) { writeProfile(for: id) }
+    }
+
+    // MARK: Battery mode
+
+    /// The overlay a game with "Save battery when unplugged" gets now, or nil while the Mac does not
+    /// save battery (plugged in, not in Low Power Mode, not hot).
+    var batteryOverlayNow: BatteryOverlay? {
+        let power = PowerState.shared
+        guard power.savesBattery else { return nil }
+        return BatteryOverlay(strict: power.lowPowerMode || power.thermal == .serious || power.thermal == .critical,
+                              screenHz: Profiles.screenHz)
+    }
+
+    /// Profiles are written again whenever the power changes, so a game started from Mac Steam,
+    /// without Unwine's Play, starts with the right settings too. A running game's bottle keeps its
+    /// profile until it closes (see writeProfile).
+    private func watchPower() {
+        guard !powerWatched else { return }
+        powerWatched = true
+        powerSeen = batteryOverlayNow
+        PowerState.shared.onChange { [weak self] in self?.powerChanged() }
+        watchPowerLevel()
+    }
+
+    /// onChange fires only when saving battery starts or stops. Low Power Mode or heat that comes or
+    /// goes while on battery changes the cap too (60 to 40), so those are watched as well.
+    private func watchPowerLevel() {
+        withObservationTracking {
+            _ = batteryOverlayNow
+        } onChange: { [weak self] in
+            Task { @MainActor in
+                self?.powerChanged()
+                self?.watchPowerLevel()
+            }
+        }
+    }
+
+    private func powerChanged() {
+        let now = batteryOverlayNow
+        guard now != powerSeen else { return }
+        powerSeen = now
+        log.line(now.map { "Saving battery (\($0.strict ? "Low Power Mode or heat" : "on battery")): games without their own cap start at \($0.cap) fps" }
+                 ?? "Not saving battery: games start with their own settings")
+        if runnerReady { writeAllProfiles() }
     }
 
     private func flushProfiles() {
@@ -1275,97 +1855,386 @@ final class AppModel {
 
     // MARK: Updates
 
+    /// Where updates come from. Each keeps the time of its last good check, so one that fails (a
+    /// server that is down) is asked again soon, without the others being asked again too.
+    enum UpdateSource: String, CaseIterable {
+        case kit, engine, app
+    }
+
+    /// Runs at launch, then from the update loop about every 6 hours while Unwine stays open. Each
+    /// source is checked at most once in 20 hours. The first call starts that loop.
     func autoUpdateIfDue() async {
-        guard stored.autoUpdate, showsLibrary else { return }
-        if let last = stored.lastUpdateCheck, Date().timeIntervalSince(last) < 20 * 3600 { return }
-        await checkForUpdates()
+        if updateLoop == nil {
+            startUpdateLoop()
+            // Before any check: a new Unwine that the last run got waits again with no new download,
+            // and the clean-up of Downloads never meets a download.
+            await appUpdater.reclaimStaged()
+            await sweepDownloads()
+        }
+        guard stored.autoUpdate, showsLibrary, !isSettingUp else { return }
+        var due = Set(UpdateSource.allCases.filter { source in
+            guard let last = stored.updateChecked[source.rawValue] ?? stored.lastUpdateCheck else { return true }
+            return Date().timeIntervalSince(last) >= 20 * 3600
+        })
+        // A new engine that waited for power or a normal network goes ahead as soon as it may.
+        if stored.deferredEngine != nil, updateDeferralReason == nil { due.insert(.engine) }
+        if !due.isEmpty { await checkForUpdates(due, automatic: true) }
+    }
+
+    /// The loop that checks for updates while Unwine stays open, and the watch on power and network
+    /// that starts an engine download that waited. Runs once, from the first autoUpdateIfDue.
+    private func startUpdateLoop() {
+        _ = NetworkPath.shared      // starts watching the network now, so the first check knows it
+        updateLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                // During setup it looks every 2 minutes, so the first check comes soon after setup ends.
+                let wait: Duration = (self?.showsLibrary ?? true) ? .seconds(6 * 3600) : .seconds(120)
+                try? await Task.sleep(for: wait, tolerance: .seconds(60))
+                guard let self else { return }
+                await self.sweepDownloads()     // what a setup or an Online setup left since the last look
+                await self.autoUpdateIfDue()
+            }
+        }
+        PowerState.shared.onChange { [weak self] in Task { await self?.fetchDeferredEngineIfAllowed() } }
+        NetworkPath.shared.onChange { [weak self] in Task { await self?.fetchDeferredEngineIfAllowed() } }
+    }
+
+    /// Why a big download that Unwine starts by itself waits now, or nil when it may start.
+    var updateDeferralReason: String? {
+        if let why = PowerState.shared.reason { return why }
+        if NetworkPath.shared.isConstrained { return "Low Data Mode is on" }
+        if NetworkPath.shared.isExpensive { return "Your Mac uses a metered network, such as a phone hotspot" }
+        return nil
+    }
+
+    /// A new engine that waited for power or a normal network. With "Update by itself" on, it downloads
+    /// as soon as the Mac is plugged in on a normal network.
+    func fetchDeferredEngineIfAllowed() async {
+        guard stored.autoUpdate, stored.deferredEngine != nil, showsLibrary, !isCheckingUpdates, updateDeferralReason == nil else { return }
+        await checkForUpdates([.engine], automatic: true)
+    }
+
+    /// Settings' "Update now": fetches a new engine that waited, on battery or a metered network too.
+    func downloadDeferredEngine() async {
+        await checkForUpdates([.engine], automatic: false)
     }
 
     /// Engine, Steam Play files and Unwine itself. Nothing is swapped while a game runs.
     func checkForUpdates() async {
-        guard showsLibrary, !isSettingUp, !isCheckingUpdates else { return }
+        await checkForUpdates(Set(UpdateSource.allCases), automatic: false)
+    }
+
+    /// Checks `sources`. An `automatic` check waits with a big engine download while the Mac saves
+    /// battery or data.
+    private func checkForUpdates(_ sources: Set<UpdateSource>, automatic: Bool) async {
+        guard showsLibrary, !isSettingUp, !isCheckingUpdates, engineSwitching == nil else { return }
         isCheckingUpdates = true
         defer { isCheckingUpdates = false }
         var notes: [String] = []
         var failures = 0
 
         // 1. Steam Play signature files help the add-on match new Steam builds. Only new files are added.
-        do {
-            if let latest = try await SteamPlayKit.latestRelease(), LooseVersion(latest.version) > LooseVersion(stored.kitVersion ?? "0") {
-                try await SteamPlayKit.download(latest, log: log) { _ in }
-                let added = try addNewSignatures(from: latest)
-                stored.kitVersion = latest.version
-                SteamPlayKit.prune(keep: latest)
-                notes.append(added > 0 ? "Steam Play now matches \(added) more Steam version(s)." : "Steam Play files are current.")
+        if sources.contains(.kit) {
+            do {
+                if let latest = try await SteamPlayKit.latestRelease(), LooseVersion(latest.version) > LooseVersion(stored.kitVersion ?? "0") {
+                    // A download and an unpack of minutes: idle sleep would cut them off.
+                    let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled],
+                                                                         reason: "Getting Steam Play files \(latest.version)")
+                    defer { ProcessInfo.processInfo.endActivity(activity) }
+                    try await SteamPlayKit.download(latest, log: log) { _ in }
+                    let added = try addNewSignatures(from: latest)
+                    stored.kitVersion = latest.version
+                    SteamPlayKit.prune(keep: latest)
+                    notes.append(added > 0 ? "Steam Play now matches \(added) more Steam version(s)." : "Steam Play files are current.")
+                }
+                if case .outdated = steamPlay {
+                    notes.append("Steam updated past Steam Play's add-on. A newer add-on comes from NotProton's project; Unwine cannot put it into Steam.app.")
+                }
+                stored.updateChecked[UpdateSource.kit.rawValue] = Date()
+            } catch {
+                failures += 1
+                notes.append("Steam Play check failed: \(error.localizedDescription)")
             }
-            if case .outdated = steamPlay {
-                notes.append("Steam updated past Steam Play's add-on. A newer add-on comes from NotProton's project; Unwine cannot put it into Steam.app.")
-            }
-        } catch {
-            failures += 1
-            notes.append("Steam Play check failed: \(error.localizedDescription)")
         }
 
         // 2. Engine: install side by side; switch only when no game runs and this Unwine can bridge it.
-        do {
-            if let candidate = try await EngineFeed.newest(), candidate.key != engine?.release.key,
-               candidate.id != stored.pendingEngine, stored.stagedEngine == nil {
-                let next = try await EngineStore.install(candidate, log: log) { _ in }
-                if NtdllPatcher.supports(wineLib: next.wineDir.appendingPathComponent("lib/wine")) {
-                    stored.stagedEngine = next.folder
-                    save()
-                    if gameRunning || OnlineSteam.isInUse || !localRunning.isEmpty {
-                        notes.append("New engine \(next.wineVersion) is ready. Unwine switches to it after your games and Windows Steam close.")
-                    } else {
-                        await activateStagedEngine()
-                        notes.append(updateNote ?? "")
-                    }
-                } else {
-                    try? FileManager.default.removeItem(at: next.root)
-                    stored.pendingEngine = candidate.id
-                    notes.append("New engine \(candidate.id) needs a newer Unwine. Your current engine keeps working.")
-                }
+        if sources.contains(.engine) {
+            do {
+                if let note = try await checkEngine(automatic: automatic) { notes.append(note) }
+                stored.updateChecked[UpdateSource.engine.rawValue] = Date()
+            } catch {
+                failures += 1
+                notes.append("Engine check failed: \(error.localizedDescription)")
             }
-        } catch {
-            failures += 1
-            notes.append("Engine check failed: \(error.localizedDescription)")
         }
 
         // 3. Unwine itself (only when an update source is set up).
-        await appUpdater.checkAndStage()
-        if case .failed(let why) = appUpdater.status { notes.append(why) }
+        if sources.contains(.app) {
+            await appUpdater.checkAndStage()
+            if case .failed(let why) = appUpdater.status { notes.append(why) } else { stored.updateChecked[UpdateSource.app.rawValue] = Date() }
+        }
 
-        if failures == 0 { stored.lastUpdateCheck = Date() }
+        // "Last checked" counts once every source had a good check.
+        if failures == 0, UpdateSource.allCases.allSatisfy({ stored.updateChecked[$0.rawValue] != nil }) { stored.lastUpdateCheck = Date() }
         save()
         let text = notes.filter { !$0.isEmpty }.joined(separator: " ")
-        updateNote = text.isEmpty ? "Everything is up to date." : text
+        // A new engine that waits has its own notice with its button, so the note does not say "up to date".
+        let waiting = stored.deferredEngine != nil || stored.heldEngine != nil
+        updateNote = !text.isEmpty ? text : waiting ? nil : "Everything is up to date."
+        isCheckingUpdates = false   // the clean-up waits for checks
+        await sweepDownloads()
     }
 
-    /// Switches to an engine installed by the updater. Keeps the old one for rollback.
-    private func activateStagedEngine() async {
+    /// Looks for a newer engine and installs it side by side. Returns what Settings should say.
+    private func checkEngine(automatic: Bool) async throws -> String? {
+        // A newer Unwine may bridge an engine that an older one could not, so it tries again once.
+        if stored.pendingEngine != nil, stored.pendingSince != appUpdater.currentVersion {
+            stored.pendingEngine = nil
+            stored.pendingRelease = nil
+            stored.pendingSince = nil
+        }
+        await retryHeldEngine()
+        if let staged = stored.stagedEngine, EngineStore.installed().contains(where: { $0.folder == staged }) {
+            return "A new engine is ready. Unwine switches to it after your games and Windows Steam close."
+        }
+        guard let candidate = try await EngineFeed.newest() else { stored.deferredEngine = nil; return nil }
+        let onDisk = EngineStore.installed()
+        let held = onDisk.first { $0.folder == stored.heldEngine?.folder }
+        guard candidate.key != engine?.release.key, candidate.id != stored.pendingEngine, candidate.key != stored.skippedEngine,
+              candidate.key != held?.release.key else {
+            if stored.deferredEngine?.key != candidate.key { stored.deferredEngine = nil }
+            return nil
+        }
+        let copy = onDisk.first { $0.release.key == candidate.key }    // an engine the user went back from earlier
+        // Only a download waits. The deferred-download notice in Settings says so, with its Update now button.
+        if automatic, copy == nil, updateDeferralReason != nil {
+            stored.deferredEngine = candidate
+            return nil
+        }
+        stored.deferredEngine = nil
+        let next: InstalledEngine
+        if let copy {
+            next = copy
+        } else {
+            engineDownload = .downloading(0)
+            defer { engineDownload = nil }
+            next = try await EngineStore.install(candidate, keepArchives: true, log: log) { step in
+                // A late report after the install ended must not bring the progress back.
+                Task { @MainActor in if self.engineDownload != nil { self.engineDownload = step } }
+            }
+        }
+        guard NtdllPatcher.supports(wineLib: next.wineDir.appendingPathComponent("lib/wine")) else {
+            // The archives stay: a newer Unwine installs this engine from them.
+            await removeEngineFolder(next.root)
+            stored.pendingEngine = candidate.id
+            stored.pendingRelease = candidate
+            stored.pendingSince = appUpdater.currentVersion
+            return "New engine \(candidate.id) needs a newer Unwine. Your current engine keeps working."
+        }
+        EngineStore.removeArchives(of: candidate)
+        stored.stagedEngine = next.folder
+        save()
+        let waits = "New engine \(next.wineVersion) is ready. Unwine switches to it after your games and Windows Steam close."
+        if gameRunning || OnlineSteam.isInUse || !localRunning.isEmpty || !localStarting.isEmpty
+            || !steamStarting.isEmpty || bottleProgramsRun { return waits }
+        return await activateStagedEngine() ?? waits     // nil: a game started meanwhile
+    }
+
+    /// An engine held back because a fix did not fit gets one more look after Unwine itself updated:
+    /// the newer Unwine may carry the fix. Then it waits to switch like any new engine.
+    private func retryHeldEngine() async {
+        guard let held = stored.heldEngine else { return }
+        guard let copy = EngineStore.installed().first(where: { $0.folder == held.folder }), let current = engine else {
+            stored.heldEngine = nil     // its folder is gone
+            return
+        }
+        guard held.since != appUpdater.currentVersion, stored.stagedEngine == nil else { return }
+        let log = self.log
+        let missing = await Task.detached(priority: .utility) { () -> [UnwineFix.Kind] in
+            RendererPatches.prepare(engine: copy, log: log)
+            return PatchStatus.lost(from: current, to: copy)
+        }.value
+        if missing.isEmpty {
+            stored.heldEngine = nil
+            stored.stagedEngine = copy.folder
+        } else {
+            stored.heldEngine = HeldEngine(folder: copy.folder, since: appUpdater.currentVersion, missing: missing)
+        }
+        save()
+    }
+
+    /// Switches to an engine installed by the updater. Keeps the old one, so Settings can go back to it.
+    /// When a fix that the current engine has does not fit the new one, it does not switch: the new
+    /// engine waits in Settings, and the user decides. Returns what Settings should say.
+    @discardableResult
+    private func activateStagedEngine() async -> String? {
         guard let folder = stored.stagedEngine,
-              let next = EngineStore.installed().first(where: { $0.folder == folder }) else { stored.stagedEngine = nil; return }
+              let next = EngineStore.installed().first(where: { $0.folder == folder }) else { stored.stagedEngine = nil; return nil }
         // Online mode's bottle runs on the engine itself, so it must be closed as well.
-        guard !Runner.isInUse(), !OnlineSteam.isInUse, localRunning.isEmpty else { return }   // waits for every game
-        do {
+        // An added game that is still starting has no running bottle yet, but it uses the engine already.
+        // So does a Steam game that Steam is starting (Steam runs the tool that the switch rebuilds),
+        // and a program Unwine runs in a game's bottle.
+        guard !Runner.isInUse(), !OnlineSteam.isInUse, localRunning.isEmpty, localStarting.isEmpty,
+              steamStarting.isEmpty, !bottleProgramsRun, engineSwitching == nil else { return nil }   // waits for every game
+        engineSwitching = ["Checking Unwine's fixes on the new engine…"]
+        defer { engineSwitching = nil }
+        let log = self.log
+        let current = engine
+        let missing = await Task.detached(priority: .utility) { () -> [UnwineFix.Kind] in
             RendererPatches.prepare(engine: next, log: log)
-            try await Runner.build(engine: next, d3dmetal: d3dmetal, log: log)
-            stored.previousEngine = engine?.folder
-            stored.activeEngine = next.folder
+            return current.map { PatchStatus.lost(from: $0, to: next) } ?? []
+        }.value
+        if !missing.isEmpty {
             stored.stagedEngine = nil
-            engine = next
-            runnerReady = true
-            writeAllProfiles()
-            EngineStore.prune(keep: [next.folder, stored.previousEngine].compactMap { $0 })
+            await dropHeldEngine(except: next.folder)   // an older held one is of no more use
+            stored.heldEngine = HeldEngine(folder: next.folder, since: appUpdater.currentVersion, missing: missing)
+            save()
+            log.line("Stayed on \(current?.folder ?? "the current engine"): \(next.folder) lacks \(missing.map(\.rawValue).joined(separator: ", "))")
+            return PatchStatus.heldNote(next, missing: missing)
+        }
+        do {
+            try await switchEngine(to: next)
+            stored.stagedEngine = nil
+            stored.skippedEngine = nil
+            await dropHeldEngine(except: next.folder)   // the engine in use now is newer than a held one
             save()
             updateNote = "Engine updated to \(next.wineVersion)."
         } catch {
             log.line("engine switch failed: \(error)")
             stored.stagedEngine = nil
-            try? FileManager.default.removeItem(at: next.root)
+            await removeEngineFolder(next.root)
             save()
             updateNote = "Engine update failed and was undone: \(error.localizedDescription)"
         }
+        return updateNote
+    }
+
+    /// Builds Unwine's Steam tool on `target` and makes it the engine in use. The engine it leaves stays
+    /// one step back, so Settings can go back to it. Callers make sure nothing runs on the engine.
+    private func switchEngine(to target: InstalledEngine) async throws {
+        engineSwitching = ["Getting the engine ready…", "Building Unwine's Steam tool…", "Writing your games' settings…"]
+        let log = self.log
+        await Task.detached(priority: .userInitiated) { RendererPatches.prepare(engine: target, log: log) }.value
+        do {
+            try await Runner.build(engine: target, d3dmetal: d3dmetal, log: log)
+        } catch {
+            // A last small step can fail after the new tool is in place. Then the tool runs on `target`
+            // already, and the switch must count: undoing it would delete the engine the tool uses.
+            guard Runner.record()?.engineFolder == target.folder else { throw error }
+            log.line("Steam tool is on \(target.folder), with a late error: \(error.localizedDescription)")
+        }
+        if let current = engine, current.folder != target.folder { stored.previousEngine = current.folder }
+        stored.activeEngine = target.folder
+        engine = target
+        runnerReady = true
+        writeAllProfiles()
+        save()
+        // Older engines hold thousands of files each, so they go off the main thread.
+        let keep = [target.folder, stored.previousEngine, stored.heldEngine?.folder].compactMap { $0 }
+        await Task.detached(priority: .utility) { EngineStore.prune(keep: keep) }.value
+        log.line("Now on engine \(target.folder)")
+    }
+
+    /// Deletes an engine's folder off the main thread: it holds thousands of files.
+    private func removeEngineFolder(_ root: URL) async {
+        await Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: root) }.value
+    }
+
+    /// Why Unwine cannot switch engines now, or nil when it can. Games, Windows Steam and setup all run
+    /// on the engine, so a switch waits for them.
+    var engineSwitchBlocker: String? {
+        if isSettingUp { return "Setup is running. Wait for it to finish." }
+        if engineSwitching != nil { return "Unwine is switching engines now." }
+        if isCheckingUpdates { return "Unwine is checking for updates. Wait for it to finish." }
+        if let name = startingSteamGame { return "\(name) is starting in Steam. Wait for its window, then quit the game first." }
+        if gameRunning { return "\(closeRunningFirst())." }
+        if !localRunning.isEmpty || !localStarting.isEmpty { return "A game you added is running. Quit it first." }
+        if bottleProgramsRun { return "A program runs in a game's Windows bottle. Close it first." }
+        if online.inUse || onlineBusy || onlineStep.isRunning { return "Windows Steam is open. Quit it first." }
+        return nil
+    }
+
+    /// A program that Unwine starts or runs in a game's Windows bottle (Fix things). It runs on the
+    /// engine too, so an engine switch waits for it.
+    var bottleProgramsRun: Bool { !bottleToolStarting.isEmpty || bottleRuns.values.contains { $0 > 0 } }
+
+    /// The engine one step back, when it is still on disk.
+    var previousEngineInstalled: InstalledEngine? {
+        guard let folder = stored.previousEngine, folder != engine?.folder else { return nil }
+        return EngineStore.installed().first { $0.folder == folder }
+    }
+
+    /// The new engine that waits because a fix does not fit it, when it is still on disk.
+    var heldEngineInstalled: InstalledEngine? {
+        guard let folder = stored.heldEngine?.folder else { return nil }
+        return EngineStore.installed().first { $0.folder == folder }
+    }
+
+    /// Settings' "Go back to …": the engine one step back becomes the one in use again. Updates then
+    /// leave out the engine the user left, until a newer one comes or the user switches back.
+    func goBackToPreviousEngine() async {
+        guard let target = previousEngineInstalled, let from = engine else { return }
+        guard engineSwitchBlocker == nil, !Runner.isInUse(), !OnlineSteam.isInUse else {
+            updateNote = engineSwitchBlocker ?? "A game is running. Quit it first."
+            return
+        }
+        defer { engineSwitching = nil }
+        stored.stagedEngine = nil   // the user picked this engine: a waiting one must not switch away from it
+        do {
+            try await switchEngine(to: target)
+            // Going back to the engine left before means the user wants it again: updates may offer it.
+            stored.skippedEngine = stored.skippedEngine == target.release.key ? nil : from.release.key
+            stored.deferredEngine = nil
+            save()
+            updateNote = "Unwine uses \(target.label) again. Games use it the next time they start."
+        } catch {
+            log.line("going back to \(target.folder) failed: \(error)")
+            updateNote = "Unwine could not go back to \(target.label): \(error.localizedDescription) Your engine did not change."
+        }
+    }
+
+    /// Settings' "Use it anyway" for a held engine: the user switches without the fix that does not fit.
+    func useHeldEngine() async {
+        guard let held = stored.heldEngine, let target = heldEngineInstalled else { stored.heldEngine = nil; save(); return }
+        guard engineSwitchBlocker == nil, !Runner.isInUse(), !OnlineSteam.isInUse else {
+            updateNote = engineSwitchBlocker ?? "A game is running. Quit it first."
+            return
+        }
+        defer { engineSwitching = nil }
+        stored.heldEngine = nil     // it becomes the engine in use, so prune must not keep it as held
+        stored.stagedEngine = nil   // the user picked this engine: a waiting one must not switch away from it
+        do {
+            try await switchEngine(to: target)
+            stored.skippedEngine = nil
+            save()
+            updateNote = "Engine updated to \(target.wineVersion). If a game breaks, go back to the old engine in Engine rollback."
+        } catch {
+            log.line("engine switch failed: \(error)")
+            stored.heldEngine = held
+            save()
+            updateNote = "Unwine could not switch to \(target.label): \(error.localizedDescription) Your engine did not change."
+        }
+    }
+
+    /// Forgets the held engine and deletes its folder, unless it is `folder` or in use.
+    private func dropHeldEngine(except folder: String) async {
+        guard let held = stored.heldEngine, held.folder != folder else { return }
+        stored.heldEngine = nil
+        if held.folder != engine?.folder, held.folder != stored.previousEngine,
+           let copy = EngineStore.installed().first(where: { $0.folder == held.folder }) {
+            await removeEngineFolder(copy.root)
+        }
+    }
+
+    /// Settings' "Delete it" for a held engine. Updates then leave that engine out.
+    func deleteHeldEngine() async {
+        guard engineSwitching == nil else { return }
+        let copy = heldEngineInstalled
+        stored.heldEngine = nil
+        if let copy { stored.skippedEngine = copy.release.key }
+        save()
+        if let copy { await removeEngineFolder(copy.root) }
+        updateNote = "The new engine is deleted. Unwine keeps your current engine, and updates do not get that engine again."
     }
 
     private func addNewSignatures(from release: SteamPlayKitRelease) throws -> Int {
@@ -1385,6 +2254,7 @@ final class AppModel {
     // MARK: Persistence
 
     func load() {
+        loaded = true
         guard let data = try? Data(contentsOf: Self.storeURL) else { return }
         if let s = try? JSONDecoder.unwine.decode(StoredState.self, from: data) {
             stored = s

@@ -29,9 +29,29 @@ struct GameAnalysis: Codable, Sendable, Equatable {
     /// The `GameAnalyzer.version` that made this. Nil on analyses saved before versions existed,
     /// so those count as out of date.
     var analyzerVersion: Int?
+    /// The game ships NVIDIA's DLSS (nvngx_dlss.dll), so MetalFX can take its place.
+    var hasDLSS = false
+    /// `GameAnalyzer.fingerprint` of the game when it was read. A new one means the game changed.
+    var fingerprint: String? = nil
 
     /// False when a newer Unwine detects more than the one that made this, so it is worth redoing.
     var isCurrent: Bool { analyzerVersion == GameAnalyzer.version }
+}
+
+extension GameAnalysis {
+    /// Fields added later decode with a default, so an analysis saved by an older Unwine still reads.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        api = try c.decode(GraphicsAPI.self, forKey: .api)
+        is64Bit = try c.decode(Bool.self, forKey: .is64Bit)
+        mainExe = try c.decodeIfPresent(String.self, forKey: .mainExe)
+        antiCheat = try c.decode([String].self, forKey: .antiCheat)
+        engine = try c.decodeIfPresent(String.self, forKey: .engine)
+        analyzedAt = try c.decode(Date.self, forKey: .analyzedAt)
+        analyzerVersion = try c.decodeIfPresent(Int.self, forKey: .analyzerVersion)
+        hasDLSS = (try? c.decodeIfPresent(Bool.self, forKey: .hasDLSS)) ?? false
+        fingerprint = try? c.decodeIfPresent(String.self, forKey: .fingerprint)
+    }
 }
 
 /// One clue to an anti-cheat in the name of a file or folder inside a game.
@@ -68,7 +88,54 @@ private extension Character {
 
 enum GameAnalyzer {
     /// Bump when detection changes, so games analysed by an older Unwine are looked at again.
-    static let version = 3
+    /// 4: DLSS, and the fingerprint that replaced the 7-day timer.
+    static let version = 4
+
+    /// What changes when the game changes: Steam's build id (the appmanifest's "buildid") for a Steam
+    /// game, the program's size and date for one added by its .exe. Nil when neither can be read.
+    /// One small file read or one file check, so it is cheap enough for every library visit.
+    static func fingerprint(appID: Int, steamapps: URL, exe: URL?) -> String? {
+        if let exe {
+            // Read fresh: URL.resourceValues keeps the first answer on the URL object.
+            guard let a = try? FileManager.default.attributesOfItem(atPath: exe.path),
+                  let size = (a[.size] as? NSNumber)?.int64Value, let date = a[.modificationDate] as? Date else { return nil }
+            return "exe:\(size):\(Int64(date.timeIntervalSince1970 * 1000))"
+        }
+        guard let app = VDF.parse(contentsOf: steamapps.appendingPathComponent("appmanifest_\(appID).acf"))?["AppState"] else { return nil }
+        if let build = app["buildid"]?.string, !build.isEmpty, build != "0" { return "build:\(build)" }
+        // Very old manifests have no build id; Steam still stamps each update.
+        if let updated = app["LastUpdated"]?.string, !updated.isEmpty, updated != "0" { return "updated:\(updated)" }
+        return nil
+    }
+
+    /// NVIDIA's DLSS file. Games keep it beside the program, or deep in an Unreal plugin folder
+    /// (Engine/Plugins/Runtime/Nvidia/DLSS/Binaries/ThirdParty/Win64), deeper than the main walk goes.
+    private static let dlssFile = "nvngx_dlss.dll"
+
+    /// Plugin folders are walked this deep, and only for the DLSS file.
+    private static let maxPluginLevel = 12
+
+    /// An Unreal game added by its Project/Binaries/Win64 program: the DLSS plugin sits in the game's
+    /// top folder, three levels up, next to the Engine folder that every packaged Unreal game has.
+    private static func unrealRoot(above dir: URL) -> URL? {
+        let parts = dir.standardizedFileURL.pathComponents.map { $0.lowercased() }
+        guard parts.count > 5, parts.suffix(2) == ["binaries", "win64"] else { return nil }
+        let root = dir.deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return FileManager.default.fileExists(atPath: root.appendingPathComponent("Engine").path) ? root : nil
+    }
+
+    /// Looks for the DLSS file anywhere under `root`, but not in folders of game content, saves or videos.
+    private static func findsDLSS(under root: URL) -> Bool {
+        guard let walker = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey],
+                                                         options: [.skipsHiddenFiles]) else { return false }
+        let skip: Set<String> = ["content", "saved", "movies", "paks", "redist", "_commonredist"]
+        for case let url as URL in walker {
+            let lower = url.lastPathComponent.lowercased()
+            if lower == dlssFile { return true }
+            if skip.contains(lower) || walker.level > maxPluginLevel { walker.skipDescendants() }
+        }
+        return false
+    }
 
     /// Names of files and folders that give away an anti-cheat that no Wine tool on macOS can be sure
     /// to satisfy. Files alone never prove a game is blocked: the Advisor turns a hit into a warning.
@@ -133,13 +200,23 @@ enum GameAnalyzer {
         var hasSource2EngineDLL = false
         var hasGameInfo = false
         var hasShaderAPIDX9 = false
+        var hasDLSS = false
+        var pluginFolders: [String] = []    // paths of the "Plugins" folders seen, each ending in "/"
 
         let keys: [URLResourceKey] = [.fileSizeKey, .isDirectoryKey]
         if let walker = fm.enumerator(at: installDir, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) {
             for case let url as URL in walker {
                 let level = walker.level
-                if level > 5 { walker.skipDescendants(); continue }
                 let lower = url.lastPathComponent.lowercased()
+                if lower == "plugins" { pluginFolders.append(url.path + "/") }
+                if level > 5 {
+                    // Deeper than this only plugin folders count, and only for the DLSS file.
+                    if lower == dlssFile { hasDLSS = true }
+                    if level > maxPluginLevel || (lower != "plugins" && !pluginFolders.contains { url.path.hasPrefix($0) }) {
+                        walker.skipDescendants()
+                    }
+                    continue
+                }
                 let ext = url.pathExtension.lowercased()
                 for marker in antiCheatMarkers where marker.matches(lower, extension: ext) { antiCheat.insert(marker.name) }
                 if ext == "exe" {
@@ -156,6 +233,7 @@ enum GameAnalyzer {
                     case "engine.dll": if parents == ["bin"] || parents == ["bin", "win64"] { hasSourceEngineDLL = true }
                     case "engine2.dll": if parents.suffix(2) == ["bin", "win64"] { hasSource2EngineDLL = true }
                     case "shaderapidx9.dll": hasShaderAPIDX9 = true
+                    case dlssFile: hasDLSS = true
                     default: break
                     }
                     if level <= 4, rendererNeedles.contains(where: { lower.contains($0) }), !isInRedist(parents) {
@@ -173,6 +251,7 @@ enum GameAnalyzer {
             if hasSource2EngineDLL { engine = "Source 2" }
             else if hasSourceEngineDLL && (hasGameInfo || hasShaderAPIDX9) { engine = "Source" }
         }
+        if !hasDLSS, let root = unrealRoot(above: installDir) { hasDLSS = findsDLSS(under: root) }
 
         // The biggest real executable is almost always the game.
         exes.sort { $0.size > $1.size }
@@ -218,6 +297,6 @@ enum GameAnalyzer {
 
         let main = candidates.first.map { String($0.url.path.dropFirst(installDir.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/")) }
         return GameAnalysis(api: api, is64Bit: is64, mainExe: main, antiCheat: antiCheat.sorted(), engine: engine,
-                            analyzedAt: Date(), analyzerVersion: version)
+                            analyzedAt: Date(), analyzerVersion: version, hasDLSS: hasDLSS)
     }
 }

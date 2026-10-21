@@ -32,6 +32,7 @@ struct Advice: Equatable, Sendable {
     var tips: [Tip]                     // warnings first, then fixes, then good-to-know
     var online: OnlineVerdict
     var source: String                  // who the advice comes from, for the UI to credit
+    var needsGPTK = false               // D3DMetal would run this game, but GPTK is not added yet
 }
 
 typealias OnlineVerdict = Advice.OnlineVerdict
@@ -82,8 +83,11 @@ enum Advisor {
 
         // 60 fps divides 60 and 120 Hz screens and stays smooth for action games.
         let cap = 60
-        // MetalFX reaches a game only through DLSS, and only D3DMetal and DXMT pass that on.
+        // MetalFX reaches a game only through DLSS, and only D3DMetal and DXMT pass that on. On DXMT the
+        // switch also makes the game see an NVIDIA card, which DXMT says not to leave on for every game,
+        // so the battery set turns it on only when the game ships DLSS.
         let upscales = (api == .dx11 || api == .dx12) && (renderer == .d3dmetal || renderer == .dxmt)
+            && analysis?.hasDLSS == true
         // DXMT and DXVK take a cap from Unwine. D3DMetal does from GPTK 4. WineD3D, older D3DMetal and
         // DirectX 12 on the DXVK layer (Wine's own DirectX 12 draws there, not DXVK) have nothing Unwine
         // can set, so the battery set leaves the cap off there.
@@ -91,6 +95,10 @@ enum Advisor {
         var battery = performance
         battery.metalFX = upscales
         battery.fpsCap = canCap ? cap : nil
+        // Ray tracing is the largest GPU cost in the games that use it, and Apple's default is on from M3.
+        if renderer == .d3dmetal { battery.rayTracing = false }
+        // DXMT's tessellation (extra triangles for fine surface detail) up to 16x, not 64x.
+        if renderer == .dxmt && api == .dx11 { battery.maxTessFactor = 16 }
 
         let (online, onlineTips) = onlineAdvice(appID: appID, title: title, analysis: analysis, highball: highball)
         var tips = onlineTips
@@ -116,11 +124,12 @@ enum Advisor {
         }
         if battery.fpsCap == nil {
             let why = renderer == .wined3d ? "Unwine has no frame cap for WineD3D."
-                                           : "Frame caps need GPTK 4. Yours is older, so Unwine cannot cap the frame rate with D3DMetal."
+                : renderer == .dxvk ? "Wine's own DirectX 12 part draws this game, and Unwine cannot cap it."
+                : "Frame caps need GPTK 4. Yours is older, so Unwine cannot cap the frame rate with D3DMetal."
             tips.append(Tip(kind: .info, text: "\(why) If the game has its own frame limit, use that to save battery."))
         }
         if battery.metalFX {
-            tips.append(Tip(kind: .info, text: "The battery settings turn on MetalFX for DLSS. It only does something when the game offers DLSS, so set the game to DLSS for the gain."))
+            tips.append(Tip(kind: .info, text: "This game has DLSS. Best battery turns on MetalFX for DLSS. Set the game to DLSS to get the gain."))
         }
         if let summary = digest?.summary {
             tips.append(Tip(kind: .info, text: "Highball notes: \(summary)", link: highball?.url))
@@ -129,7 +138,7 @@ enum Advisor {
         let base = analysis != nil ? "Unwine's file check" : "Unwine's default"
         let source = pick.fromHighball ? "Highball database (CC0)" : (highball != nil ? "\(base) and Highball database (CC0)" : base)
         return Advice(renderer: renderer, rendererReason: reason, performance: performance, battery: battery,
-                      tips: inOrder(tips), online: online, source: source)
+                      tips: inOrder(tips), online: online, source: source, needsGPTK: pick.needsGPTK)
     }
 
     /// Warnings first, then fixes, then good-to-know. Each group keeps the order it was added in.
@@ -160,6 +169,7 @@ enum Advisor {
         var renderer: Renderer
         var reason: String
         var fromHighball: Bool
+        var needsGPTK = false       // D3DMetal is the better layer, and only a GPTK import is missing
     }
 
     /// Highball's suggested layer wins, unless it is unusable here. Then the game's own files decide.
@@ -183,9 +193,10 @@ enum Advisor {
         case "d3dmetal":
             let is64 = analysis?.is64Bit ?? true
             if hasD3DMetal && is64 { return Pick(renderer: .d3dmetal, reason: said("D3DMetal"), fromHighball: true) }
-            let why = hasD3DMetal ? "this game is 32-bit and D3DMetal runs 64-bit games only"
-                                  : "Apple's Game Porting Toolkit is not added yet"
-            return Pick(renderer: byFiles.renderer, reason: "Highball suggests D3DMetal, but \(why). Unwine uses \(byFiles.renderer.title) instead.", fromHighball: false)
+            let why = is64 ? "Apple's Game Porting Toolkit is not added yet"
+                           : "this game is 32-bit and D3DMetal runs 64-bit games only"
+            return Pick(renderer: byFiles.renderer, reason: "Highball suggests D3DMetal, but \(why). Unwine uses \(byFiles.renderer.title) instead.",
+                        fromHighball: false, needsGPTK: is64)
         default:
             return byFiles
         }
@@ -209,14 +220,18 @@ enum Advisor {
     private static func rendererFromFiles(api: GraphicsAPI, analysis: GameAnalysis?, hasD3DMetal: Bool) -> Pick {
         let renderer = Profiles.resolve(.auto, analysis: analysis, hasD3DMetal: hasD3DMetal)
         let reason: String
+        var needsGPTK = false
         switch api {
         case .dx12:
+            // DXVK has no DirectX 12. On its layer, Wine's own DirectX 12 part (vkd3d) draws over Vulkan.
+            let fallback = "Wine's own DirectX 12 part tries to run it over Vulkan, because DXVK has no DirectX 12. The game may run slowly or not start."
             if renderer == .d3dmetal {
                 reason = "DirectX 12 game. D3DMetal is Apple's layer for it."
-            } else if hasD3DMetal {
-                reason = "DirectX 12 game, but it is 32-bit and D3DMetal runs 64-bit games only. DXVK runs it through Vulkan."
+            } else if analysis?.is64Bit == false {
+                reason = "DirectX 12 game, but it is 32-bit, and D3DMetal runs 64-bit games only. \(fallback)"
             } else {
-                reason = "DirectX 12 game. D3DMetal is not added yet, so DXVK runs it through Vulkan."
+                reason = "DirectX 12 game. Apple's D3DMetal runs it best. It comes in GPTK 4, which is not added yet. Until then, \(fallback)"
+                needsGPTK = true
             }
         case .dx11: reason = "DirectX 11 game. DXMT translates it straight to Metal."
         case .dx10: reason = "DirectX 10 game. DXMT handles DirectX 10 and 11."
@@ -229,7 +244,7 @@ enum Advisor {
                 ? "Unwine has not looked inside this game yet, so it starts with DXMT. That suits most games."
                 : "Unwine could not tell which graphics API this game uses, so it starts with DXMT. That suits most games."
         }
-        return Pick(renderer: renderer, reason: reason, fromHighball: false)
+        return Pick(renderer: renderer, reason: reason, fromHighball: false, needsGPTK: needsGPTK)
     }
 
     // MARK: Online play
@@ -594,4 +609,25 @@ enum HighballNotes {
             return zip(head, head.dropFirst()).contains { $0 == "not" && $1 == "playable" }
         }
     }
+}
+
+// MARK: - This Mac
+
+/// The Mac's chip as the kernel names it ("Apple M4 Pro"). Apple's ray tracing default follows it.
+enum MacChip {
+    static let name: String? = {
+        var size = 0
+        guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0, size > 1 else { return nil }
+        var buffer = [CChar](repeating: 0, count: size)
+        guard sysctlbyname("machdep.cpu.brand_string", &buffer, &size, nil, 0) == 0 else { return nil }
+        let text = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        return text.hasPrefix("Apple M") ? text : nil
+    }()
+
+    /// The chip's generation: 4 for an M4 Pro. Nil when the name does not say.
+    static let generation: Int? = name.flatMap { Int($0.dropFirst("Apple M".count).prefix { $0.isNumber }) }
+
+    /// D3DMetal turns DirectX ray tracing on by default from M3, the first chips with ray tracing in
+    /// hardware, and off on M1 and M2 (Apple's GPTK Read Me).
+    static var raysByDefault: Bool? { generation.map { $0 >= 3 } }
 }

@@ -87,9 +87,32 @@ enum HighballDB {
     private static let retryAfter: TimeInterval = 600
 
     private static let cacheURL = Paths.support.appendingPathComponent("Cache/highball-games.json")
+    /// The server's tag for the cached file (its ETag). Sent back with the next request, so a list
+    /// that did not change costs one short answer instead of the whole file again.
+    private static let tagURL = Paths.support.appendingPathComponent("Cache/highball-games.etag")
 
     /// Highball's entry for a Steam app, from the cached file. Safe from any thread.
     static func game(_ appID: Int) -> HighballGame? { index.games[appID] }
+
+    /// Highball's entry for a game by its title, for games added by their .exe. Letter case, accents,
+    /// punctuation, ™ and ®, a leading "The" and Roman numbers do not count (see GameTitles.key). A
+    /// title that two games share finds nothing: Unwine does not guess. Safe from any thread.
+    static func game(title: String) -> HighballGame? { index.titleTables.game(title: title) }
+
+    /// How many games the cached list holds, those without a Steam app id too. Safe from any thread.
+    static var gameCount: Int { index.count }
+
+    /// When Unwine last got the list, or last heard that it had not changed: the cache file's date.
+    static var updatedAt: Date? {
+        (try? FileManager.default.attributesOfItem(atPath: cacheURL.path))?[.modificationDate] as? Date
+    }
+
+    enum Refresh: Equatable, Sendable {
+        case updated(Int)       // a new list, with this many games
+        case unchanged          // Highball's list is the one Unwine has
+        case failed(String)
+        case notNeeded          // the copy is new enough, or the last try was a moment ago
+    }
 
     /// Downloads the database when the cached copy is missing, unreadable or older than three days.
     /// The old copy stays in place unless the new one passes `parse`, so any failure is harmless.
@@ -97,18 +120,33 @@ enum HighballDB {
     /// retry wait, so a timer can call it often. Returns true only when it wrote a new cache file.
     @discardableResult
     static func refreshIfStale(log: LogFile? = nil) async -> Bool {
-        guard isStale, await throttle.allow(every: retryAfter) else { return false }
+        if case .updated = await refresh(force: false, log: log) { return true }
+        return false
+    }
+
+    /// Asks Highball for the list. `force` (Settings' Refresh now) skips the age check and the retry wait.
+    static func refresh(force: Bool, log: LogFile? = nil) async -> Refresh {
+        if !force { guard isStale, await throttle.allow(every: retryAfter) else { return .notNeeded } }
         do {
-            let data = try await download()
+            // Only a readable copy may be kept on "not changed".
+            let tag = index.games.isEmpty ? nil : (try? String(contentsOf: tagURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let fresh = try await download(tag: tag.flatMap { $0.isEmpty ? nil : $0 }) else {
+                // The date of the copy says when Unwine last made sure it is current.
+                try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: cacheURL.path)
+                log?.line("Highball database unchanged")
+                return .unchanged
+            }
+            let (data, newTag) = fresh
             guard let games = parse(data) else { throw RefreshError.notADatabase }
             try Paths.ensure(cacheURL.deletingLastPathComponent())
             try data.write(to: cacheURL, options: .atomic)
-            index.set(byAppID(games))
+            if let newTag { try? newTag.write(to: tagURL, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: tagURL) }
+            index.set(games)
             log?.line("Highball database refreshed: \(games.count) games")
-            return true
+            return .updated(games.count)
         } catch {
             log?.line("Highball database not refreshed: \(error.localizedDescription)")
-            return false
+            return .failed(error.localizedDescription)
         }
     }
 
@@ -123,34 +161,87 @@ enum HighballDB {
         return age < 0 || age > maxAge || index.games.isEmpty
     }
 
-    /// Parsed once, then kept. `refreshIfStale` replaces it after writing a new file.
+    /// Parsed once, then kept. `refresh` replaces it after writing a new file. The title tables are
+    /// built on the first title lookup, so a library of Steam games never pays for them.
     private final class Index: @unchecked Sendable {
         private let lock = NSLock()
-        private var cached: [Int: HighballGame]?
+        private var list: [HighballGame]?
+        private var byAppID: [Int: HighballGame] = [:]
+        private var titles: Titles?
 
         var games: [Int: HighballGame] {
             lock.lock(); defer { lock.unlock() }
-            if let cached { return cached }
-            let loaded = HighballDB.loadFromDisk()
-            cached = loaded
-            return loaded
+            loadIfNeeded()
+            return byAppID
         }
 
-        func set(_ games: [Int: HighballGame]) {
+        /// All games in the list, those without a Steam app id too.
+        var count: Int {
             lock.lock(); defer { lock.unlock() }
-            cached = games
+            loadIfNeeded()
+            return list?.count ?? 0
+        }
+
+        var titleTables: Titles {
+            lock.lock(); defer { lock.unlock() }
+            loadIfNeeded()
+            if let titles { return titles }
+            let made = Titles(list ?? [])
+            titles = made
+            return made
+        }
+
+        func set(_ games: [HighballGame]) {
+            lock.lock(); defer { lock.unlock() }
+            use(games)
+        }
+
+        private func loadIfNeeded() {
+            if list == nil { use(HighballDB.loadFromDisk()) }
+        }
+
+        private func use(_ games: [HighballGame]) {
+            list = games
+            byAppID = Dictionary(games.compactMap { game in game.appID.map { ($0, game) } }, uniquingKeysWith: { first, _ in first })
+            titles = nil
         }
     }
 
     private static let index = Index()
 
-    private static func loadFromDisk() -> [Int: HighballGame] {
-        guard let data = try? Data(contentsOf: cacheURL), let games = parse(data) else { return [:] }
-        return byAppID(games)
+    private static func loadFromDisk() -> [HighballGame] {
+        guard let data = try? Data(contentsOf: cacheURL), let games = parse(data) else { return [] }
+        return games
     }
 
-    private static func byAppID(_ games: [HighballGame]) -> [Int: HighballGame] {
-        Dictionary(games.compactMap { game in game.appID.map { ($0, game) } }, uniquingKeysWith: { first, _ in first })
+    /// The games by title keys (see GameTitles.key).
+    private struct Titles {
+        /// Whole titles.
+        var whole: [String: HighballGame] = [:]
+        /// Titles without their "(...)" part, or cut before a numbered subtitle, where no whole title
+        /// has that key.
+        var loose: [String: HighballGame] = [:]
+
+        init(_ games: [HighballGame]) {
+            var whole: [String: [HighballGame]] = [:]
+            var loose: [String: [HighballGame]] = [:]
+            for game in games {
+                if let key = GameTitles.key(game.title) { whole[key, default: []].append(game) }
+                for key in GameTitles.looseKeys(game.title) { loose[key, default: []].append(game) }
+            }
+            // A key that two games share would be a guess, so it finds nothing.
+            self.whole = whole.compactMapValues { $0.count == 1 ? $0[0] : nil }
+            self.loose = loose.filter { whole[$0.key] == nil }.compactMapValues { $0.count == 1 ? $0[0] : nil }
+        }
+
+        /// The whole title first, then the title's own looser forms against whole titles. Two loose
+        /// forms are never matched with each other: that would join "Star Wars: A" and "Star Wars: B".
+        func game(title: String) -> HighballGame? {
+            guard !whole.isEmpty, let key = GameTitles.key(title) else { return nil }
+            if let game = whole[key] ?? loose[key] { return game }
+            for form in GameTitles.looseKeys(title) { if let game = whole[form] { return game } }
+            return nil
+        }
     }
 
     // MARK: Parsing
@@ -213,10 +304,13 @@ enum HighballDB {
     private static let throttle = Throttle()
 
     /// Reads at most `maxBytes`, counted after decompression, so a bad server cannot fill memory.
-    private static func download() async throws -> Data {
+    /// With the cached copy's `tag`, a list that has not changed returns nil (the server's 304).
+    /// Otherwise it returns the file and its new tag.
+    private static func download(tag: String?) async throws -> (Data, String?)? {
         var request = URLRequest(url: source, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.setValue("Unwine", forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let tag { request.setValue(tag, forHTTPHeaderField: "If-None-Match") }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForResource = 60
         config.waitsForConnectivity = false   // fail fast offline; the next launch tries again
@@ -224,15 +318,16 @@ enum HighballDB {
         defer { session.invalidateAndCancel() }
 
         let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw DownloadError.http((response as? HTTPURLResponse)?.statusCode ?? -1, source)
-        }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if status == 304, tag != nil { return nil }
+        guard let http = response as? HTTPURLResponse, status == 200 else { throw DownloadError.http(status, source) }
         guard response.expectedContentLength <= Int64(maxBytes) else { throw RefreshError.tooLarge }
         var data = Data()
+        data.reserveCapacity(Int(max(0, min(response.expectedContentLength, Int64(maxBytes)))))
         for try await byte in bytes {
             data.append(byte)
             if data.count > maxBytes { throw RefreshError.tooLarge }
         }
-        return data
+        return (data, http.value(forHTTPHeaderField: "ETag"))
     }
 }

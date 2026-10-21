@@ -11,9 +11,44 @@ struct LocalGameRecord: Codable, Equatable, Sendable {
     /// The added game whose Windows bottle this one uses. Programs from one game folder share a
     /// bottle, as on Windows they share one registry: a launcher's settings then reach the game.
     var bottleOf: Int? = nil
+    /// The game folder the user picked, when the program sits deeper in it (bin/x64). Unwine reads the
+    /// game's files from here, so anti-cheat and engine clues in the top folders count too.
+    var rootPath: String? = nil
+    var lastPlayed: Date? = nil
+    var playtimeMinutes = 0             // while its bottle ran after Play, in whole minutes
+    /// The program's own name from its version info (ProductName), for Highball advice.
+    var productName: String? = nil
+    /// The Steam app id in a steam_appid.txt next to the program, for Highball advice.
+    var steamAppID: Int? = nil
+    /// The program file that `productName`, `steamAppID` and the icon in Covers were read from. Nil
+    /// until Unwine reads them; a program that moved is read again.
+    var productRead: String? = nil
+    /// A picture the user chose for the game: a file name in Unwine's Covers folder.
+    var cover: String? = nil
 
     var folder: URL { URL(fileURLWithPath: exePath).deletingLastPathComponent().standardizedFileURL }
+    /// Where the game's own files start: the folder the user picked, else the program's folder.
+    var root: URL { rootPath.map { URL(fileURLWithPath: $0, isDirectory: true).standardizedFileURL } ?? folder }
     var bottle: Int { bottleOf ?? id }
+}
+
+extension LocalGameRecord {
+    /// Fields added after Unwine 1.0.2 decode with a default, so older libraries keep every game.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        exePath = try c.decode(String.self, forKey: .exePath)
+        addedAt = try c.decode(Date.self, forKey: .addedAt)
+        bottleOf = try? c.decodeIfPresent(Int.self, forKey: .bottleOf)
+        rootPath = try? c.decodeIfPresent(String.self, forKey: .rootPath)
+        lastPlayed = try? c.decodeIfPresent(Date.self, forKey: .lastPlayed)
+        playtimeMinutes = (try? c.decodeIfPresent(Int.self, forKey: .playtimeMinutes)) ?? 0
+        productName = try? c.decodeIfPresent(String.self, forKey: .productName)
+        steamAppID = try? c.decodeIfPresent(Int.self, forKey: .steamAppID)
+        productRead = try? c.decodeIfPresent(String.self, forKey: .productRead)
+        cover = try? c.decodeIfPresent(String.self, forKey: .cover)
+    }
 }
 
 enum LocalGamesError: LocalizedError {
@@ -22,7 +57,9 @@ enum LocalGamesError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .missing(let path): return "The game's file is gone from \(path). Add it again from where it is now."
+        // Adding it again would make a second entry with a new, empty bottle. The failed-start banner
+        // and the game's page both have Locate….
+        case .missing(let path): return "Its program is not in \(path) now. Press Locate… and pick it where it is now. Its bottle and saves stay."
         case .bottle(let why): return "Unwine could not make the game's Windows bottle: \(why)"
         }
     }
@@ -36,12 +73,25 @@ enum LocalGames {
     static func isLocal(_ id: Int) -> Bool { id >= idBase }
 
     /// The game as the library shows it. Its bottle is LocalGames/compatdata/<id>/pfx, the same
-    /// layout as Steam's, so the bottle checks and "Fresh bottle" work for it too.
+    /// layout as Steam's, so the bottle checks and "Fresh bottle" work for it too. Its install folder
+    /// is the game folder the user picked, so the file check reads the whole game.
     static func game(from r: LocalGameRecord) -> SteamGame {
-        let exe = URL(fileURLWithPath: r.exePath)
-        return SteamGame(id: r.id, name: r.name, installDir: exe.deletingLastPathComponent(), steamapps: root,
-                         sizeOnDisk: 0, state: .installed, lastPlayed: nil, isWindowsBuild: true, localExe: exe,
-                         bottleID: r.bottleOf)
+        SteamGame(id: r.id, name: r.name, installDir: r.root, steamapps: root,
+                  sizeOnDisk: 0, state: .installed, lastPlayed: r.lastPlayed, isWindowsBuild: true,
+                  localExe: URL(fileURLWithPath: r.exePath), bottleID: r.bottleOf,
+                  playtimeMinutes: r.playtimeMinutes > 0 ? r.playtimeMinutes : nil, addedAt: r.addedAt)
+    }
+
+    /// Steam's own order (last played first, then by name), with the added games in it.
+    static func inLibraryOrder(_ games: [SteamGame]) -> [SteamGame] {
+        games.sorted {
+            switch ($0.lastPlayed, $1.lastPlayed) {
+            case let (a?, b?): return a > b
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            }
+        }
     }
 
     /// True when a program's file lies inside an added game's bottle (an installer put it there).
@@ -83,8 +133,6 @@ enum LocalGames {
         // its files, registry entries and helpers are there.
         if let host = records.first(where: { isInside(exe, bottle: $0.bottle) }) { return host }
         let dir = exe.deletingLastPathComponent().standardizedFileURL.pathComponents
-        // Folders that hold many unrelated things are never one game's folder.
-        let shelves: Set<String> = ["documents", "desktop", "downloads", "applications", "games", "steamapps", "common", "volumes"]
         let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.pathComponents
         func near(_ a: [String], _ b: [String]) -> Bool {
             let (short, long) = a.count <= b.count ? (a, b) : (b, a)
@@ -94,44 +142,109 @@ enum LocalGames {
         return records.first { near($0.folder.pathComponents, dir) }
     }
 
-    /// A readable name from the game's folder ("Romance_of_X_14" becomes "Romance of X 14").
-    static func suggestedName(for exe: URL) -> String {
-        // Folders like bin, x64 or Binaries say nothing about the game: look further up.
-        let generic: Set<String> = ["bin", "bin32", "bin64", "x64", "x86", "win32", "win64", "binaries", "game", "games",
-                                    "release", "retail", "shipping", "debug", "system", "data", "downloads", "desktop", "documents"]
-        var dir = exe.deletingLastPathComponent()
-        for _ in 0..<3 where generic.contains(dir.lastPathComponent.lowercased()) { dir = dir.deletingLastPathComponent() }
-        let folder = dir.lastPathComponent
-        let base = folder.isEmpty || folder == "/" || generic.contains(folder.lowercased())
-            ? exe.deletingPathExtension().lastPathComponent : folder
-        return base.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces)
+    /// Folders that hold many unrelated things are never one game's folder.
+    static let shelves: Set<String> = ["documents", "desktop", "downloads", "applications", "games", "steamapps", "common", "volumes"]
+
+    // A new game's name comes from LocalGames.defaultName (GameTitles.swift): its folder, past
+    // generic ones such as bin, Program Files and drive_c, else the program's ProductName.
+
+    /// The game's top folder, from the folder the user picked: that folder, or for a folder of many
+    /// games (Games, Downloads, a whole drive) the folder in it that holds the program. Nil when that
+    /// is the program's own folder (nothing more to read), or when the program is not inside it.
+    static func gameRoot(for exe: URL, picked: URL?) -> URL? {
+        guard let picked else { return nil }
+        // Folder listings hand back resolved paths (/private/var for /var), so both sides are resolved.
+        var root = picked.resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        let dir = exe.deletingLastPathComponent().resolvingSymlinksInPath().standardizedFileURL.pathComponents
+        guard dir.count >= root.count, Array(dir.prefix(root.count)) == root else { return nil }
+        let home = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.pathComponents
+        if root.count <= home.count || shelves.contains(root.last?.lowercased() ?? "") {
+            guard dir.count > root.count else { return nil }
+            root = Array(dir.prefix(root.count + 1))
+        }
+        guard root.count < dir.count else { return nil }
+        return URL(fileURLWithPath: NSString.path(withComponents: root), isDirectory: true)
+    }
+
+    /// The game folder after the program moved: the same folder if the program is still in it, or the
+    /// folder that now holds the program at the same place inside (the whole game moved).
+    static func movedRoot(of record: LocalGameRecord, to exe: URL) -> URL? {
+        // With no folder picked, the old program's folder is the game's: a program deeper in it (the
+        // game in bin/x64, after its launcher) keeps it.
+        guard record.rootPath != nil else { return gameRoot(for: exe, picked: record.folder) }
+        let old = record.root.path + "/"
+        let path = exe.standardizedFileURL.path
+        if path.hasPrefix(old) { return gameRoot(for: exe, picked: record.root) }
+        let inside = URL(fileURLWithPath: record.exePath).standardizedFileURL.path
+        guard inside.hasPrefix(old), path.hasSuffix("/" + inside.dropFirst(old.count)) else { return nil }
+        let moved = URL(fileURLWithPath: String(path.dropLast(inside.count - old.count + 1)), isDirectory: true)
+        return gameRoot(for: exe, picked: moved)
+    }
+
+    /// True when a program's name says it installs something (setup, install). An uninstaller is not one.
+    static func looksLikeInstaller(_ exe: URL) -> Bool {
+        let n = exe.lastPathComponent.lowercased()
+        return !n.contains("unins") && (n.contains("setup") || n.contains("install"))
     }
 
     static func logName(_ id: Int) -> String { "local-\(id).log" }
 
-    /// The .exe files in a game folder (and one level down), the likeliest game first: installers,
-    /// uninstallers, crash reporters and redistributables last, then bigger files before smaller.
-    static func programs(in folder: URL) -> [(url: URL, size: Int64)] {
+    /// The .exe files in a game folder and three folders down (an Unreal game keeps its program in
+    /// Game/Binaries/Win64), the likeliest game first. Mac apps and a bottle's own Windows folder are
+    /// skipped. Walks folders, so call it off the main thread.
+    static func programs(in folder: URL, depth maxDepth: Int = 3) -> [(url: URL, size: Int64)] {
         let fm = FileManager.default
         var found: [(url: URL, size: Int64)] = []
         func scan(_ dir: URL, depth: Int) {
-            guard let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
+            guard found.count < 2000,
+                  let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
                                                           options: [.skipsHiddenFiles]) else { return }
             for item in items {
                 let values = try? item.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey])
                 if values?.isDirectory == true {
-                    if depth < 1 { scan(item, depth: depth + 1) }
+                    let name = item.lastPathComponent.lowercased()
+                    let skip = name.hasSuffix(".app") || (name == "windows" && dir.lastPathComponent.lowercased() == "drive_c")
+                    if depth < maxDepth && !skip { scan(item, depth: depth + 1) }
                 } else if item.pathExtension.lowercased() == "exe" {
                     found.append((item, Int64(values?.fileSize ?? 0)))
                 }
             }
         }
         scan(folder, depth: 0)
-        let unlikely = ["unins", "setup", "install", "redist", "vcredist", "dxsetup", "crash", "report", "dotnet", "directx", "uninst"]
+        return Array(ranked(found).prefix(200))
+    }
+
+    /// Programs in likeliest-game order: installers, uninstallers, crash reporters, helpers and
+    /// redistributables last, then bigger files before smaller.
+    static func ranked(_ found: [(url: URL, size: Int64)]) -> [(url: URL, size: Int64)] {
+        let unlikely = ["unins", "setup", "install", "redist", "vcredist", "dxsetup", "crash", "report", "dotnet", "directx", "uninst",
+                        "helper", "prereq", "cefprocess", "easyanticheat", "beservice", "be_service", "touchup", "updater"]
         func score(_ u: URL) -> Int { unlikely.contains { u.lastPathComponent.lowercased().contains($0) } ? 1 : 0 }
         return found.sorted { a, b in
             score(a.url) != score(b.url) ? score(a.url) < score(b.url) : a.size > b.size
         }
+    }
+
+    /// Every .exe an installer can have put in a bottle: in Program Files, the other folders on its
+    /// C: drive (GOG Games) and the user's AppData/Local/Programs, but not in Windows' own folders.
+    /// Walks folders, so call it off the main thread.
+    static func installedPrograms(in pfx: URL) -> Set<String> {
+        let fm = FileManager.default
+        let drive = pfx.appendingPathComponent("drive_c", isDirectory: true)
+        var tops = ((try? fm.contentsOfDirectory(at: drive, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])) ?? [])
+            .filter { !["windows", "users", "programdata"].contains($0.lastPathComponent.lowercased()) }
+        for user in (try? fm.contentsOfDirectory(at: drive.appendingPathComponent("users"), includingPropertiesForKeys: nil)) ?? [] {
+            tops.append(user.appendingPathComponent("AppData/Local/Programs", isDirectory: true))
+        }
+        var found = Set<String>()
+        for top in tops {
+            guard let walk = fm.enumerator(at: top, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) else { continue }
+            for case let url as URL in walk {
+                if walk.level > 5 || found.count > 5000 { walk.skipDescendants(); continue }
+                if url.pathExtension.lowercased() == "exe" { found.insert(url.standardizedFileURL.path) }
+            }
+        }
+        return found
     }
 
     static func prefix(_ game: SteamGame) -> URL { game.compatData.appendingPathComponent("pfx", isDirectory: true) }
@@ -139,9 +252,10 @@ enum LocalGames {
     static func isRunning(_ game: SteamGame) -> Bool { OnlineSteam.serverIsAlive(prefix(game)) }
 
     /// The variables the game starts with: the engine's base, the game's Unwine profile on top,
-    /// and the Vulkan driver (the Steam path takes it from the runner's engine.env).
+    /// and the Vulkan driver (the Steam path takes it from the runner's engine.env). Logs are quiet
+    /// unless the game's Detailed logs is on: its profile then sets the detailed levels.
     static func environment(engine: InstalledEngine, prefix: URL, profile: URL) -> [String: String] {
-        var env = WineEnvironment.base(engine: engine, prefix: prefix, debug: true)
+        var env = WineEnvironment.base(engine: engine, prefix: prefix, debug: false)
         if let text = try? String(contentsOf: profile, encoding: .utf8) {
             for (key, raw) in OnlineSteam.profileAssignments(text) {
                 if let value = OnlineSteam.shellWord(raw, env: env) { env[key] = value }
@@ -150,42 +264,77 @@ enum LocalGames {
         let vulkan = RendererPatches.vulkanICD(engine: engine).path
         env["VK_DRIVER_FILES"] = vulkan
         env["VK_ICD_FILENAMES"] = vulkan
+        // Wine's menu builder writes Linux menu entries and icons into ~/.local/share for every
+        // installer. A Mac never reads them, so it is off, as in Online mode. The game's own DLL
+        // overrides stay.
+        env["WINEDLLOVERRIDES"] = LaunchOptions.overrides(env["WINEDLLOVERRIDES"], adding: "winemenubuilder.exe=d")
         return env
     }
 
-    /// Starts the game. On its first start, makes the bottle first (a minute or two under Rosetta);
-    /// `phase` names each step for the waiting screen. Returns when the game process has started.
-    static func start(_ game: SteamGame, engine: InstalledEngine, profile: URL, log: LogFile,
+    /// `env` without Faster x87 math, for the wineboot that makes a bottle. wineboot starts 32-bit
+    /// programs too, and x87sidecar would attach to them: macOS could then ask for the password while
+    /// only a bottle is made. The game itself starts with it.
+    static func withoutX87(_ env: [String: String]) -> [String: String] {
+        env.filter { !X87Sidecar.variables.contains($0.key) }
+    }
+
+    /// Starts the game with `arguments` after its program's name. On its first start, makes the bottle
+    /// first: a clone of the engine's template from `template` (which builds it once if needed), else
+    /// with wineboot (about 25 s under Rosetta). `phase` names each step for the waiting screen.
+    /// Returns when the game process has started; with `watchInstalls`, it returns the programs that
+    /// were in the bottle just before (to find what an installer adds).
+    @discardableResult
+    static func start(_ game: SteamGame, engine: InstalledEngine, profile: URL, arguments: [String] = [], log: LogFile,
+                      template: (@MainActor () async -> URL?)? = nil, watchInstalls: Bool = false,
                       phase: @escaping @MainActor (String) -> Void,
-                      onExit: @escaping @Sendable (Int32) -> Void) async throws {
+                      onExit: @escaping @Sendable (Int32) -> Void) async throws -> Set<String>? {
         guard let exe = game.localExe, FileManager.default.fileExists(atPath: exe.path) else {
             throw LocalGamesError.missing(game.localExe?.deletingLastPathComponent().path ?? game.name)
         }
         let pfx = prefix(game)
         try Paths.ensure(game.compatData)
-        var env = environment(engine: engine, prefix: pfx, profile: profile)
 
+        // A folder that is there without a registry may hold files: wineboot finishes it in place.
+        if !FileManager.default.fileExists(atPath: pfx.path), let template {
+            await phase(BottleTemplate.ready(engine) == nil ? "Setting up Windows once for your added games…" : "Making a Windows bottle for this game…")
+            if let source = await template() {
+                await phase("Making a Windows bottle for this game…")
+                do { try await BottleTemplate.clone(source, to: pfx, log: log) }
+                catch { log.line("Could not copy the bottle template, so Wine makes the bottle: \(error.localizedDescription)") }
+            }
+        }
         if !FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) {
             await phase("Making a Windows bottle for this game…")
             log.line("Making the bottle for \(game.name)")
+            let boot = withoutX87(environment(engine: engine, prefix: pfx, profile: profile))
             do {
-                try await Shell.run(engine.wine, ["wineboot", "--init"], env: env, log: log)
-                try await Shell.run(engine.wineserver, ["-w"], env: env, log: log, check: false)
+                try await Shell.run(engine.wine, ["wineboot", "--init"], env: boot, log: log)
+                try await Shell.run(engine.wineserver, ["-w"], env: boot, log: log, check: false)
             } catch {
                 // A half-made bottle would be used as it is next time: it goes to the Trash.
-                _ = try? await Shell.run(engine.wineserver, ["-k"], env: env, log: log, check: false)
+                _ = try? await Shell.run(engine.wineserver, ["-k"], env: boot, log: log, check: false)
                 try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
-                throw LocalGamesError.bottle("Wine stopped while it set up the bottle. Press Play to try again; if it fails again, Show logs on the game's page says why.")
+                // The failed-start banner's Show logs opens this game's log.
+                throw LocalGamesError.bottle("Wine stopped while it set up the bottle. Press Play to try again. If it fails again, press Show logs: the game's log says why.")
             }
             guard FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) else {
                 try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
-                throw LocalGamesError.bottle("Wine made no bottle. Press Play to try again; Show logs on the game's page says why.")
+                throw LocalGamesError.bottle("Wine made no bottle. Press Play to try again. If it fails again, press Show logs: the game's log says why.")
             }
             BottleFonts.ensure(prefix: pfx)
         }
 
-        // Read the profile again now: the user may have changed settings while the bottle was made.
-        env = environment(engine: engine, prefix: pfx, profile: profile)
+        // Read the profile now: the user may have changed settings while the bottle was made.
+        var env = environment(engine: engine, prefix: pfx, profile: profile)
+        // The game's Display choices (and, for D3DMetal, Apple's DLSS files) go into the closed bottle
+        // now: Wine reads them when the game starts. An open bottle keeps what it has (BottlePrep).
+        _ = await BottlePrep.apply(profile: profile, prefix: pfx, engine: engine, game: game.name, log: log, announce: phase)
+        // A bottle that is open already (a Wine tool, the game's launcher) keeps its server's msync.
+        // BottlePrep's regedit runs with the profile's own msync, so a server it leaves matches it.
+        if let live = BottleTools.serverMsync(pfx), live != env["WINEMSYNC"] {
+            log.line("The bottle is open with msync \(live == "1" ? "on" : "off"), so the game uses that until the bottle closes")
+            env["WINEMSYNC"] = live
+        }
         // The game runs from an app bundle that says "game", so macOS can give it Game Mode. A
         // bundle is only rebuilt while the bottle is closed: running processes use its files.
         await phase("Starting \(game.name)…")
@@ -196,12 +345,15 @@ enum LocalGames {
             loader = GameModeBundle.matches(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name)
                 ? GameModeBundle.loader(bundle) : engine.wine
         } else {
-            loader = GameModeBundle.ensure(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name, log: log)
-                ?? engine.wine
+            loader = GameModeBundle.ensure(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name,
+                                           icon: ArtCache.iconFile(game.id), log: log) ?? engine.wine
         }
         env["WINELOADER"] = loader.path
-        log.line("Starting \(exe.path) from \(loader == engine.wine ? "the engine" : "its Game Mode app")")
-        _ = try Shell.spawn(loader, [exe.path], env: env, cwd: exe.deletingLastPathComponent(), log: log, onExit: onExit)
+        let before = watchInstalls ? installedPrograms(in: pfx) : nil
+        log.line("Starting \(exe.path) from \(loader == engine.wine ? "the engine" : "its Game Mode app")"
+                 + (arguments.isEmpty ? "" : " with \(arguments.count) launch option\(arguments.count == 1 ? "" : "s")"))
+        _ = try Shell.spawn(loader, [exe.path] + arguments, env: env, cwd: exe.deletingLastPathComponent(), log: log, onExit: onExit)
+        return before
     }
 
     /// Ends everything running in the game's bottle.
@@ -222,8 +374,13 @@ enum LocalGames {
 enum GameModeBundle {
     static func loader(_ bundle: URL) -> URL { bundle.appendingPathComponent("Contents/MacOS/wine") }
 
-    private static func info(bundleID: String, name: String) -> Data {
+    /// The icon a bundle shows in the Dock and Command-Tab: the game program's own, made when the
+    /// bundle is built. An icon that turns up later waits for the next build.
+    private static let iconName = "game.icns"
+
+    static func info(bundleID: String, name: String, icon: Bool) -> Data {
         let safe = name.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
+        let iconKey = icon ? "\t<key>CFBundleIconFile</key>\n\t<string>\(iconName)</string>\n" : ""
         return Data("""
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -231,7 +388,7 @@ enum GameModeBundle {
             <dict>
             \t<key>CFBundleExecutable</key>
             \t<string>wine</string>
-            \t<key>CFBundleIdentifier</key>
+            \(iconKey)\t<key>CFBundleIdentifier</key>
             \t<string>\(bundleID)</string>
             \t<key>CFBundleInfoDictionaryVersion</key>
             \t<string>6.0</string>
@@ -271,9 +428,11 @@ enum GameModeBundle {
         let fm = FileManager.default
         let source = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
         let macOS = bundle.appendingPathComponent("Contents/MacOS", isDirectory: true)
+        // With or without an icon: an icon alone is no reason to build the bundle again.
+        let plist = try? Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))
         guard let want = try? fm.contentsOfDirectory(atPath: source.path), want.contains("wine"),
               let have = try? fm.contentsOfDirectory(atPath: macOS.path),
-              (try? Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))) == info(bundleID: bundleID, name: name)
+              plist == info(bundleID: bundleID, name: name, icon: false) || plist == info(bundleID: bundleID, name: name, icon: true)
         else { return false }
         let all = links(engine)
         guard Set(have) == Set(want).union(all.compactMap { $0.path.hasPrefix("Contents/MacOS/") ? String($0.path.dropFirst(15)) : nil })
@@ -292,7 +451,8 @@ enum GameModeBundle {
 
     /// The bundle's loader, building the bundle first when it is missing or out of date. Nil when
     /// it cannot be built; the caller then starts Wine from the engine (no Game Mode).
-    static func ensure(engine: InstalledEngine, bundle: URL, bundleID: String, name: String, log: LogFile) -> URL? {
+    /// `icon` is the PNG of the game program's icon; the bundle gets it as an .icns when it is built.
+    static func ensure(engine: InstalledEngine, bundle: URL, bundleID: String, name: String, icon: URL? = nil, log: LogFile) -> URL? {
         if matches(engine: engine, bundle: bundle, bundleID: bundleID, name: name) { return loader(bundle) }
         let fm = FileManager.default
         let source = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
@@ -301,7 +461,14 @@ enum GameModeBundle {
         do {
             let macOS = stage.appendingPathComponent("Contents/MacOS", isDirectory: true)
             try Paths.ensure(macOS)
-            try info(bundleID: bundleID, name: name).write(to: stage.appendingPathComponent("Contents/Info.plist"))
+            // Without an icon the Dock shows a blank app; a failed icon only costs the icon.
+            var hasIcon = false
+            if let icon, fm.fileExists(atPath: icon.path) {
+                let resources = try Paths.ensure(stage.appendingPathComponent("Contents/Resources", isDirectory: true))
+                hasIcon = ExeIcon.writeICNS(from: icon, to: resources.appendingPathComponent(iconName))
+                if !hasIcon { log.line("Could not make the Dock icon for \(name), so its app has none") }
+            }
+            try info(bundleID: bundleID, name: name, icon: hasIcon).write(to: stage.appendingPathComponent("Contents/Info.plist"))
             for file in try fm.contentsOfDirectory(atPath: source.path) {
                 let from = source.appendingPathComponent(file), to = macOS.appendingPathComponent(file)
                 if clonefile(from.path, to.path, 0) != 0 { try fm.copyItem(at: from, to: to) }

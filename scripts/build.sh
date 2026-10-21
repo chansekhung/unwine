@@ -3,8 +3,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION="${VERSION:-1.0.3}"
-BUILD="${BUILD:-4}"
+# The version comes from CHANGELOG.md, so no version ships without its "What's new" entry: the
+# newest "## 1.0.3 · …" heading is the version, and the number of headings is the build number.
+VERSION="$(awk '/^## [0-9]/ { print $2; exit }' CHANGELOG.md)"
+BUILD="$(grep -c '^## [0-9]' CHANGELOG.md)"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "✗ CHANGELOG.md needs a heading such as \"## 1.0.4 · not released yet\" at the top"; exit 1; }
+awk '/^## [0-9]/ { n++; next } n == 1 && /^- / { found = 1 } END { exit !found }' CHANGELOG.md \
+  || { echo "✗ CHANGELOG.md: write what changed under \"## $VERSION\" first, one \"- \" line for each change"; exit 1; }
 APP="dist/Unwine.app"
 
 # The macOS 27 SDK turns SwiftUI's @State into a compiler plugin that the Command Line
@@ -12,7 +17,7 @@ APP="dist/Unwine.app"
 for sdk in /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk /Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk; do
   [ -d "$sdk" ] && { export SDKROOT="$sdk"; break; }
 done
-echo "▸ Compiling (SDK: ${SDKROOT:-default})"
+echo "▸ Compiling Unwine $VERSION ($BUILD) (SDK: ${SDKROOT:-default})"
 swift build -c release --arch arm64
 BIN="$(swift build -c release --arch arm64 --show-bin-path)/Unwine"
 
@@ -32,6 +37,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Unwine"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp CHANGELOG.md "$APP/Contents/Resources/CHANGELOG.md"     # the "What's new" window reads it
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -55,6 +61,16 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
   <key>NSHumanReadableCopyright</key><string>Free software (GPL-3.0). Wine is LGPL. Steam is Valve's.</string>
   <key>NSDownloadsFolderUsageDescription</key><string>Unwine looks for Apple's Game Porting Toolkit file you downloaded, to add GPTK.</string>
+  <!-- "Open With > Unwine" and a drop on the Dock icon add a Windows program as a game. -->
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key><string>Windows program</string>
+      <key>CFBundleTypeRole</key><string>Viewer</string>
+      <key>LSHandlerRank</key><string>Alternate</string>
+      <key>LSItemContentTypes</key><array><string>com.microsoft.windows-executable</string></array>
+    </dict>
+  </array>
   <key>UnwineUpdateRepo</key><string>${UNWINE_UPDATE_REPO:-chansekhung/unwine}</string>
 </dict>
 </plist>

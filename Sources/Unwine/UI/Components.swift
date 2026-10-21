@@ -77,12 +77,16 @@ struct PlayTip: Shape {
 struct UnwineMark: View {
     var progress: Double?
     var size: CGFloat = 88
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         Group {
-            // Known progress only redraws when it changes. Only the "working" light needs a clock.
+            // Known progress only redraws when it changes. Only the "working" light needs a clock,
+            // and with Reduce Motion on it stands still.
             if let progress {
                 mark(progress: progress, t: 0)
+            } else if reduceMotion {
+                mark(progress: nil, t: nil)
             } else {
                 TimelineView(Motion.schedule) { timeline in mark(progress: nil, t: timeline.date.timeIntervalSinceReferenceDate) }
             }
@@ -90,7 +94,7 @@ struct UnwineMark: View {
         .accessibilityLabel(progress.map { "Progress \(Int($0 * 100)) percent" } ?? "Working")
     }
 
-    private func mark(progress: Double?, t: Double) -> some View {
+    private func mark(progress: Double?, t: Double?) -> some View {
         let line = max(2, size / 14)
         let lit = LinearGradient(colors: [Palette.glow, .white], startPoint: .leading, endPoint: .trailing)
         return ZStack {
@@ -100,11 +104,15 @@ struct UnwineMark: View {
                     .stroke(lit, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
                     .animation(.easeInOut(duration: 0.4), value: progress)
                 PlayTip().fill(Color.white.opacity(0.25 + 0.75 * progress))
-            } else {
+            } else if let t {
                 let head = (t * 0.45).truncatingRemainder(dividingBy: 1.25)
                 CoilShape().trim(from: max(0, head - 0.25), to: min(1, head))
                     .stroke(lit, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round))
                 PlayTip().fill(Color.white.opacity(0.55 + 0.35 * (0.5 + 0.5 * sin(t * 2.4))))
+            } else {
+                // Still "working" for Reduce Motion: the whole coil softly lit, the play button half on.
+                CoilShape().stroke(lit, style: StrokeStyle(lineWidth: line, lineCap: .round, lineJoin: .round)).opacity(0.55)
+                PlayTip().fill(Color.white.opacity(0.7))
             }
         }
         .shadow(color: Palette.glow.opacity(0.55), radius: size / 14)
@@ -118,6 +126,7 @@ struct UnwineMark: View {
 struct ProgressTrack: View {
     var progress: Double?
     var height: CGFloat = 6
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         GeometryReader { geo in
@@ -128,6 +137,11 @@ struct ProgressTrack: View {
                         .fill(LinearGradient(colors: [Palette.accent, Palette.glow], startPoint: .leading, endPoint: .trailing))
                         .frame(width: max(height, geo.size.width * min(max(progress, 0), 1)))
                         .animation(.easeOut(duration: 0.35), value: progress)
+                } else if reduceMotion {
+                    // Unknown progress with Reduce Motion: a still light that fades out to the right,
+                    // instead of a travelling one. A full, even bar would read as "done".
+                    Capsule().fill(LinearGradient(colors: [Palette.accent.opacity(0.6), Palette.glow.opacity(0.08)],
+                                                  startPoint: .leading, endPoint: .trailing))
                 } else {
                     TimelineView(Motion.schedule) { tl in
                         let t = tl.date.timeIntervalSinceReferenceDate
@@ -152,13 +166,16 @@ struct ProgressTrack: View {
 struct PhaseWords: View {
     let words: [String]
     var interval: Double = 2.6
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
+        // The words still change with Reduce Motion on, because they say what happens; they fade
+        // instead of sliding in.
         TimelineView(.periodic(from: .now, by: interval)) { tl in
             let i = words.isEmpty ? 0 : Int(tl.date.timeIntervalSinceReferenceDate / interval) % words.count
             Text(words.isEmpty ? "" : words[i])
                 .id(i)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
+                .transition(reduceMotion ? .opacity : .opacity.combined(with: .move(edge: .bottom)))
                 .animation(.easeInOut(duration: 0.35), value: i)
         }
     }
@@ -190,7 +207,17 @@ enum Motion {
 // MARK: - Skeleton shimmer for art that is still loading
 
 struct Shimmer: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
+        if reduceMotion {
+            Palette.card        // a still skeleton
+        } else {
+            shimmer
+        }
+    }
+
+    private var shimmer: some View {
         TimelineView(Motion.schedule) { tl in
             let t = tl.date.timeIntervalSinceReferenceDate
             GeometryReader { geo in
@@ -239,12 +266,13 @@ struct StatusPill: View {
     let text: String
     let color: Color
     var pulsing = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         HStack(spacing: 7) {
             Circle().fill(color).frame(width: 7, height: 7)
                 .overlay {
-                    if pulsing {
+                    if pulsing && !reduceMotion {
                         TimelineView(Motion.schedule) { tl in
                             let s = 1 + (tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 1.4) / 1.4) * 1.6
                             Circle().stroke(color.opacity(2 - s), lineWidth: 1.5).scaleEffect(s)

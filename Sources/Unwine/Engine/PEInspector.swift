@@ -17,6 +17,209 @@ enum PEInspector {
         return Info(is64Bit: image.is64Bit, imports: image.imports(in: file))
     }
 
+    /// What a program says about itself in its resources: its name and its icon.
+    struct Resources {
+        /// ProductName from each language of the version info, English first. Empty when it has none.
+        var productNames: [String] = []
+        /// FileDescription, in the language of the first product name.
+        var fileDescription: String?
+        /// Every picture of the program's own icon: the first icon group, the one Windows Explorer shows.
+        var icons: [IconPicture] = []
+    }
+
+    /// One picture of an icon, as the file holds it: a PNG file, or a Windows bitmap (a DIB, with its
+    /// transparency mask after the colours).
+    struct IconPicture {
+        let width: Int
+        let height: Int
+        let bitCount: Int
+        let isPNG: Bool
+        let data: [UInt8]
+    }
+
+    /// Reads the version info and, with `icons`, the program's own icon. Nil when the file is not a
+    /// Windows program or holds no resources. Reads only the small blocks it needs, so a 200 MB .exe
+    /// costs a few reads.
+    static func resources(_ url: URL, icons wantIcons: Bool = true) -> Resources? {
+        guard let file = RandomAccessFile(url), let image = Image(file), image.directories.count > 2 else { return nil }
+        let entry = image.directories[2]
+        guard entry.rva != 0, entry.size > 0, let base = image.fileOffset(ofRVA: entry.rva, fileSize: file.size) else { return nil }
+        let tree = ResourceTree(file: file, image: image, base: base)
+        let types = tree.entries(at: 0)
+        func type(_ id: Int) -> ResourceTree.Entry? { types.first { $0.id == id && $0.isDirectory } }
+
+        var result = Resources()
+        if let version = type(16), let bytes = tree.firstData(under: version, limit: 256 * 1024) {
+            (result.productNames, result.fileDescription) = VersionInfo.read(bytes)
+        }
+        // Explorer shows the first icon group, so that is the program's own icon.
+        if wantIcons, let groups = type(14), let pictures = type(3),
+           let group = tree.entries(at: groups.offset).first,
+           let directory = tree.firstData(under: group, limit: 64 * 1024) {
+            result.icons = iconPictures(directory, pictures: tree.entries(at: pictures.offset), tree: tree)
+        }
+        return result
+    }
+
+    /// The pictures an icon group lists. Each is an RT_ICON resource, found by its number.
+    private static func iconPictures(_ group: [UInt8], pictures: [ResourceTree.Entry], tree: ResourceTree) -> [IconPicture] {
+        guard le16(group, 0) == 0, le16(group, 2) == 1, let count = le16(group, 4) else { return [] }
+        var result: [IconPicture] = []
+        var budget = 16 * 1024 * 1024
+        for index in 0..<min(count, 64) {
+            let o = 6 + index * 14
+            guard o + 14 <= group.count, let listedBits = le16(group, o + 6), let id = le16(group, o + 12) else { break }
+            guard let entry = pictures.first(where: { $0.id == id }),
+                  let data = tree.firstData(under: entry, limit: min(budget, 8 * 1024 * 1024)) else { continue }
+            budget -= data.count
+            // The group says 0 for 256 pixels; the picture itself knows its real size. A damaged
+            // picture can claim any size, so sizes stop at 65536 and width times height cannot overflow.
+            let listed = (w: group[o] == 0 ? 256 : Int(group[o]), h: group[o + 1] == 0 ? 256 : Int(group[o + 1]))
+            let cap = 1 << 16
+            if data.starts(with: [0x89, 0x50, 0x4E, 0x47]) {
+                let w = be32(data, 16) ?? listed.w, h = be32(data, 20) ?? listed.h
+                result.append(IconPicture(width: min(w, cap), height: min(h, cap), bitCount: 32, isPNG: true, data: data))
+            } else if let w = le32(data, 4), let h2 = le32(data, 8), let bits = le16(data, 14) {
+                // A DIB's height counts the colours and the mask, so it is twice the picture's height.
+                let h = abs(Int(Int32(truncatingIfNeeded: h2))) / 2
+                result.append(IconPicture(width: min(w, cap), height: min(h > 0 ? h : listed.h, cap),
+                                          bitCount: bits > 0 ? bits : listedBits, isPNG: false, data: data))
+            }
+            if budget <= 0 { break }
+        }
+        return result
+    }
+
+    private static func be32(_ b: [UInt8], _ o: Int) -> Int? {
+        guard o >= 0, o + 4 <= b.count else { return nil }
+        return Int(b[o]) << 24 | Int(b[o + 1]) << 16 | Int(b[o + 2]) << 8 | Int(b[o + 3])
+    }
+
+    /// The resource directory: a tree of type, then name or number, then language, then the data.
+    /// Every offset in it counts from the start of the tree.
+    private struct ResourceTree {
+        struct Entry {
+            let id: Int?            // nil for an entry with a name instead of a number
+            let offset: Int
+            let isDirectory: Bool
+        }
+
+        let file: RandomAccessFile
+        let image: Image
+        let base: Int
+
+        /// The entries of the directory at `offset`. Named entries come first, as in the file.
+        func entries(at offset: Int) -> [Entry] {
+            guard offset >= 0, let head = file.read(16, at: base + offset), head.count == 16,
+                  let named = PEInspector.le16(head, 12), let numbered = PEInspector.le16(head, 14) else { return [] }
+            let count = min(named + numbered, 2048)
+            guard count > 0, let table = file.read(count * 8, at: base + offset + 16) else { return [] }
+            var result: [Entry] = []
+            for index in 0..<min(count, table.count / 8) {
+                guard let name = PEInspector.le32(table, index * 8), let target = PEInspector.le32(table, index * 8 + 4) else { break }
+                result.append(Entry(id: name & 0x8000_0000 != 0 ? nil : name & 0xFFFF,
+                                    offset: target & 0x7FFF_FFFF, isDirectory: target & 0x8000_0000 != 0))
+            }
+            return result
+        }
+
+        /// The first piece of data under `entry`, down through the name and language levels. The
+        /// depth limit keeps a damaged file that loops back on itself from looping here.
+        func firstData(under entry: Entry, limit: Int, depth: Int = 0) -> [UInt8]? {
+            guard entry.isDirectory else { return data(at: entry.offset, limit: limit) }
+            guard depth < 3 else { return nil }
+            for child in entries(at: entry.offset) {
+                if let found = firstData(under: child, limit: limit, depth: depth + 1) { return found }
+            }
+            return nil
+        }
+
+        /// A data entry holds the RVA and the size of the bytes. Nil when they are larger than `limit`.
+        private func data(at offset: Int, limit: Int) -> [UInt8]? {
+            guard let entry = file.read(16, at: base + offset), let rva = PEInspector.le32(entry, 0),
+                  let size = PEInspector.le32(entry, 4), size > 0, size <= limit,
+                  let at = image.fileOffset(ofRVA: rva, fileSize: file.size),
+                  let bytes = file.read(size, at: at), bytes.count == size else { return nil }
+            return bytes
+        }
+    }
+
+    /// VS_VERSION_INFO: blocks of (length, value length, type, UTF-16 key, value, child blocks), each
+    /// part on a 4-byte boundary. Its StringFileInfo holds one table of names per language.
+    private enum VersionInfo {
+        struct Block {
+            let start: Int
+            let end: Int
+            let key: String
+            let valueStart: Int
+            let childStart: Int
+        }
+
+        static func read(_ b: [UInt8]) -> (products: [String], description: String?) {
+            guard let root = block(b, at: 0, end: b.count), root.key == "VS_VERSION_INFO" else { return ([], nil) }
+            var tables: [(language: Int, strings: [String: String])] = []
+            for info in children(b, of: root) where info.key == "StringFileInfo" {
+                for table in children(b, of: info) {
+                    var strings: [String: String] = [:]
+                    for item in children(b, of: table) where item.key == "ProductName" || item.key == "FileDescription" {
+                        if let text = text(b, item), !text.isEmpty { strings[item.key] = text }
+                    }
+                    tables.append((Int(table.key.prefix(4), radix: 16) ?? 0, strings))
+                }
+            }
+            // US English first, then any English, then the order of the file.
+            func rank(_ language: Int) -> Int { language == 0x0409 ? 0 : (language & 0x3FF == 0x09 ? 1 : 2) }
+            let ordered = tables.enumerated().sorted { (rank($0.element.language), $0.offset) < (rank($1.element.language), $1.offset) }.map(\.element)
+            var products: [String] = []
+            for table in ordered { if let p = table.strings["ProductName"], !products.contains(p) { products.append(p) } }
+            let description = ordered.first { $0.strings["ProductName"] != nil }?.strings["FileDescription"]
+                ?? ordered.lazy.compactMap { $0.strings["FileDescription"] }.first
+            return (products, description)
+        }
+
+        private static func align(_ o: Int) -> Int { (o + 3) & ~3 }
+
+        static func block(_ b: [UInt8], at start: Int, end limit: Int) -> Block? {
+            guard let length = PEInspector.le16(b, start), length >= 6, let valueLength = PEInspector.le16(b, start + 2),
+                  let type = PEInspector.le16(b, start + 4) else { return nil }
+            let end = min(start + length, limit)
+            var o = start + 6
+            var units: [UInt16] = []
+            while o + 2 <= end, units.count < 64, let unit = PEInspector.le16(b, o) {
+                o += 2
+                if unit == 0 { break }
+                units.append(UInt16(unit))
+            }
+            let valueStart = align(o)
+            // Text values count UTF-16 units, binary ones bytes.
+            let childStart = align(valueStart + (type == 1 ? valueLength * 2 : valueLength))
+            return Block(start: start, end: end, key: String(decoding: units, as: UTF16.self), valueStart: valueStart, childStart: childStart)
+        }
+
+        static func children(_ b: [UInt8], of parent: Block) -> [Block] {
+            var result: [Block] = []
+            var o = parent.childStart
+            while o + 6 <= parent.end, result.count < 256, let child = block(b, at: o, end: parent.end) {
+                result.append(child)
+                o = align(child.end)
+            }
+            return result
+        }
+
+        /// A string value: UTF-16 up to its NUL. Some tools count its length in bytes, others in
+        /// units, so the NUL and the block's end decide.
+        static func text(_ b: [UInt8], _ item: Block) -> String? {
+            var units: [UInt16] = []
+            var o = item.valueStart
+            while o + 2 <= item.end, units.count < 512, let unit = PEInspector.le16(b, o), unit != 0 {
+                units.append(UInt16(unit))
+                o += 2
+            }
+            let text = String(decoding: units, as: UTF16.self).trimmingCharacters(in: .whitespacesAndNewlines.union(.controlCharacters))
+            return text.isEmpty ? nil : text
+        }
+    }
+
     /// Which of `needles` the file mentions as plain ASCII text, in any letter case.
     /// Engines like Unreal load their renderer with LoadLibrary, so imports alone miss it.
     /// Reads in overlapping chunks, so a name that straddles two chunks is still found.

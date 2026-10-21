@@ -16,3 +16,6 @@ Unwine reuses work from these projects, each under its own licence:
   AreWeAntiCheatYet (MIT). Unwine downloads the whole list and keeps it on this Mac only.
 - Windows Steam client for Online mode: Valve's own installer, downloaded from Valve when the user
   sets up Online mode.
+- x87sidecar (MIT, Copyright (c) 2025 Lifeisawful, later work by athei; github.com/athei/x87sidecar):
+  the release build x87sidecar_entitled, downloaded from its GitHub release only when the user turns
+  on Faster x87 math for a game. Unwine checks its SHA-256 and does not change the program.

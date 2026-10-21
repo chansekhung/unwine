@@ -4,10 +4,12 @@ import UniformTypeIdentifiers
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @State private var pickingGPTK = false
     @State private var confirmRemoveOnline = false
     @State private var removeSizes: (games: Int64, saves: Int64)?
     @State private var measuring = false
+    @State private var showingLog = false
 
     var body: some View {
         @Bindable var model = model
@@ -32,21 +34,42 @@ struct SettingsView: View {
                             Text("New engine \(pending) is out. It needs a newer Unwine; your current engine keeps working.")
                                 .font(.system(size: 11)).foregroundStyle(Palette.warn)
                         }
+                        EngineUpdateNotices()
                         row("Steam Play files", model.stored.kitVersion.map { "NotProton \($0)" } ?? "Not installed")
-                        row("Unwine", appVersionText)
+                        HStack(spacing: 10) {
+                            row("Unwine", appVersionText)
+                            Button("What's new") { openWindow(id: WhatsNewView.windowID) }
+                                .buttonStyle(.link).font(.system(size: 12))
+                                .help("What each Unwine version changed, in plain words")
+                        }
                         HStack(spacing: 10) {
                             Button(model.isCheckingUpdates ? "Checking…" : "Check now") { Task { await model.checkForUpdates() } }
-                                .buttonStyle(QuietButtonStyle()).disabled(model.isCheckingUpdates || !model.showsLibrary)
-                            if model.isCheckingUpdates { ProgressTrack(progress: nil).frame(width: 120) }
+                                .buttonStyle(QuietButtonStyle()).disabled(model.isCheckingUpdates || !model.showsLibrary || model.engineSwitching != nil)
+                                .help(model.engineSwitching != nil ? "Unwine is switching engines now." : "Checks the engine, the Steam Play files and Unwine itself")
+                            if model.isCheckingUpdates && model.engineDownload == nil { ProgressTrack(progress: nil).frame(width: 120) }
                             if case .readyToInstall(let v) = model.appUpdater.status {
                                 Button("Install Unwine \(v)") { model.appUpdater.installAndRelaunch() }.buttonStyle(PrimaryButtonStyle())
                             }
                         }
-                        if let note = model.updateNote { Text(note).font(.system(size: 11)).foregroundStyle(Palette.muted) }
+                        if let note = model.updateNote {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(note).font(.system(size: 11)).foregroundStyle(Palette.muted)
+                                if note.localizedCaseInsensitiveContains("failed") || note.localizedCaseInsensitiveContains("could not") {
+                                    Button("Show log") { showingLog = true }.buttonStyle(.link).font(.system(size: 11))
+                                        .help("Shows Unwine's log, which says what went wrong")
+                                }
+                            }
+                        }
                         if let last = model.stored.lastUpdateCheck {
                             Text("Last checked \(last.formatted(.relative(presentation: .named))).").font(.system(size: 11)).foregroundStyle(Palette.muted)
                         }
                     }
+
+                    group("Engine rollback") { EngineRollbackSection() }
+
+                    group("Unwine fixes") { UnwineFixesSection() }
+
+                    group("Compatibility data") { CompatibilityDataSection() }
 
                     group("GPTK (Apple D3DMetal)") {
                         row("Installed", addingGPTK ? "Adding…" : model.d3dmetal?.label ?? "Not added")
@@ -70,15 +93,21 @@ struct SettingsView: View {
                         if case .needsUser(let why) = model.steps[.gptk] { Text(why).font(.system(size: 11)).foregroundStyle(Palette.warn) }
                     }
 
+                    group("New games") { NewGamesControls() }
+
                     group("Steam") {
                         row("Steam Play", stateText)
-                        row("Steam version", model.steamVersion ?? "Unknown")
+                        row("Steam version", model.steamMissing ? "Not installed" : model.steamVersion ?? "Unknown")
                         Text("Unwine's tool shows in Steam as \u{201C}\(Runner.toolDisplay)\u{201D}. Unwine never changes Steam.app.")
                             .font(.system(size: 11)).foregroundStyle(Palette.muted)
                         HStack(spacing: 8) {
-                            Button("Restart Steam") { Task { await model.restartSteam() } }.buttonStyle(QuietButtonStyle())
-                                .disabled(model.gameRunning || model.macSteamBlocked)
-                                .help(model.gameRunning ? "Close your game first" : model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Steam closes and opens again")
+                            // Set up without Steam: Restart Steam is off and says why, and this is the next step.
+                            if model.steamMissing {
+                                Button("Get Steam") { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/about/")!) }
+                                    .buttonStyle(QuietButtonStyle())
+                                    .help("Opens Valve's page, where you download Steam for Mac")
+                            }
+                            RestartSteamButton(primary: false)
                             Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }
                                 .buttonStyle(QuietButtonStyle())
                         }
@@ -146,6 +175,10 @@ struct SettingsView: View {
                         }
                     }
 
+                    group("Storage") { StorageSection() }
+
+                    group("Logs") { LogsSection() }
+
                     group("Moving to a new Mac") {
                         Text("1. Copy Unwine.dmg to the new Mac and drag Unwine to Applications.\n2. Open Unwine and run setup again (it downloads the engine once).\n3. Steam Play must be on in the new Mac's Steam.\n4. Your games come back with Steam: copy the Steam library folder, or let Steam download them.")
                             .font(.system(size: 12)).foregroundStyle(Palette.text.opacity(0.9))
@@ -153,7 +186,7 @@ struct SettingsView: View {
                     }
 
                     group("Credits") {
-                        Text("Wine (LGPL) · Sikarugir engine by Gcenx · DXMT by 3Shain · DXVK · KosmicKrisp (Mesa/LunarG) · MoltenVK · Steam Play parts and Steam bridge by NotProton (GPL-3.0), built on Valve's Proton code · Apple D3DMetal, used under Apple's licence from your own download · Game advice from the Highball database (CC0) and AreWeAntiCheatYet (MIT). Unwine is free and GPL-3.0.")
+                        Text("Wine (LGPL) · Sikarugir engine by Gcenx · DXMT by 3Shain · DXVK · KosmicKrisp (Mesa/LunarG) · MoltenVK · Steam Play parts and Steam bridge by NotProton (GPL-3.0), built on Valve's Proton code · Apple D3DMetal, used under Apple's licence from your own download · x87sidecar by Lifeisawful and athei (MIT), downloaded only when you turn on Faster x87 math · Game advice from the Highball database (CC0) and AreWeAntiCheatYet (MIT). Unwine is free and GPL-3.0.")
                             .font(.system(size: 11)).foregroundStyle(Palette.muted)
                     }
                 }
@@ -176,6 +209,7 @@ struct SettingsView: View {
         .fileImporter(isPresented: $pickingGPTK, allowedContentTypes: [UTType(filenameExtension: "dmg") ?? .data]) { result in
             if case .success(let url) = result { Task { await model.importGPTK(url) } }
         }
+        .sheet(isPresented: $showingLog) { LogsView(gameID: nil).environment(model) }
     }
 
     private var appVersionText: String {
@@ -223,6 +257,7 @@ struct SettingsView: View {
     }
 
     private var stateText: String {
+        if model.steamMissing { return "Steam is not installed" }
         switch model.steamPlay {
         case .on: return "On, Unwine listed"
         case .off: return "Not seen in Steam"

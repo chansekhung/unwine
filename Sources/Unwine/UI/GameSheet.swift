@@ -8,9 +8,12 @@ struct GameSheet: View {
     @State private var confirmReset = false
     @State private var confirmOnlineSetup = false
     @State private var confirmRemove = false
+    @State private var confirmQuit = false
     @State private var locating = false
     @State private var renaming = false
     @State private var newName = ""
+    @State private var pickingInstalled = false
+    @State private var installedList: [(url: URL, size: Int64)] = []   // kept while the chooser closes
 
     private var game: SteamGame? { model.games.first { $0.id == gameID } }
 
@@ -72,34 +75,49 @@ struct GameSheet: View {
                             .buttonStyle(PrimaryButtonStyle())
                             .disabled(model.localStarting[game.id] != nil)
                             .help(model.localStarting[game.id] ?? "Starts the game with these settings, without Steam")
+                    } else if model.steamGamesRunning.contains(game.id) {
+                        // The bottle is open: the game runs, or its start hangs before a window shows.
+                        Button { confirmQuit = true } label: { Label("Quit game…", systemImage: "stop.fill") }
+                            .buttonStyle(QuietButtonStyle())
+                            .disabled(model.quittingGames.contains(game.id))
+                            .help(model.quittingGames.contains(game.id) ? "Unwine is closing \(game.name). Wait a moment."
+                                  : "Ends the game and everything in its Windows bottle. Unwine asks first.")
+                    } else if game.state != .installed {
+                        // Nothing to play until Steam finishes: the next step is in Steam.
+                        Button { model.showInSteam(game.id) } label: { Label("Open in Steam", systemImage: "arrow.up.forward.app") }
+                            .buttonStyle(PrimaryButtonStyle())
+                            .disabled(model.macSteamBlocked)
+                            .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason
+                                  : game.state == .needsUpdate ? "Steam has an update for this game. Play works after the update."
+                                  : "Steam is downloading this game. Play works when the download finishes.")
                     } else {
+                        let blocker = model.steamPlayBlocker(game)
                         Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
                             .buttonStyle(PrimaryButtonStyle())
-                            .disabled(game.state != .installed || model.macSteamBlocked)
-                            .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason
-                                  : game.state == .installed ? (needsOnline != nil ? "Single player and offline, through Mac Steam" : "Starts in Steam with these settings")
-                                  : "Finish the download in Steam first")
+                            .disabled(blocker != nil)
+                            .help(blocker ?? (needsOnline != nil ? "Single player and offline, through Mac Steam" : "Starts in Steam with these settings"))
                     }
                 }
                 .padding(18)
             }
+            // Pinned under the header, outside the scroll, so the result of a button at the bottom shows.
+            BannerHost()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    if let banner = model.banner {
-                        NoticeRow(color: Palette.glow, icon: "info.circle", text: banner) {
-                            Button { model.banner = nil } label: { Image(systemName: "xmark") }
-                                .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Hide this message")
-                        }
-                    }
-                    if let step = model.localStarting[game.id] {
+                    if let words = model.runState(of: game).waitWords {
                         HStack(spacing: 10) {
                             UnwineMark(progress: nil, size: 22)
-                            PhaseWords(words: step.hasPrefix("Closing") ? [step, "Ending the game's programs…"]
-                                                                       : [step, "Windows games start slowly on a Mac", "The game's window opens soon"])
-                                .font(.system(size: 12)).foregroundStyle(Palette.glow)
+                            PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
+                            // Before the bottle opens there is nothing to quit, only a wait to end.
+                            if !isLocal, model.steamStarting[game.id] != nil, !model.steamGamesRunning.contains(game.id) {
+                                Spacer()
+                                Button("Stop waiting") { model.stopWaiting(for: game) }.buttonStyle(QuietButtonStyle())
+                                    .help("Play works again at once. Use it when Steam asked something and you cancelled the start there.")
+                            }
                         }
                     }
+                    if !isLocal { BottleWaitRow(game: game) }
                     if isLocal, let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {
                         NoticeRow(color: Palette.warn, icon: "questionmark.folder",
                                   text: "Unwine cannot find \(exe.lastPathComponent) in \(exe.deletingLastPathComponent().path). If the game moved, or its drive is not connected, point Unwine at it again. Its bottle and saves stay.") {
@@ -107,10 +125,21 @@ struct GameSheet: View {
                                 .help("Pick the game's program where it is now")
                         }
                     }
+                    if let found = model.installedPrograms[game.id], !found.isEmpty {
+                        NoticeRow(color: Palette.ok, icon: "shippingbox",
+                                  text: "The installer put \(found.count == 1 ? "a new program" : "\(found.count) new programs") in this game's Windows bottle. Pick the one that starts the game. This entry then starts it, in the same bottle.") {
+                            Button("Pick the installed program") { installedList = found; pickingInstalled = true }.buttonStyle(PrimaryButtonStyle())
+                                .help("Shows the new programs, the likeliest first")
+                            Button { model.installedPrograms[game.id] = nil } label: { Image(systemName: "xmark") }
+                                .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Keep the installer as this entry")
+                        }
+                    }
                     if game.bottleIncomplete {
                         NoticeRow(color: Palette.warn, icon: "wrench.and.screwdriver",
                                   text: "This game's Windows bottle is incomplete: its 32-bit part is missing, so the game and its launcher quit at once. A fresh bottle fixes it.\(isLocal ? " Saves the game keeps in its own folder stay." : " Steam Cloud saves stay.")") {
                             Button("Fresh bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
+                                .disabled(model.bottleBusyReason(game) != nil)
+                                .help(model.bottleBusyReason(game) ?? "Moves this game's Windows bottle to the Trash. A new one comes on the next Play.")
                         }
                     }
                     if case .publisherBlocked = advice.online {
@@ -127,8 +156,8 @@ struct GameSheet: View {
                                     ? "Steam runs this game with another tool (\(model.mappings[game.id] ?? "")), so these settings do nothing. Switch it to Unwine? Steam restarts for a few seconds."
                                     : "Steam is not set to use Unwine for this game yet. Steam restarts for a few seconds.") {
                             Button("Use Unwine") { Task { await model.useDecant(true, for: game) } }
-                                .buttonStyle(PrimaryButtonStyle()).disabled(model.busyGame != nil || model.gameRunning)
-                                .help(model.gameRunning ? "Close your running game first" : "Steam restarts for a few seconds")
+                                .buttonStyle(PrimaryButtonStyle()).disabled(model.steamSwitchBlocker != nil)
+                                .help(model.steamSwitchBlocker ?? "Steam restarts for a few seconds")
                         }
                     }
 
@@ -136,6 +165,7 @@ struct GameSheet: View {
                         NoticeRow(color: Palette.accent, icon: "arrow.triangle.branch",
                                   text: "This \(LocalGames.role(of: game.localExe!)?.lowercased() ?? "program") starts with the settings of \(followed.name), because the game it opens gets everything the \(LocalGames.role(of: game.localExe!)?.lowercased() ?? "program") got. To change graphics, speed or Apple extras, close this page and open \(followed.name).")
                     } else {
+                    SessionRow(game: game)
                     adviceSection(game, advice)
 
                     if let ac = needsOnline { onlineSection(game, anticheat: ac) }
@@ -173,19 +203,23 @@ struct GameSheet: View {
                         hint("Faster in most games. Turn off if a game freezes or a download stalls.")
                         Toggle("Tell games the CPU has AVX", isOn: binding(game.id, \.advertiseAVX))
                         hint("Some new games refuse to start without it. Rosetta handles it.")
-                        Picker("Frame rate cap", selection: binding(game.id, \.fpsCap)) {
-                            Text("Off").tag(Int?.none)
-                            ForEach([30, 40, 60, 120], id: \.self) { Text("\($0) fps").tag(Int?.some($0)) }
-                        }
+                        if analysis?.is64Bit == false { X87Switch(game: game) }     // Faster x87 math, 32-bit games only
+                        FrameCapPicker(cap: binding(game.id, \.fpsCap))
                         if resolved == .wined3d && s.fpsCap != nil {
                             note("Unwine has no frame cap for Wine's own layer (WineD3D), so this cap does nothing for this game. Use the game's own frame limit instead.", warn: true)
                         } else if resolved == .dxvk && analysis?.api == .dx12 && s.fpsCap != nil {
                             note("On the DXVK layer, Wine's own DirectX 12 draws this game, and Unwine cannot cap it. Use the game's own frame limit instead.", warn: true)
                         } else if resolved == .d3dmetal && model.d3dmetal?.isVersion4 != true && s.fpsCap != nil {
                             note("D3DMetal takes a frame cap only from GPTK 4. Yours is \(model.d3dmetal?.label ?? "older"), so this cap does nothing for this game.", warn: true)
+                        } else if let cap = s.fpsCap, cap > Profiles.screenHz {
+                            hint("Your screen shows at most \(Profiles.screenHz) frames a second, so a \(cap) fps cap saves little. Pick \(evenCaps) to save more.")
+                        } else if let cap = s.fpsCap, Profiles.screenHz % max(1, cap) != 0 {
+                            hint("\(cap) fps does not divide your screen's \(Profiles.screenHz) Hz, so some frames show longer than others. Pick \(evenCaps) for even motion.")
                         } else {
-                            hint("Off lets the game run as fast as it can. A cap saves battery and heat; pick a value that divides your screen's refresh rate.")
+                            hint("Off lets the game run as fast as it can. A cap saves battery and heat. Each value in the list divides your screen's \(Profiles.screenHz) Hz, so every frame shows for the same time.")
                         }
+                        Toggle("Save battery when unplugged", isOn: binding(game.id, \.saveBatteryUnplugged))
+                        note(batteryNote(game, s), warn: false)
                         Toggle("120 fps mode (DirectX 10 and 11)", isOn: binding(game.id, \.fps120))
                         note(fps120Note(game, s, analysis, resolved), warn: s.fps120 && !fps120Works(game, s))
                         Toggle("Low latency (DXVK)", isOn: binding(game.id, \.lowLatency))
@@ -208,55 +242,100 @@ struct GameSheet: View {
                         // Every switch stays yours to flip. When Unwine thinks one does nothing for
                         // this game, the note says why, and turns orange while the switch is on.
                         Toggle("MetalFX sharpening (DirectX 10 and 11)", isOn: binding(game.id, \.metalFXSpatial))
-                        note(canSharpen
-                             ? "DXMT doubles the size the game draws, with MetalFX. Set the game to \(halfScreen) and it fills your screen sharply. If you set the game to your screen's full size, turn this off: doubling it again only costs battery."
-                             : noMetalFXReason(analysis, resolved, dlss: false),
-                             warn: s.metalFXSpatial && !canSharpen)
+                        note(sharpenNote(canSharpen, analysis, resolved),
+                             warn: s.metalFXSpatial && (!canSharpen || Profiles.screenScale < 2))
                         Toggle("MetalFX for DLSS games", isOn: binding(game.id, \.metalFX))
-                        note(canMetalFX
-                             ? "Turns the game's DLSS option into Apple's MetalFX. Set the game to DLSS to get the gain."
-                             : noMetalFXReason(analysis, resolved, dlss: true),
-                             warn: s.metalFX && !canMetalFX)
+                        // An analysis from an older Unwine did not look for DLSS, so only a current one can say "none".
+                        let noDLSS = analysis.map { $0.isCurrent && !$0.hasDLSS } ?? false
+                        note(dlssNote(canMetalFX, noDLSS: noDLSS, analysis, resolved),
+                             warn: s.metalFX && (!canMetalFX || noDLSS))
+                        Picker("Ray tracing (D3DMetal)", selection: binding(game.id, \.rayTracing)) {
+                            Text("Apple's default").tag(Bool?.none)
+                            Text("Off").tag(Bool?.some(false))
+                            Text("On").tag(Bool?.some(true))
+                        }
+                        note(rayTracingNote(resolved), warn: s.rayTracing != nil && resolved != .d3dmetal)
                         Toggle("Metal 4 mode (GPTK 4)", isOn: binding(game.id, \.metal4))
                         note(metal4Note(resolved), warn: false)
                     }
                     }
 
+                    section("Display") { DisplayControls(game: game) }
+                    if analysis?.api == .dx12 { section("Experimental") { DXMTD3D12Control(game: game) } }
+                    }
+
+                    section("Launch options and mods") {
+                        LaunchOptionsEditor(game: game, followed: followed)
+                    }
+
+                    section("Controllers") { ControllerRow(steamGame: !isLocal) }
+
                     section("Fix things") {
+                        let busy = isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
                         HStack(spacing: 8) {
                             Button("Reset settings") { model.resetSettings(game.id) }.buttonStyle(QuietButtonStyle())
                                 .help("Back to Unwine's defaults for new games")
                             Button("Fresh Windows bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
-                                .disabled(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id)))
-                                .help(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
-                                      ? "Quit the game first"
-                                      : "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
-                            Button("Show logs") {
-                                NSWorkspace.shared.activateFileViewerSelecting([game.runLog, game.wineLog].filter { FileManager.default.fileExists(atPath: $0.path) })
-                            }
-                            .buttonStyle(QuietButtonStyle())
-                            .disabled(!FileManager.default.fileExists(atPath: game.runLog.path))
-                            .help("Logs appear after the first Play")
+                                .disabled(model.bottleBusyReason(game) != nil)
+                                .help(model.bottleBusyReason(game)
+                                      ?? "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
+                            // The Logs sheet: the game's logs (with the log of programs run in its bottle) and Unwine's.
+                            ShowLogsButton(game: game)
                         }
+                        DetailedLogsControl(game: game)
                         HStack(spacing: 8) {
                             if isLocal {
                                 Button("Rename…") { newName = game.name; renaming = true }.buttonStyle(QuietButtonStyle())
                                     .help("Change the name Unwine shows for this game")
+                                Button("Change program…") { model.changeLocalProgram(game) }.buttonStyle(QuietButtonStyle())
+                                    .disabled(busy)
+                                    .help(busy ? "Quit the game first" : "Points this game at another .exe, such as the game after its launcher, or the program that an installer put in the bottle. The bottle and its saves stay.")
                                 Button("Remove from Unwine…") { confirmRemove = true }.buttonStyle(QuietButtonStyle())
-                                    .disabled(model.localRunning.contains(game.id) || model.localStarting[game.id] != nil)
-                                    .help(model.localRunning.contains(game.id) || model.localStarting[game.id] != nil
-                                          ? "Quit the game first" : "Asks first. The game's own files stay where they are.")
+                                    .disabled(busy)
+                                    .help(busy ? "Quit the game first" : "Asks first. The game's own files stay where they are.")
                             } else {
                                 Button("Show in Steam") { model.showInSteam(game.id) }.buttonStyle(QuietButtonStyle())
                                     .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens this game's page in Mac Steam")
-                            }
-                            Button("Show game files") { NSWorkspace.shared.activateFileViewerSelecting([game.localExe ?? game.installDir]) }.buttonStyle(QuietButtonStyle())
-                            if usesDecant {
-                                Button("Stop using Unwine") { Task { await model.useDecant(false, for: game) } }
-                                    .buttonStyle(QuietButtonStyle()).disabled(model.busyGame != nil || model.gameRunning)
-                                    .help("Steam goes back to its default for this game")
+                                if usesDecant {
+                                    Button("Stop using Unwine") { Task { await model.useDecant(false, for: game) } }
+                                        .buttonStyle(QuietButtonStyle()).disabled(model.steamSwitchBlocker != nil)
+                                        .help(model.steamSwitchBlocker ?? "Steam goes back to its default for this game")
+                                }
                             }
                         }
+                        if isLocal { coverButtons(game) }
+                        // The game's Windows bottle: programs for it (installers, patches, mod tools),
+                        // Wine's own tools, and its C: drive, where games keep saves and settings.
+                        let blocker = model.bottleBlocker(game)
+                        HStack(spacing: 8) {
+                            Button("Run a program in this bottle…") { model.pickProgramForBottle(game) }.buttonStyle(QuietButtonStyle())
+                                .disabled(blocker != nil)
+                                .help(blocker ?? "Runs an .exe, .msi, .bat or .cmd file inside this game's bottle, with the game's settings")
+                            Menu {
+                                ForEach(WineTool.allCases) { tool in
+                                    Button(tool.title) { Task { await model.runInBottle(game, .tool(tool)) } }
+                                }
+                            } label: { Text("Wine tools") }
+                                .menuStyle(.button).buttonStyle(QuietButtonStyle()).fixedSize()
+                                .disabled(blocker != nil)
+                                .help(blocker ?? "Wine settings, the registry editor, the task manager and the uninstaller, for this game's bottle")
+                        }
+                        HStack(spacing: 8) {
+                            Button("Show bottle (C: drive)") { model.showBottleDrive(game) }.buttonStyle(QuietButtonStyle())
+                                .disabled(!model.bottleExists(game))
+                                .help(model.bottleExists(game) ? "Opens the bottle's C: drive in Finder. Games keep saves and settings in its users folder."
+                                      : "Play the game once first. \(isLocal ? "Unwine" : "Steam") makes its Windows bottle then.")
+                            Button("Show game files") { model.showGameFiles(game) }.buttonStyle(QuietButtonStyle())
+                                .help(isLocal ? "Opens the game's folder in Finder" : "Shows the game's folder in Finder")
+                        }
+                        if let step = model.bottleToolStarting[game.id] {
+                            HStack(spacing: 10) {
+                                UnwineMark(progress: nil, size: 20)
+                                PhaseWords(words: [step, "Windows programs start slowly on a Mac", "Its window opens soon"])
+                                    .font(.system(size: 12)).foregroundStyle(Palette.glow)
+                            }
+                        }
+                        ShaderCacheRow(game: game)
                         Text("Settings apply the next time the game starts.").font(.system(size: 11)).foregroundStyle(Palette.muted)
                     }
                 }
@@ -296,6 +375,11 @@ struct GameSheet: View {
         } message: { ask in
             Text(restartMessage(ask))
         }
+        .confirmationDialog("Quit \(game.name)?", isPresented: $confirmQuit) {
+            Button("Quit game", role: .destructive) { Task { await model.quitSteamGame(game) } }
+        } message: {
+            Text(AppModel.quitGameWarning)
+        }
         .confirmationDialog("Start this game with a fresh Windows bottle?", isPresented: $confirmReset) {
             Button("Move bottle to Trash", role: .destructive) { model.resetBottle(game) }
         } message: {
@@ -314,23 +398,56 @@ struct GameSheet: View {
         .alert("Rename \(game.name)", isPresented: $renaming) {
             TextField("Name", text: $newName)
             Button("Rename") { model.renameLocalGame(game.id, to: newName) }
+                .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button("Cancel", role: .cancel) {}
+        }
+        .sheet(isPresented: $pickingInstalled) {
+            ProgramChooser(folder: game.compatData.appendingPathComponent("pfx/drive_c", isDirectory: true),
+                           programs: installedList,
+                           title: "Which program did the installer put in the bottle?",
+                           intro: "The likeliest is first. Press Return to use it. This entry keeps its bottle and takes the program's name.",
+                           pickSingle: false) { exe in
+                pickingInstalled = false
+                if let exe { model.useInstalledProgram(game.id, exe: exe) }
+            }
         }
     }
 
     /// DirectX 8 and 9 games draw with DXVK's DirectX 9 part under every layer but WineD3D.
     private func oldDirectX(_ a: GameAnalysis?) -> Bool { a?.api == .dx9 || a?.api == .dx8 }
 
+    /// An added game's cover: the picture on its tile and at the top of this page.
+    @ViewBuilder
+    private func coverButtons(_ game: SteamGame) -> some View {
+        let copying = ArtState.shared.preparing.contains(game.id)
+        HStack(spacing: 8) {
+            Button("Choose cover…") { model.chooseCover(for: game) }.buttonStyle(QuietButtonStyle())
+                .disabled(copying)
+                .help(copying ? "Unwine is copying the picture you picked. Wait a moment." : "Pick a picture for this game. A tall picture fits the tile best.")
+            if model.hasCover(game.id) {
+                Button("Reset cover") { model.resetCover(for: game) }.buttonStyle(QuietButtonStyle())
+                    .disabled(copying)
+                    .help(copying ? "Unwine is copying the picture you picked. Wait a moment." : "Removes your picture. The tile shows the program's icon again, or the game's initials.")
+            }
+            if copying {
+                UnwineMark(progress: nil, size: 18)
+                PhaseWords(words: ["Copying the picture…", "Saving it in Unwine's folder…"]).font(.system(size: 11)).foregroundStyle(Palette.glow)
+            }
+        }
+    }
+
     private func restartMessage(_ ask: OnlineRestartAsk) -> String {
         let what = ask.changes.isEmpty ? "settings Windows Steam did not start with"
                                        : "settings Windows Steam did not start with: " + ask.changes.joined(separator: ", ")
-        return "\(ask.game.name) uses \(what). Games take Windows Steam's settings, so it restarts to use them (Steam Cloud saves sync first). Without a restart the game plays with the settings Steam has now. Low latency and frame caps apply either way."
+        // These reach the game through the files Unwine fills before each start (OnlineSteam.stageConfigs).
+        return "\(ask.game.name) uses \(what). Games take Windows Steam's settings, so it restarts to use them (Steam Cloud saves sync first). Without a restart the game plays with the settings Steam has now. Low latency, frame caps, HDR and the DirectDraw picture apply either way."
     }
 
     private func facts(_ game: SteamGame, _ a: GameAnalysis?) -> String {
         var parts: [String] = []
         if let a { parts.append(a.api.label); parts.append(a.is64Bit ? "64-bit" : "32-bit"); if let e = a.engine { parts.append(e) } }
         if game.sizeOnDisk > 0 { parts.append(ByteCountFormatter.string(fromByteCount: game.sizeOnDisk, countStyle: .file)) }
+        if let played = game.playedLine { parts.append(played) }
         return parts.joined(separator: " · ")
     }
 
@@ -347,6 +464,8 @@ struct GameSheet: View {
                     Text(advice.rendererReason).font(.system(size: 12)).foregroundStyle(Palette.muted)
                 }
             }
+            // The next step when only Apple's file stands between this game and D3DMetal.
+            if advice.needsGPTK { GPTKOffer() }
             HStack(spacing: 8) {
                 ForEach(Preset.allCases) { p in
                     PresetCard(preset: p, detail: summary(model.settings(p, for: game, advice: advice), renderer: advice.renderer),
@@ -372,6 +491,10 @@ struct GameSheet: View {
     }
 
     private func metal4Note(_ resolved: Renderer) -> String {
+        // Metal 4 came with macOS 26; Unwine sets nothing for it on an older macOS.
+        guard Profiles.hasMetal4 else {
+            return "Needs macOS 26 or newer. This Mac has macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion), so this switch does nothing."
+        }
         guard let d = model.d3dmetal, d.isVersion4 else {
             return "Needs GPTK 4. \(model.d3dmetal.map { "You have \($0.label)." } ?? "GPTK is not added yet.") Until then this switch does nothing."
         }
@@ -394,13 +517,79 @@ struct GameSheet: View {
         }
         if hz <= 60 { return "Your screen shows at most \(hz) frames a second, so this switch does nothing here." }
         if let cap = s.fpsCap { return "Your frame rate cap (\(cap) fps) wins, so this switch does nothing. Set the cap to Off to use it." }
+        if s.fps120, s.saveBatteryUnplugged, let battery = model.batteryOverlayNow {
+            return "Your Mac saves battery now, so this game starts without 120 fps mode, capped at \(battery.cap) fps. When you plug in, 120 fps mode comes back."
+        }
         return "Some full-screen games ask for 60 Hz, or for a rate your screen does not have, like 75 Hz. Your screen stays at \(hz) Hz, but DXMT then holds the game at 60 fps. On: DXMT paces to \(hz) Hz instead. It only helps when your Mac draws each frame well under \(String(format: "%.1f", 1000.0 / Double(hz))) ms (GPU time in the Metal overlay). A slower frame waits for the next refresh, so you still see 60, and motion can look uneven: then turn this off, or lower the game's graphics settings. It costs battery and heat. A game in a window, or set to \(hz) Hz in its own menu, gets \(hz) already. It also holds games with V-Sync off at \(hz). If the game runs too fast, turn this off."
+    }
+
+    /// The caps that divide the screen's rate, in words: "30, 40, 60 or 120 fps".
+    private var evenCaps: String {
+        let caps = Profiles.capChoices().map(String.init)
+        guard let last = caps.last else { return "a lower cap" }
+        return (caps.count > 1 ? caps.dropLast().joined(separator: ", ") + " or " + last : last) + " fps"
+    }
+
+    /// What "Save battery when unplugged" does for this game, for the Mac's power right now.
+    /// PowerState is observed, so the line changes the moment the Mac is plugged in or unplugged.
+    private func batteryNote(_ game: SteamGame, _ s: GameSettings) -> String {
+        guard s.saveBatteryUnplugged else { return "Off: this game starts with the same settings on battery and on power." }
+        guard model.takesFrameCap(game) else {
+            return "Unwine has no frame cap for this game's layer, so this switch changes nothing for it. Use the game's own frame limit to save battery."
+        }
+        let power = PowerState.shared
+        let hz = Profiles.screenHz
+        // Where DXVK draws (the same games Low latency reaches), it also builds fewer shaders at once.
+        let shaders = model.canLowerLatency(game) ? " DXVK builds fewer shaders at the same time, for less heat." : " Nothing else changes for this game."
+        if let battery = model.batteryOverlayNow {
+            let now = power.lowPowerMode ? "Low Power Mode is on" : battery.strict ? "Your Mac is hot" : "On battery now"
+            if let own = s.fpsCap { return "\(now): your own cap of \(own) fps stays.\(shaders)" }
+            return "\(now): this game starts capped at \(battery.cap) fps. Plugged in, it starts as usual. A running game keeps its settings until it closes."
+        }
+        if let own = s.fpsCap { return "Plugged in now. On battery, your own cap of \(own) fps stays.\(shaders)" }
+        let normal = BatteryOverlay(strict: false, screenHz: hz).cap, strict = BatteryOverlay(strict: true, screenHz: hz).cap
+        return "Plugged in now. On battery, this game starts capped at \(normal) fps, and at \(strict) fps in Low Power Mode or when your Mac is hot."
+    }
+
+    /// DXMT enlarges by the screen's own scale (see Profiles.configs), so a 1x screen gets nothing.
+    private func sharpenNote(_ can: Bool, _ a: GameAnalysis?, _ r: Renderer) -> String {
+        guard can else { return noMetalFXReason(a, r, dlss: false) }
+        guard Profiles.screenScale >= 2 else {
+            return "Your screen has no Retina pixels (1x), so MetalFX has nothing to add, and this switch does nothing here. On a Retina screen, DXMT draws the picture 2x larger."
+        }
+        return "DXMT draws the picture 2x larger with MetalFX, to your screen's real pixels. Set the game to \(halfScreen) and it fills your screen sharply. If you set the game to your screen's full size, turn this off: a second enlargement only costs battery. On a screen without Retina (1x), this switch does nothing."
+    }
+
+    private func dlssNote(_ can: Bool, noDLSS: Bool, _ a: GameAnalysis?, _ r: Renderer) -> String {
+        guard can else { return noMetalFXReason(a, r, dlss: true) }
+        if noDLSS {
+            return "Unwine found no DLSS files in this game, so MetalFX has nothing to replace."
+                + (r == .dxmt ? " On DXMT this switch still makes the game see an NVIDIA graphics card, and some games then take slower paths. Leave it off."
+                              : " This switch does nothing for it.")
+        }
+        return "\(a?.hasDLSS == true ? "This game has DLSS. " : "")Turns the game's DLSS option into Apple's MetalFX. Set the game to DLSS to get the gain."
+    }
+
+    private func rayTracingNote(_ resolved: Renderer) -> String {
+        guard resolved == .d3dmetal else {
+            return "Works only with the D3DMetal layer (DirectX 12 with GPTK). This game uses \(resolved.title) now, so this choice does nothing."
+        }
+        let here = MacChip.name.flatMap { name in MacChip.raysByDefault.map { " This Mac has an \(name), so the default here is \($0 ? "on" : "off")." } } ?? ""
+        return "Apple's default is on for M3 and newer chips, and off for M1 and M2.\(here) Off saves battery and heat in games with ray-traced light and shadows. If a game shows broken shadows or crashes, try Off."
     }
 
     /// Why Play online cannot start now, or nil when it can.
     private func playOnlineBlocker(_ game: SteamGame) -> String? {
         if game.state != .installed { return "Finish the download in Steam first" }
+        return windowsSteamBlocker
+    }
+
+    /// Why Windows Steam cannot open now, or nil when it can. It closes Mac Steam, and with it a game
+    /// that runs or starts there.
+    private var windowsSteamBlocker: String? {
+        if let name = model.startingSteamGame { return "\(name) is starting in Mac Steam. Wait for its window, then close it first." }
         if model.gameRunning { return "A game is running in Mac Steam. Close it first." }
+        if model.steamRestartWords != nil { return "Mac Steam is restarting. Wait for it to finish." }
         if model.onlineStep.isRunning { return "Online mode is still setting up" }
         if model.onlineBusy { return "Unwine is switching Steam. Wait a moment." }
         return nil
@@ -424,8 +613,10 @@ struct GameSheet: View {
 
     private func summary(_ s: GameSettings, renderer: Renderer) -> String {
         var parts = [s.fpsCap.map { "\($0) fps cap" } ?? "No frame cap"]
-        if renderer == .d3dmetal && s.metal4 && model.d3dmetal?.isVersion4 == true { parts.append("Metal 4") }
-        if s.metalFXSpatial { parts.append("MetalFX sharpening") }
+        // Below macOS 26 there is no Metal 4, and the profile leaves it out (Profiles.render).
+        if renderer == .d3dmetal && s.metal4 && model.d3dmetal?.isVersion4 == true && Profiles.hasMetal4 { parts.append("Metal 4") }
+        if renderer == .d3dmetal && s.rayTracing == false { parts.append("Ray tracing off") }
+        if renderer == .dxmt, let tess = s.maxTessFactor { parts.append("Tessellation up to \(tess)x") }
         if s.metalFX { parts.append("MetalFX for DLSS") }
         if s.msync { parts.append("msync") }
         return parts.joined(separator: " · ")
@@ -458,6 +649,8 @@ struct GameSheet: View {
         return section("Online play") {
             Text("\(game.name) uses \(anticheat). Mac Steam's Steam Play cannot load \(anticheat), so online servers block you. Online mode runs Windows Steam inside Unwine, like CrossOver does. It is experimental.")
                 .font(.system(size: 12))
+            OnlineQuitOffer(card: false)
+            PictureRebuildTip(game: game)
             // Setup, and the re-setup after an engine update, show here whether installed or not.
             switch model.onlineStep {
             case .running(let progress, let words):
@@ -472,13 +665,15 @@ struct GameSheet: View {
                 HStack(spacing: 8) {
                     Button("Try again") { Task { await model.setUpOnline() } }.buttonStyle(PrimaryButtonStyle())
                         .disabled(model.onlineBusy).help(model.onlineBusy ? "Unwine is switching Steam. Wait a moment." : "Runs setup again. Finished steps are skipped.")
-                    Button("Show log") { NSWorkspace.shared.activateFileViewerSelecting([Paths.logs]) }.buttonStyle(QuietButtonStyle())
+                    // Windows Steam's own log has each setup step; Unwine's log, beside it, has the failure.
+                    ShowLogsButton(game: nil, log: "online", title: "Show log", help: "Shows Windows Steam's log and Unwine's. They say what went wrong.")
                 }
             default:
                 onlineControls(game, online: online)
             }
             if online.installed, model.analysis(for: game)?.api == .dx12 {
-                note("DirectX 12 games cannot run in Online mode yet: Windows Steam's own window needs DXMT, and DXMT has no DirectX 12.", warn: true)
+                // OnlineSteam keeps the bottle's DXMT as it ships, without DXMT's experimental DirectX 12 part.
+                note("DirectX 12 games cannot run in Online mode yet. Windows Steam's own window needs DXMT, and Online mode does not use the experimental switch \u{201C}DirectX 12 through DXMT\u{201D}.", warn: true)
             }
             if online.installed, let engine = model.engine {
                 ForEach(Array(OnlineSteam.notes(engine: engine, profile: Profiles.file(for: game.id)).enumerated()), id: \.offset) { _, text in
@@ -513,10 +708,8 @@ struct GameSheet: View {
             HStack(spacing: 8) {
                 Button(online.running ? "Windows Steam is open" : "Sign in to Windows Steam") { Task { await model.openOnline(nil) } }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(online.running || model.onlineBusy || model.gameRunning)
-                    .help(online.running ? "Sign in in the Windows Steam window"
-                          : model.gameRunning ? "A game is running in Mac Steam. Close it first."
-                          : model.onlineBusy ? "Unwine is switching Steam. Wait a moment." : "Opens Windows Steam's sign-in window")
+                    .disabled(online.running || windowsSteamBlocker != nil)
+                    .help(online.running ? "Sign in in the Windows Steam window" : windowsSteamBlocker ?? "Opens Windows Steam's sign-in window")
                 quitControl(online)
             }
             hint(online.running
@@ -600,7 +793,7 @@ private struct PresetCard: View {
         .buttonStyle(.plain)
         .foregroundStyle(Palette.text)
         .help(active ? "Already in use"
-              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your Metal overlay, Low latency and 120 fps mode choices stay. Applies the next time the game starts.")
+              : "Sets: \(detail)\(resetsLayer ? ", and the graphics layer back to Automatic" : ""). Your own choices stay: the Metal overlay, MetalFX sharpening, Low latency, background shader building, 120 fps mode, Save battery when unplugged, Faster x87 math, Detailed logs, Display and the Experimental switch. Applies the next time the game starts.")
     }
 }
 
