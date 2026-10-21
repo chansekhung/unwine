@@ -6,6 +6,7 @@ import Foundation
 struct StoredState: Codable {
     var games: [Int: GameSettings] = [:]
     var analyses: [Int: GameAnalysis] = [:]
+    var sessions: [Int: SessionSummary] = [:]   // how each game ran last time, measured by macOS 27
     var defaults = GameSettings()
     var autoUpdate = true
     var setupComplete = false
@@ -33,6 +34,7 @@ struct StoredState: Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         games = (try? c.decodeIfPresent([Int: GameSettings].self, forKey: .games)) ?? [:]
         analyses = (try? c.decodeIfPresent([Int: GameAnalysis].self, forKey: .analyses)) ?? [:]
+        sessions = (try? c.decodeIfPresent([Int: SessionSummary].self, forKey: .sessions)) ?? [:]
         defaults = (try? c.decodeIfPresent(GameSettings.self, forKey: .defaults)) ?? GameSettings()
         autoUpdate = (try? c.decodeIfPresent(Bool.self, forKey: .autoUpdate)) ?? true
         setupComplete = (try? c.decodeIfPresent(Bool.self, forKey: .setupComplete)) ?? false
@@ -203,6 +205,9 @@ final class AppModel {
     var isCheckingUpdates = false
     let appUpdater = AppUpdater()
 
+    // Measured session summary (metalperftrace): open game bottles and the sessions being read
+    let sessionWatch = SessionWatch()
+
     var stored = StoredState()
     let log = LogFile("unwine.log")
     private var started = false
@@ -349,6 +354,7 @@ final class AppModel {
         // A closed bottle has no settings left to compare with, so the next start sets them fresh.
         if !online.inUse, stored.onlineEnvHash != nil, !onlineBusy { stored.onlineEnvHash = nil; stored.onlineEnv = nil; save() }
         reopenMacSteamIfOnlineEnded()
+        watchSessions()     // macOS 27: note each game's Wine processes, read the session once they end
         steamChecked = true
     }
 
