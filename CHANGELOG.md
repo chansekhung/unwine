@@ -24,7 +24,7 @@ How to keep this list. The build reads it, so follow these rules.
 
 ## 1.0.5 · not released yet
 
-- **Faster x87 math is off for now.** With this Wine engine, it stopped every 32-bit game at start, Age of Mythology too. Unwine turns it off by itself, and the switch says why. Your games start again. A later engine with the newer x87 hook can bring it back.
+- **Faster x87 math works now.** In 1.0.4 it stopped every 32-bit game at start, Age of Mythology too. Wine gave x87sidecar a file that this engine does not have. Now x87sidecar gets the right file, in added games and in Steam games. In a test, x87 math ran about 28 times faster.
 
 ## 1.0.4 · 2026-10-21
 

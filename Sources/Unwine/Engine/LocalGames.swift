@@ -352,7 +352,15 @@ enum LocalGames {
         let before = watchInstalls ? installedPrograms(in: pfx) : nil
         log.line("Starting \(exe.path) from \(loader == engine.wine ? "the engine" : "its Game Mode app")"
                  + (arguments.isEmpty ? "" : " with \(arguments.count) launch option\(arguments.count == 1 ? "" : "s")"))
-        _ = try Shell.spawn(loader, [exe.path] + arguments, env: env, cwd: exe.deletingLastPathComponent(), log: log, onExit: onExit)
+        // Faster x87 math: Wine starts x87sidecar for each process the game starts (ROSETTA_X87_PATH),
+        // but the bundle's loader does not start itself again, so the game's first process needs
+        // x87sidecar to start it. x87sidecar keeps this process ID for the game.
+        var program = loader, args = [exe.path] + arguments
+        if let x87 = env["ROSETTA_X87_PATH"], FileManager.default.isExecutableFile(atPath: x87) {
+            program = URL(fileURLWithPath: x87)
+            args.insert(loader.path, at: 0)
+        }
+        _ = try Shell.spawn(program, args, env: env, cwd: exe.deletingLastPathComponent(), log: log, onExit: onExit)
         return before
     }
 

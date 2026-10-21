@@ -6,12 +6,29 @@ import Foundation
 /// faster. Old 32-bit games use a lot of it. x87sidecar does that math in 64-bit doubles, not in 80-bit
 /// numbers, so a few programs behave differently: it is a switch per game, off at the start.
 ///
-/// The engine's ntdll.so (Sikarugir Wine 11.0) has the older hook: it runs each 32-bit process through
-/// the program in ROSETTA_X87_PATH (that program first, then Wine's own arguments). It has no
-/// x87sidecar handshake (no X87_SIDECAR_BOOTSTRAP), so the plain build would refuse to attach. The
-/// "entitled" build attaches by itself (macOS asks once per login session to allow it Developer Tools
-/// access), but every 32-bit program then stops at start. So Unwine offers the switch only on an engine
-/// with the handshake (`engineHasHook`); on this engine it stays off and says why.
+/// The engine's ntdll.so (Sikarugir Wine 11.0) has the older hook: when Wine starts its loader, it
+/// runs the program in ROSETTA_X87_PATH instead, with the loader's path and Wine's own arguments. It
+/// has no x87sidecar handshake (no X87_SIDECAR_BOOTSTRAP), so the plain build would refuse to attach.
+/// The "entitled" build attaches by itself (macOS asks once per login session to allow it Developer
+/// Tools access).
+///
+/// For a 32-bit program the hook first names a 32-bit loader (lib/wine/i386-unix/wine). This engine
+/// has none: it runs 32-bit programs inside the 64-bit loader (WoW64). Without x87sidecar, Wine's
+/// start of that missing file fails and Wine takes the 64-bit loader. With it, x87sidecar starts
+/// instead, cannot start the missing file, and the program ends with status 1. WINEARCH=wow64 makes
+/// Wine skip the 32-bit loader, so x87sidecar gets the 64-bit one.
+///
+/// Wine uses the hook only when it starts a loader: for each process a game starts, but not for the
+/// game's first process, whose loader does not start itself again. So whoever starts the game starts
+/// x87sidecar too: Unwine for an added game (LocalGames), the runner's loader wrapper for a Steam game
+/// (Runner.startX87). That wrapper is a shell script, and x87sidecar cannot attach to a script, so it
+/// also keeps ROSETTA_X87_PATH from Wine. Measured on 21 Oct 2026 (macOS 27.0.1, x87sidecar 1.9.0): a
+/// 32-bit "hello", a DXMT window and a 32-bit program that starts another all ran, both ways, and an
+/// x87 loop took 0.57 s, not 16 s.
+///
+/// x87sidecar does that math in 64-bit doubles. At the 53-bit precision Windows programs run at, the
+/// loop gave the same result to the last digit. A program that asks for 64-bit precision (the
+/// mingw default) gets slightly different results: that is why it is a switch per game.
 enum X87Sidecar {
     static let version = "1.9.0"
     static let url = URL(string: "https://github.com/athei/x87sidecar/releases/download/v1.9.0/x87sidecar_entitled.tar.xz")!
@@ -49,23 +66,25 @@ enum X87Sidecar {
 
     /// The profile lines for Faster x87 math (see `Profiles.render`). `AppModel.profileSettings` already
     /// turned `x87` off where it cannot work: a 64-bit game, no passing check on this macOS, no hook.
+    /// WINEARCH=wow64 makes Wine give x87sidecar the 64-bit loader, which runs 32-bit programs on this
+    /// engine (see above). Wine reads it nowhere else in a bottle that exists.
     static func exports(_ s: GameSettings) -> [(String, String)] {
         guard s.x87, isInstalled else { return [] }
-        return [("ROSETTA_X87_PATH", binary.path)] + (s.x87PreciseFaults ? [("X87_PRECISE_FAULTS", "1")] : [])
+        return [("ROSETTA_X87_PATH", binary.path), ("WINEARCH", "wow64")] + (s.x87PreciseFaults ? [("X87_PRECISE_FAULTS", "1")] : [])
     }
 
     /// Every name `exports` can set. Making a bottle runs without them (LocalGames.withoutX87).
-    static let variables: Set<String> = ["ROSETTA_X87_PATH", "X87_PRECISE_FAULTS"]
+    static let variables: Set<String> = ["ROSETTA_X87_PATH", "WINEARCH", "X87_PRECISE_FAULTS"]
 
-    /// True when this engine's Wine has the x87sidecar handshake (X87_SIDECAR_BOOTSTRAP). Read once per
-    /// engine. The older hook alone (ROSETTA_X87_PATH, in Sikarugir's Wine 11.0) is not enough: there
-    /// the entitled build attaches and every 32-bit program stops at once, before it shows anything.
-    /// Measured on 21 Oct 2026 (macOS 27.0.1, x87sidecar 1.9.0): a 32-bit "hello" and a DXMT window
-    /// both ended with status 1, and Age of Mythology's start crashed, although --probe passed.
+    /// True when this engine's Wine has the x87 hook (ROSETTA_X87_PATH in its ntdll.so) and runs 32-bit
+    /// programs in its 64-bit loader only (no lib/wine/i386-unix/wine). Only there does WINEARCH=wow64
+    /// change nothing but the loader x87sidecar gets. Read once per engine.
     @MainActor static func engineHasHook(_ engine: InstalledEngine) -> Bool {
         if let known = hooks[engine.folder] { return known }
-        let ntdll = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix/ntdll.so")
-        let found = (try? Data(contentsOf: ntdll, options: .alwaysMapped))?.range(of: Data("X87_SIDECAR_BOOTSTRAP\0".utf8)) != nil
+        let lib = engine.wineDir.appendingPathComponent("lib/wine", isDirectory: true)
+        let ntdll = lib.appendingPathComponent("x86_64-unix/ntdll.so")
+        let found = (try? Data(contentsOf: ntdll, options: .alwaysMapped))?.range(of: Data("ROSETTA_X87_PATH\0".utf8)) != nil
+            && !FileManager.default.fileExists(atPath: lib.appendingPathComponent("i386-unix/wine").path)
         hooks[engine.folder] = found
         return found
     }
@@ -389,7 +408,7 @@ extension AppModel {
     var x87Blocker: String? {
         guard let engine else { return "Finish Unwine's setup first." }
         if !X87Sidecar.engineHasHook(engine) {
-            return "Unwine's engine does not have the newer x87 hook (the part of Wine that starts x87sidecar). With the older hook, x87sidecar stops every 32-bit game at start, so it stays off. An engine update with the newer hook can bring it back."
+            return "Unwine's engine has no x87 hook that Unwine can use (the part of Wine that starts x87sidecar), so x87sidecar cannot attach to games. An Unwine update can fix this."
         }
         if let p = stored.x87Probe, p.isCurrent, !p.passed {
             return "x87sidecar \(p.sidecarVersion) does not support the Rosetta in macOS \(p.macOSVersion) yet."
@@ -411,7 +430,8 @@ extension AppModel {
             x87Rechecked = true
             Task { await recheckX87() }
         }
-        guard stored.analyses[id]?.is64Bit == false, x87Ready else { s.x87 = false; return s }
+        // A Steam Play runner from an older Unwine, still in use, would stop the game (Runner.startsX87).
+        guard stored.analyses[id]?.is64Bit == false, x87Ready, Runner.startsX87 else { s.x87 = false; return s }
         if !s.x87PreciseFaults, X87Sidecar.lastSession(of: x87Games(for: id), bytes: 64_000).hitFault, noteX87Fault(id) {
             s.x87PreciseFaults = true
         }

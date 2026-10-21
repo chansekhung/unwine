@@ -669,7 +669,7 @@ enum OnlineSteam {
                 // No Faster x87 math in Online mode: x87sidecar would attach to steam.exe and to the VAC
                 // game itself, and a ban is permanent. Unwine takes no risk with VAC.
                 if env.removeValue(forKey: "ROSETTA_X87_PATH") != nil {
-                    env["X87_PRECISE_FAULTS"] = nil
+                    for name in X87Sidecar.variables { env[name] = nil }
                     notes.append("Faster x87 math is off in Online mode, so nothing attaches to Windows Steam or to a game with Valve Anti-Cheat (VAC). Play uses it.")
                 }
                 if applied.dropped {
@@ -759,7 +759,7 @@ enum OnlineSteam {
                      "UNWINE_HIGH_RESOLUTION": "High Resolution Mode", "UNWINE_FILL_SCREEN": "games fill the whole screen",
                      // What a game's page sets now: logs, Faster x87 math, Display, Launch options and mods.
                      "WINEDEBUG": "Detailed logs", "DXVK_LOG_LEVEL": "Detailed logs", "DXMT_LOG_LEVEL": "Detailed logs",
-                     "ROSETTA_X87_PATH": "Faster x87 math", "X87_PRECISE_FAULTS": "Faster x87 math",
+                     "ROSETTA_X87_PATH": "Faster x87 math", "X87_PRECISE_FAULTS": "Faster x87 math", "WINEARCH": "Faster x87 math",
                      "CNC_DDRAW_CONFIG_FILE": "DirectDraw picture",
                      "LANG": "game language", "LC_ALL": "game language", "WINEUSERLOCALE": "game language",
                      "WINEDLLOVERRIDES": "DLL overrides", "TZ": "time zone"]

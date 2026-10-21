@@ -21,7 +21,13 @@ enum Runner {
     /// 8: quiet logs (Wine's at -all, DXVK's and DXMT's at warn) unless a game's Detailed logs or Steam's
     /// launch options ask for more; no WINEESYNC (this Wine has no esync).
     /// 9: wineboot, and the programs it starts, run without Faster x87 math.
-    static let format = 9
+    /// 10: the loader wrapper starts x87sidecar itself (`startX87`).
+    static let format = 10
+
+    /// A game's profile may turn on Faster x87 math only for a runner whose wrapper starts x87sidecar
+    /// itself. An older wrapper gives Wine ROSETTA_X87_PATH, and x87sidecar then gets this shell script
+    /// and stops the game. No runner yet counts as new: Unwine builds one before a Steam game starts.
+    static var startsX87: Bool { (record()?.format ?? format) >= 10 }
 
     static var base: URL { SteamPlayPaths.runners.appendingPathComponent("crossover-\(build)", isDirectory: true) }
     static var root: URL { base.appendingPathComponent("CrossOver", isDirectory: true) }
@@ -238,8 +244,22 @@ enum Runner {
           reg|reg.exe|*/reg|*/reg.exe|*'\\'reg|*'\\'reg.exe) DECANT_NO_X87=1 ;;
         esac
         if [ -n "${DECANT_NO_X87:-}" ]; then
-          unset -v ROSETTA_X87_PATH X87_PRECISE_FAULTS
+          unset -v ROSETTA_X87_PATH WINEARCH X87_PRECISE_FAULTS
           export DECANT_NO_X87
+        fi
+        """
+
+    /// The wrapper's last step. With Faster x87 math, Wine would start x87sidecar with the loader it
+    /// means to run next: this wrapper, a shell script. x87sidecar cannot attach to a script (sh then
+    /// stops on a trap), so the wrapper starts x87sidecar itself, with the real loader, and Wine never
+    /// sees ROSETTA_X87_PATH. Each process Wine starts comes back through the wrapper, which reads the
+    /// profile and puts x87sidecar back. The real loader does not start itself again (its preloader is
+    /// built in), so x87sidecar attaches once per process.
+    static let startX87 = """
+        if [ -n "${ROSETTA_X87_PATH:-}" ]; then
+          x87="$ROSETTA_X87_PATH"
+          unset -v ROSETTA_X87_PATH
+          if [ -x "$x87" ]; then exec "$x87" "$real" "$@"; fi
         fi
         """
 
@@ -304,6 +324,7 @@ enum Runner {
           esac
         fi
         [ -x "$real" ] || real="$real_src"
+        \(startX87)
         exec "$real" "$@"
 
         """

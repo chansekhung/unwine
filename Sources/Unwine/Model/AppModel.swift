@@ -416,6 +416,8 @@ final class AppModel {
         if !gameRunning {
             if runnerNeedsRefresh, let engine, !Runner.isInUse() {
                 runnerNeedsRefresh = (try? Runner.refresh(engine: engine, d3dmetal: d3dmetal)) == nil
+                // Profiles left Faster x87 math out while the old runner was in use (Runner.startsX87).
+                if !runnerNeedsRefresh { writeAllProfiles() }
             }
             flushProfiles()
             addBottleFonts()
