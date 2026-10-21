@@ -190,6 +190,14 @@ final class AppModel {
     private var lastHighballCheck = Date()
     private var runnerNeedsRefresh = false  // the runner is from an older Unwine and was in use at launch
 
+    // Engine environment, Mac Driver options and renderer extras (group f). See AppModel+Bottles.swift.
+    @ObservationIgnored var bottleTasks: [Int: Task<Void, Never>] = [:]  // each Steam game's last bottle write, run in order
+    @ObservationIgnored var bottlesChecked = false  // every Steam game's bottle was checked once since Unwine opened
+    var bottleWriting = Set<Int>()      // Steam games whose bottle gets its display settings now
+    var bottleWaiting = Set<Int>()      // Steam games whose settings wait for their bottle (open, or not made yet)
+    var bottleFailed = Set<Int>()       // Steam games whose last bottle write did not take
+    var bottlePlayQueued = Set<Int>()   // Play waits for a bottle write to finish
+
     /// Switching between Mac Steam and Windows Steam.
     var onlineBusy: Bool { onlineWords != nil }
     /// Mac Steam must stay closed while Windows Steam runs: two clients on one account sign each
@@ -317,6 +325,7 @@ final class AppModel {
             }
             flushProfiles()
             addBottleFonts()
+            prepareWaitingBottles()
             // Windows Steam runs on the engine too, so an engine switch waits for it as well.
             if stored.stagedEngine != nil, !isCheckingUpdates, !online.inUse, !onlineStep.isRunning { await activateStagedEngine() }
         }
@@ -622,6 +631,7 @@ final class AppModel {
     func apply(_ preset: Preset, to game: SteamGame) {
         let now = settings(for: game.id)
         var s = settings(preset, for: game, advice: advice(for: game))
+        s.keepPlayerChoices(from: now)      // logs, display and experimental choices (AppModel+Bottles)
         s.metalHUD = now.metalHUD
         s.lowLatency = now.lowLatency
         s.asyncShaders = now.asyncShaders
@@ -641,6 +651,7 @@ final class AppModel {
         let gptk4 = d3dmetal?.isVersion4 == true
         func normal(_ s: GameSettings) -> GameSettings {
             var s = s
+            s.dropPlayerChoices()           // logs, display and experimental choices (AppModel+Bottles)
             let real = s.renderer == .auto ? a.renderer
                 : Profiles.resolve(s.renderer, analysis: stored.analyses[game.id], hasD3DMetal: d3dmetal != nil)
             if s.renderer == a.renderer { s.renderer = .auto }
@@ -710,7 +721,7 @@ final class AppModel {
         if game.localExe != nil { Task { await playLocal(game) }; return }
         guard macSteamAllowed() else { return }
         writeProfile(for: game.id)
-        MacSteam.play(game.id)
+        startWhenBottleReady(game)      // MacSteam.play, after a display write in its bottle (AppModel+Bottles)
         // Steam starts the game in the background; bring its window to the front once it shows,
         // so the keyboard and mouse go to the game at once.
         let pfx = game.compatData.appendingPathComponent("pfx")
@@ -1258,6 +1269,7 @@ final class AppModel {
         let dir = games.first { $0.id == id }?.installDir
         do { try Profiles.write(appID: id, settings: s, renderer: r, api: stored.analyses[id]?.api, engine: engine, d3dmetal: d3dmetal, gameDir: dir) }
         catch { log.line("profile \(id) failed: \(error)") }
+        prepareBottle(for: id)          // a Steam game's display values and DLSS files (AppModel+Bottles)
     }
 
     func writeAllProfiles() {

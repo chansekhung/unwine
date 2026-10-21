@@ -100,6 +100,7 @@ struct GameSheet: View {
                                 .font(.system(size: 12)).foregroundStyle(Palette.glow)
                         }
                     }
+                    if !isLocal { BottleWaitRow(game: game) }
                     if isLocal, let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {
                         NoticeRow(color: Palette.warn, icon: "questionmark.folder",
                                   text: "Unwine cannot find \(exe.lastPathComponent) in \(exe.deletingLastPathComponent().path). If the game moved, or its drive is not connected, point Unwine at it again. Its bottle and saves stay.") {
@@ -220,6 +221,9 @@ struct GameSheet: View {
                         Toggle("Metal 4 mode (GPTK 4)", isOn: binding(game.id, \.metal4))
                         note(metal4Note(resolved), warn: false)
                     }
+
+                    section("Display") { DisplayControls(game: game) }
+                    if analysis?.api == .dx12 { section("Experimental") { DXMTD3D12Control(game: game) } }
                     }
 
                     section("Fix things") {
@@ -238,6 +242,7 @@ struct GameSheet: View {
                             .disabled(!FileManager.default.fileExists(atPath: game.runLog.path))
                             .help("Logs appear after the first Play")
                         }
+                        DetailedLogsControl(game: game)
                         HStack(spacing: 8) {
                             if isLocal {
                                 Button("Rename…") { newName = game.name; renaming = true }.buttonStyle(QuietButtonStyle())
@@ -372,6 +377,10 @@ struct GameSheet: View {
     }
 
     private func metal4Note(_ resolved: Renderer) -> String {
+        // Metal 4 came with macOS 26; Unwine sets nothing for it on an older macOS.
+        guard Profiles.hasMetal4 else {
+            return "Needs macOS 26 or newer. This Mac has macOS \(ProcessInfo.processInfo.operatingSystemVersion.majorVersion), so this switch does nothing."
+        }
         guard let d = model.d3dmetal, d.isVersion4 else {
             return "Needs GPTK 4. \(model.d3dmetal.map { "You have \($0.label)." } ?? "GPTK is not added yet.") Until then this switch does nothing."
         }
