@@ -203,6 +203,7 @@ struct GameSheet: View {
                         hint("Faster in most games. Turn off if a game freezes or a download stalls.")
                         Toggle("Tell games the CPU has AVX", isOn: binding(game.id, \.advertiseAVX))
                         hint("Some new games refuse to start without it. Rosetta handles it.")
+                        if analysis?.is64Bit == false { X87Switch(game: game) }     // Faster x87 math, 32-bit games only
                         FrameCapPicker(cap: binding(game.id, \.fpsCap))
                         if resolved == .wined3d && s.fpsCap != nil {
                             note("Unwine has no frame cap for Wine's own layer (WineD3D), so this cap does nothing for this game. Use the game's own frame limit instead.", warn: true)

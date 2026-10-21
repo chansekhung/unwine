@@ -25,6 +25,9 @@ struct GameSettings: Codable, Equatable, Sendable {
     var forceSDR = false                // HDR off: DXMT and DXVK tell the game the screen has no HDR
     var dxmtD3D12 = false               // experimental: a DirectX 12 game runs on DXMT's own DirectX 12 part
     var ddrawMode: DirectDrawMode = .auto   // DirectDraw games (cnc-ddraw): the game's own mode, a window, or full screen
+    // Faster x87 math (x87sidecar group)
+    var x87 = false                     // Faster x87 math: x87sidecar speeds up a 32-bit game's x87 math under Rosetta
+    var x87PreciseFaults = false        // set by Unwine after the game stopped on an x87 fault (X87_PRECISE_FAULTS=1)
 }
 
 extension GameSettings {
@@ -53,6 +56,8 @@ extension GameSettings {
         forceSDR = (try? c.decodeIfPresent(Bool.self, forKey: .forceSDR)) ?? d.forceSDR
         dxmtD3D12 = (try? c.decodeIfPresent(Bool.self, forKey: .dxmtD3D12)) ?? d.dxmtD3D12
         ddrawMode = (try? c.decodeIfPresent(DirectDrawMode.self, forKey: .ddrawMode)) ?? d.ddrawMode
+        x87 = (try? c.decodeIfPresent(Bool.self, forKey: .x87)) ?? d.x87
+        x87PreciseFaults = (try? c.decodeIfPresent(Bool.self, forKey: .x87PreciseFaults)) ?? d.x87PreciseFaults
     }
 }
 
@@ -257,6 +262,7 @@ enum Profiles {
 
         export("WINEMSYNC", s.msync && engine.supportsMsync ? "1" : "0")
         export("ROSETTA_ADVERTISE_AVX", s.advertiseAVX ? "1" : "0")
+        for (k, v) in X87Sidecar.exports(s) { export(k, v) }     // Faster x87 math: ROSETTA_X87_PATH (X87Sidecar.swift)
         if s.metalHUD { export("MTL_HUD_ENABLED", "1") }
         // Logs are quiet unless this game's Detailed logs is on (engine.env and WineEnvironment set the
         // quiet levels). A level from Steam's launch options still wins: the runner's wrappers keep it.

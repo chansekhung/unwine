@@ -41,6 +41,8 @@ struct StoredState: Codable {
     var favourites: Set<Int> = []           // games in the Favourites shelf at the top of the library
     var hiddenGames: Set<Int> = []          // games the user hid; "Hidden games" under the grid shows them
     var withoutSteam = false                // setup finished without Mac Steam, for games added by their .exe
+    // Faster x87 math (x87sidecar group)
+    var x87Probe: X87Probe?                 // x87sidecar's last check of Rosetta, and the macOS build it ran on
 
     init() {}
 
@@ -84,6 +86,9 @@ struct StoredState: Codable {
         favourites = (try? c.decodeIfPresent(Set<Int>.self, forKey: .favourites)) ?? []
         hiddenGames = (try? c.decodeIfPresent(Set<Int>.self, forKey: .hiddenGames)) ?? []
         withoutSteam = (try? c.decodeIfPresent(Bool.self, forKey: .withoutSteam)) ?? false
+        // Faster x87 math (x87sidecar group). An unreadable check counts as none: x87sidecar checks
+        // Rosetta again before a game uses it.
+        x87Probe = try? c.decodeIfPresent(X87Probe.self, forKey: .x87Probe)
     }
 }
 
@@ -289,6 +294,10 @@ final class AppModel {
 
     // Measured session summary (metalperftrace): open game bottles and the sessions being read
     let sessionWatch = SessionWatch()
+
+    // Faster x87 math (x87sidecar group; see Engine/X87Sidecar.swift)
+    var x87Task: X87Task?               // x87sidecar being downloaded or checked, or why that failed
+    var x87Rechecked = false            // x87sidecar's check after a macOS update already ran this time
 
     var stored = StoredState()
     let log = LogFile("unwine.log")
@@ -760,9 +769,9 @@ final class AppModel {
 
     /// Applies one of the advisor's setting sets. The layer goes back to Automatic (which is the
     /// advised layer), and the Metal overlay stays as the user set it: it is a display choice.
-    /// The Metal overlay, MetalFX sharpening, Low latency, background shader building, 120 fps mode
-    /// and Save battery when unplugged stay as the user set them: they are the user's choices, not
-    /// speed or battery settings.
+    /// The Metal overlay, MetalFX sharpening, Low latency, background shader building, 120 fps mode,
+    /// Save battery when unplugged and Faster x87 math stay as the user set them: they are the user's
+    /// choices, not speed or battery settings.
     func apply(_ preset: Preset, to game: SteamGame) {
         let now = settings(for: game.id)
         var s = settings(preset, for: game, advice: advice(for: game))
@@ -773,6 +782,8 @@ final class AppModel {
         s.asyncShaders = now.asyncShaders
         s.fps120 = now.fps120
         s.saveBatteryUnplugged = now.saveBatteryUnplugged
+        s.x87 = now.x87
+        s.x87PreciseFaults = now.x87PreciseFaults
         stored.games[game.id] = s
         stored.presetChoice[game.id] = preset.rawValue
         save()
@@ -798,6 +809,8 @@ final class AppModel {
             s.asyncShaders = true
             s.fps120 = false
             s.saveBatteryUnplugged = true
+            s.x87 = false
+            s.x87PreciseFaults = false
             if !(real == .d3dmetal && gptk4) { s.metal4 = true }
             if real == .wined3d || (real == .d3dmetal && !gptk4) || (real == .dxvk && api == .dx12) { s.fpsCap = nil }
             if !((api == .dx11 || api == .dx12) && (real == .d3dmetal || real == .dxmt)) { s.metalFX = false }
@@ -1706,7 +1719,7 @@ final class AppModel {
             pendingProfiles.insert(id)
             return
         }
-        let s = settings(for: id)
+        let s = profileSettings(for: id)        // Faster x87 math only where it can work (X87Sidecar.swift)
         let r = renderer(for: id)
         let dir = games.first { $0.id == id }?.installDir
         do {
