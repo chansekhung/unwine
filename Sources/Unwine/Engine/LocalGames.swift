@@ -139,9 +139,10 @@ enum LocalGames {
     static func isRunning(_ game: SteamGame) -> Bool { OnlineSteam.serverIsAlive(prefix(game)) }
 
     /// The variables the game starts with: the engine's base, the game's Unwine profile on top,
-    /// and the Vulkan driver (the Steam path takes it from the runner's engine.env).
+    /// and the Vulkan driver (the Steam path takes it from the runner's engine.env). Logs are quiet
+    /// unless the game's Detailed logs is on: its profile then sets the detailed levels.
     static func environment(engine: InstalledEngine, prefix: URL, profile: URL) -> [String: String] {
-        var env = WineEnvironment.base(engine: engine, prefix: prefix, debug: true)
+        var env = WineEnvironment.base(engine: engine, prefix: prefix, debug: false)
         if let text = try? String(contentsOf: profile, encoding: .utf8) {
             for (key, raw) in OnlineSteam.profileAssignments(text) {
                 if let value = OnlineSteam.shellWord(raw, env: env) { env[key] = value }
@@ -186,6 +187,9 @@ enum LocalGames {
 
         // Read the profile again now: the user may have changed settings while the bottle was made.
         env = environment(engine: engine, prefix: pfx, profile: profile)
+        // The game's Display choices (and, for D3DMetal, Apple's DLSS files) go into the closed bottle
+        // now: Wine reads them when the game starts. An open bottle keeps what it has (BottlePrep).
+        _ = await BottlePrep.apply(profile: profile, prefix: pfx, engine: engine, game: game.name, log: log, announce: phase)
         // The game runs from an app bundle that says "game", so macOS can give it Game Mode. A
         // bundle is only rebuilt while the bottle is closed: running processes use its files.
         await phase("Starting \(game.name)…")

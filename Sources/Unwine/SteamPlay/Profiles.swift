@@ -15,6 +15,14 @@ struct GameSettings: Codable, Equatable, Sendable {
     var lowLatency = false              // DXVK's latency sleep, a Reflex-like wait before the game reads input
     var asyncShaders = true             // DirectX 8/9: build new shaders in the background, never stop the game for one
     var fps120 = false                  // 120 fps mode: DXMT paces DirectX 10/11 games to the screen's refresh, not a 60 Hz game mode
+    // Logs, display and renderer extras. The display values go into the game's closed bottle (BottlePrep).
+    var detailedLogs = false            // Wine's error lines and DXVK's and DXMT's notes in the logs (quiet otherwise)
+    var retina = false                  // added games: Wine's Retina mode and 192 DPI (Steam Play: NOTPROTON_RETINA=1 in Steam)
+    var fillScreen = false              // Wine's CaptureDisplaysForFullscreen: a full-screen game takes the whole display
+    var commandIsCtrl = false           // both Command keys reach the game as Ctrl (and Option as Alt)
+    var forceSDR = false                // HDR off: DXMT and DXVK tell the game the screen has no HDR
+    var dxmtD3D12 = false               // experimental: a DirectX 12 game runs on DXMT's own DirectX 12 part
+    var ddrawMode: DirectDrawMode = .auto   // DirectDraw games (cnc-ddraw): the game's own mode, a window, or full screen
 }
 
 extension GameSettings {
@@ -34,6 +42,13 @@ extension GameSettings {
         lowLatency = (try? c.decodeIfPresent(Bool.self, forKey: .lowLatency)) ?? d.lowLatency
         asyncShaders = (try? c.decodeIfPresent(Bool.self, forKey: .asyncShaders)) ?? d.asyncShaders
         fps120 = (try? c.decodeIfPresent(Bool.self, forKey: .fps120)) ?? d.fps120
+        detailedLogs = (try? c.decodeIfPresent(Bool.self, forKey: .detailedLogs)) ?? d.detailedLogs
+        retina = (try? c.decodeIfPresent(Bool.self, forKey: .retina)) ?? d.retina
+        fillScreen = (try? c.decodeIfPresent(Bool.self, forKey: .fillScreen)) ?? d.fillScreen
+        commandIsCtrl = (try? c.decodeIfPresent(Bool.self, forKey: .commandIsCtrl)) ?? d.commandIsCtrl
+        forceSDR = (try? c.decodeIfPresent(Bool.self, forKey: .forceSDR)) ?? d.forceSDR
+        dxmtD3D12 = (try? c.decodeIfPresent(Bool.self, forKey: .dxmtD3D12)) ?? d.dxmtD3D12
+        ddrawMode = (try? c.decodeIfPresent(DirectDrawMode.self, forKey: .ddrawMode)) ?? d.ddrawMode
     }
 }
 
@@ -81,13 +96,18 @@ enum Profiles {
         let (dxvk, dxmt) = configs(settings: settings, renderer: renderer, api: api, gameDir: gameDir)
         try writeOrRemove(dxvk, at: dxvkConfig(for: appID))
         try writeOrRemove(dxmt, at: dxmtConfig(for: appID))
-        let text = render(appID: appID, settings: settings, renderer: renderer, engine: engine, d3dmetal: d3dmetal,
-                          hasDXVKConfig: dxvk != nil, hasDXMTConfig: dxmt != nil)
+        // A DirectDraw game's cnc-ddraw reads Unwine's own ddraw.ini, never one in the game's folder.
+        let directDraw = renderer != .wined3d
+            && DirectDrawConfig.write(appID: appID, settings: settings, api: api, gameDir: gameDir, engine: engine)
+        let text = render(appID: appID, settings: settings, renderer: renderer, api: api, engine: engine, d3dmetal: d3dmetal,
+                          hasDXVKConfig: dxvk != nil, hasDXMTConfig: dxmt != nil, directDraw: directDraw)
         try text.write(to: file(for: appID), atomically: true, encoding: .utf8)
     }
 
     static func remove(appID: Int) {
-        for url in [file(for: appID), dxvkConfig(for: appID), dxmtConfig(for: appID)] { try? FileManager.default.removeItem(at: url) }
+        for url in [file(for: appID), dxvkConfig(for: appID), dxmtConfig(for: appID), DirectDrawConfig.file(for: appID)] {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     private static func writeOrRemove(_ text: String?, at url: URL) throws {
@@ -118,12 +138,16 @@ enum Profiles {
             // to the window, and the DirectX 9 one never draws, so it hid the whole game: a black
             // screen with music. With this, DXVK makes that layer only when DirectX 9 really presents.
             if api != .dx9 && api != .dx8 { dxvk.append("d3d9.deferSurfaceCreation = True") }
+            // HDR off (the game's Display choice): DXVK tells a DirectX 10/11 game the screen has no HDR.
+            if s.forceSDR { dxvk.append("dxgi.enableHDR = False") }
         }
         var dxmt: [String] = []
         // DXMT runs every layer choice except DXVK, WineD3D and a real D3DMetal (which has its own cap).
         if renderer == .dxmt || renderer == .auto {
             if let cap = s.fpsCap {
                 dxmt.append("d3d11.preferredMaxFrameRate = \(cap)")
+                // DXMT's DirectX 12 part (experimental) reads a cap of its own.
+                if s.dxmtD3D12 && api == .dx12 { dxmt.append("d3d12.preferredMaxFrameRate = \(cap)") }
             } else if s.fps120 && screenHz > 60 {
                 // A game in a 60 Hz full-screen mode gets paced to 60 by DXMT, though the Mac screen
                 // stays at its own rate. The user's own cap above wins over this.
@@ -131,6 +155,11 @@ enum Profiles {
                 dxmt.append("d3d11.preferredMaxFrameRate = \(screenHz)")
             }
         }
+        // Online mode runs a DXVK game on DXMT and gives DXMT this file. The cap reached DXMT through
+        // DXVK_FRAME_RATE before, which only DXVK 1.x reads, so the profile no longer carries it.
+        if renderer == .dxvk, let cap = s.fpsCap { dxmt.append("d3d11.preferredMaxFrameRate = \(cap)") }
+        // HDR off: DXMT tells the game the screen has no HDR (Online mode runs DXVK games on DXMT too).
+        if s.forceSDR && (renderer == .dxmt || renderer == .auto || renderer == .dxvk) { dxmt.append("dxgi.forceSDR = True") }
         // A game's own dxvk.conf or dxmt.conf counts too: Unwine's file replaces the game's, so it carries it.
         let header = "# Written by Unwine. Settings from Steam's launch options still apply on top.\n"
         let ownDXVK = renderer != .wined3d ? shipped("dxvk.conf") : "", ownDXMT = shipped("dxmt.conf")
@@ -138,18 +167,34 @@ enum Profiles {
                 dxmt.isEmpty && ownDXMT.isEmpty ? nil : header + ownDXMT + dxmt.joined(separator: "\n") + "\n")
     }
 
-    static func render(appID: Int?, settings s: GameSettings, renderer: Renderer,
+    /// Metal 4 exists from macOS 26. D3DMetal makes it its default on macOS 27; below 26 there is nothing to switch on.
+    static var hasMetal4: Bool {
+        ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))
+    }
+
+    static func render(appID: Int?, settings s: GameSettings, renderer: Renderer, api: GraphicsAPI? = nil,
                        engine: InstalledEngine, d3dmetal: D3DMetalInstall?,
-                       hasDXVKConfig: Bool = false, hasDXMTConfig: Bool = false) -> String {
+                       hasDXVKConfig: Bool = false, hasDXMTConfig: Bool = false, directDraw: Bool = false) -> String {
         let q = Runner.shellQuote
         var out = ["# Written by Unwine for \(appID.map { "Steam app \($0)" } ?? "games without their own settings").",
                    "# Renderer: \(renderer.rawValue)"]
         func export(_ k: String, _ v: String) { out.append("export \(k)=\(q(v))") }
         func dir(_ name: String) -> String { engine.renderer(name).path }
 
+        // Wine never reads this line: Unwine writes these values into the closed bottle before the game
+        // starts (BottlePrep). In Steam Play, RetinaMode is NotProton's, from Steam's launch options.
+        if let appID { out.append(MacDriverValues(settings: s, appID: appID).profileLine) }
+
         export("WINEMSYNC", s.msync && engine.supportsMsync ? "1" : "0")
         export("ROSETTA_ADVERTISE_AVX", s.advertiseAVX ? "1" : "0")
         if s.metalHUD { export("MTL_HUD_ENABLED", "1") }
+        // Logs are quiet unless this game's Detailed logs is on (engine.env and WineEnvironment set the
+        // quiet levels). A level from Steam's launch options still wins: the runner's wrappers keep it.
+        if s.detailedLogs {
+            export("WINEDEBUG", WineEnvironment.detailedDebug)
+            export("DXVK_LOG_LEVEL", WineEnvironment.detailedLayerLog)
+            export("DXMT_LOG_LEVEL", WineEnvironment.detailedLayerLog)
+        }
 
         // DirectX 9 and DirectDraw helpers ride along with every modern layer.
         if renderer != .wined3d {
@@ -158,7 +203,12 @@ enum Profiles {
             // off as well: the crash fix applies either way, and the async fix then does nothing.
             let d9vk = RendererPatches.fixedDir("d9vk", engine: engine)?.path
             if engine.supports("WINEDLLPATH_D9VK") { export("WINEDLLPATH_D9VK", d9vk ?? dir("d9vk")) }
-            if engine.supports("WINEDLLPATH_CNCD") { export("WINEDLLPATH_CNCD", dir("cnc_ddraw")) }
+            if engine.supports("WINEDLLPATH_CNCD") {
+                export("WINEDLLPATH_CNCD", dir("cnc_ddraw"))
+                // Unwine's own ddraw.ini for a DirectDraw game, as a Windows path (Wine's Z: drive is the
+                // Mac's /). Without it, cnc-ddraw keeps its file in the bottle or in the game's folder.
+                if directDraw, let appID { export("CNC_DDRAW_CONFIG_FILE", DirectDrawConfig.windowsPath(DirectDrawConfig.file(for: appID))) }
+            }
             // DXVK (also behind the DirectX 9 helper) reads the frame cap and latency sleep from its file.
             if hasDXVKConfig { export("DXVK_CONFIG_FILE", dxvkConfig(for: appID).path) }
         }
@@ -172,24 +222,31 @@ enum Profiles {
             if s.metalFX { export("D3DM_ENABLE_METALFX", "1") }
             if let rt = s.rayTracing { export("D3DM_SUPPORT_DXR", rt ? "1" : "0") }
             if d.isVersion4 {
-                export("D3DM_MTL4", s.metal4 ? "1" : "0")
+                // Below macOS 26 there is no Metal 4, so the variable stays out.
+                if hasMetal4 { export("D3DM_MTL4", s.metal4 ? "1" : "0") }
                 if let cap = s.fpsCap { export("D3DM_MAX_FPS", String(cap)) }
             }
         case .dxvk:
             let three = engine.renderer("dxvk3")
             let patched = RendererPatches.fixedDir("dxvk3", engine: engine)
-            export("WINEDLLPATH_DXVK", patched?.path ?? (FileManager.default.fileExists(atPath: three.path) ? three.path : dir("dxvk")))
+            let legacy = patched == nil && !FileManager.default.fileExists(atPath: three.path)
+            export("WINEDLLPATH_DXVK", patched?.path ?? (legacy ? dir("dxvk") : three.path))
             export("DXVK_ASYNC", s.asyncShaders ? "1" : "0")
-            if let cap = s.fpsCap { export("DXVK_FRAME_RATE", String(cap)) }   // DXVK 1.x; 3.x reads the config file
+            // Only the old DXVK 1.x folder reads DXVK_FRAME_RATE; DXVK 3 takes the cap from its file.
+            if legacy, let cap = s.fpsCap { export("DXVK_FRAME_RATE", String(cap)) }
+            // Online mode runs this game on DXMT, and its cap reaches DXMT through this file.
+            if hasDXMTConfig { export("DXMT_CONFIG_FILE", dxmtConfig(for: appID).path) }
         case .wined3d:
             break
         default: // .dxmt, .auto, or .d3dmetal without an import
-            export("WINEDLLPATH_DXMT", dir("dxmt"))
+            // Experimental: a DirectX 12 game with the switch on gets DXMT's own DirectX 12 part.
+            let d3d12 = s.dxmtD3D12 && api == .dx12 ? DXMTD3D12.folder(engine: engine) : nil
+            export("WINEDLLPATH_DXMT", d3d12?.path ?? dir("dxmt"))
             export("DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN", "1")
             if s.metalFX { export("DXMT_ENABLE_NVEXT", "1") }
-            // Steam Play bottles run without Retina mode (Online mode's follows its High Resolution
-            // Mode switch), so a game draws at the screen's point size and DXMT's default 2x MetalFX
-            // output lands on the screen's real pixels.
+            // Bottles run without Retina mode unless the game's Sharp picture (or Steam's launch options,
+            // or Online mode's High Resolution Mode) turns it on, so a game draws at the screen's point
+            // size and DXMT's default 2x MetalFX output lands on the screen's real pixels.
             if s.metalFXSpatial { export("DXMT_METALFX_SPATIAL_SWAPCHAIN", "1") }
             if hasDXMTConfig { export("DXMT_CONFIG_FILE", dxmtConfig(for: appID).path) }
         }
