@@ -82,9 +82,7 @@ struct SettingsView: View {
                         Text("Unwine's tool shows in Steam as \u{201C}\(Runner.toolDisplay)\u{201D}. Unwine never changes Steam.app.")
                             .font(.system(size: 11)).foregroundStyle(Palette.muted)
                         HStack(spacing: 8) {
-                            Button("Restart Steam") { Task { await model.restartSteam() } }.buttonStyle(QuietButtonStyle())
-                                .disabled(model.gameRunning || model.macSteamBlocked)
-                                .help(model.gameRunning ? "Close your game first" : model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Steam closes and opens again")
+                            RestartSteamButton(primary: false)
                             Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }
                                 .buttonStyle(QuietButtonStyle())
                         }

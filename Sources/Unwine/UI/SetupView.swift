@@ -87,11 +87,10 @@ struct SetupView: View {
             Button("Choose file…") { pickingGPTK = true }.buttonStyle(QuietButtonStyle())
             Button("Skip") { model.skipGPTK(); Task { await model.runSetup() } }.buttonStyle(QuietButtonStyle())
         case (.steam, .needsUser):
-            if !model.steamRunning {
+            if !model.steamRunning && model.steamRestartWords == nil {
                 Button("Open Steam") { MacSteam.start() }.buttonStyle(PrimaryButtonStyle())
             } else {
-                Button("Restart Steam") { Task { await model.restartSteam() } }.buttonStyle(PrimaryButtonStyle())
-                    .disabled(model.gameRunning)
+                RestartSteamButton()     // stays through a restart, with its words, while Steam is closed
             }
             Button("Check again") { Task { await model.refreshSteam(); model.checkSteamConnection() } }.buttonStyle(QuietButtonStyle())
             Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }

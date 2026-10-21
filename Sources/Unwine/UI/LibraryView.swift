@@ -118,7 +118,9 @@ struct LibraryView: View {
     }
 
     @ViewBuilder private var steamPlayNotice: some View {
-        if model.online.running || model.onlineBusy {
+        if model.onlineQuitOffer != nil && model.online.running && !model.onlineBusy {
+            OnlineQuitOffer()
+        } else if model.online.running || model.onlineBusy {
             NoticeCard(icon: "globe", color: Palette.glow,
                        title: model.online.running ? "Online mode is on" : "Switching Steam",
                        text: model.willReopenMacSteam
@@ -154,17 +156,15 @@ struct LibraryView: View {
             NoticeCard(icon: "exclamationmark.triangle.fill", color: Palette.warn,
                        title: "Steam updated, and Steam Play does not match it yet",
                        text: "Your games stay installed. Steam Play's add-on needs a newer build from NotProton's project. Unwine already pulled in its newest matching files.") {
-                Button("Restart Steam") { Task { await model.restartSteam() } }.buttonStyle(PrimaryButtonStyle())
-                    .disabled(model.gameRunning).help(model.gameRunning ? "Close your game first" : "Steam closes and opens again")
+                RestartSteamButton()
                 Button("NotProton releases") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton/releases")!) }
                     .buttonStyle(QuietButtonStyle())
             }
-        case .off where model.steamRunning:
+        case .off where model.steamRunning || model.steamRestartWords != nil:     // stays through a restart
             NoticeCard(icon: "hand.point.right.fill", color: Palette.warn,
                        title: "Steam does not list Unwine right now",
                        text: "Unwine's tool is ready. It appears in Steam once Steam Play is on in Steam.") {
-                Button("Restart Steam") { Task { await model.restartSteam() } }.buttonStyle(PrimaryButtonStyle())
-                    .disabled(model.gameRunning).help(model.gameRunning ? "Close your game first" : "Steam closes and opens again")
+                RestartSteamButton()
                 Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }
                     .buttonStyle(QuietButtonStyle())
             }
@@ -203,8 +203,21 @@ struct GameTile: View {
     let rename: () -> Void
     let remove: () -> Void
     @State private var hovering = false
+    @State private var confirmQuit = false
 
     private var busy: Bool { model.localStarting[game.id] != nil || model.localRunning.contains(game.id) }
+
+    /// A menu item cannot show a tooltip, so a Steam game's blocked Play says why in its title.
+    private var steamPlayTitle: String {
+        if model.macSteamBlocked { return "Play (Steam is closed while Online mode runs)" }
+        if game.state != .installed { return "Play (finish the download in Steam first)" }
+        if model.steamRestartWords != nil || model.busyGame != nil { return "Play (Steam is restarting)" }
+        switch model.runState(of: game) {
+        case .starting: return "Play (the game is starting)"
+        case .closing: return "Play (the game is closing)"
+        case .idle, .running: return "Play in Steam"
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -224,6 +237,11 @@ struct GameTile: View {
         .onHover { hovering = $0 }
         .onTapGesture(perform: open)
         .contextMenu { menu }
+        .confirmationDialog("Quit \(game.name)?", isPresented: $confirmQuit) {
+            Button("Quit game", role: .destructive) { Task { await model.quitSteamGame(game) } }
+        } message: {
+            Text(AppModel.quitGameWarning)
+        }
         .task(id: game.state) { await model.analyze(game) }
         .help("Settings for \(game.name). Right-click for more.")
     }
@@ -242,10 +260,16 @@ struct GameTile: View {
             }
             .disabled(busy)
         } else {
-            Button { model.play(game) } label: {
-                Label(model.macSteamBlocked ? "Play (Steam is closed while Online mode runs)" : "Play in Steam", systemImage: "play.fill")
+            if model.steamGamesRunning.contains(game.id) {
+                // The bottle is open: the game runs, or its start hangs. Quit game asks first.
+                Button { confirmQuit = true } label: {
+                    Label(model.quittingGames.contains(game.id) ? "Quit game (closing now)" : "Quit game…", systemImage: "stop.fill")
+                }
+                .disabled(model.quittingGames.contains(game.id))
+            } else {
+                Button { model.play(game) } label: { Label(steamPlayTitle, systemImage: "play.fill") }
+                    .disabled(model.steamPlayBlocker(game) != nil)
             }
-            .disabled(model.macSteamBlocked || game.state != .installed)
             Button { open() } label: { Label("Settings…", systemImage: "slider.horizontal.3") }
             Divider()
             Button { model.showInSteam(game.id) } label: { Label("Show in Steam (rename or uninstall it there)", systemImage: "arrow.up.forward.app") }
@@ -273,21 +297,26 @@ struct GameTile: View {
             Text("Update in Steam").font(.system(size: 11, weight: .medium)).padding(8)
                 .background(.ultraThinMaterial, in: Capsule()).padding(8)
         case .installed:
-            if let step = model.localStarting[game.id] {
+            // Starting and closing show their words, a running game its badge, an idle one Play on hover.
+            let run = model.runState(of: game)
+            if let words = run.waitWords {
                 HStack(spacing: 8) {
                     UnwineMark(progress: nil, size: 18)
-                    PhaseWords(words: [step, "Windows games start slowly on a Mac"]).font(.system(size: 11, weight: .medium))
+                    PhaseWords(words: words).font(.system(size: 11, weight: .medium))
                 }
                 .padding(10)
                 .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 10))
                 .padding(8)
+            } else if run == .running {
+                RunningBadge(help: game.localExe == nil ? "\(game.name) is running. To quit it, right-click it or open its page."
+                                                        : "\(game.name) is running. To quit it, open its page.")
+                    .padding(8)
             } else if hovering {
+                let blocker = game.localExe == nil ? model.steamPlayBlocker(game) : nil
                 Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(game.localExe == nil ? model.macSteamBlocked : (model.localStarting[game.id] != nil || model.localRunning.contains(game.id)))
-                    .help(game.localExe == nil
-                          ? (model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Starts in Steam with this game's settings")
-                          : (model.localRunning.contains(game.id) ? "\(game.name) is running. Open its page to quit it." : model.localStarting[game.id] ?? "Starts the game without Steam"))
+                    .disabled(blocker != nil)
+                    .help(blocker ?? (game.localExe == nil ? "Starts in Steam with this game's settings" : "Starts the game without Steam"))
                     .padding(12)
                     .transition(.opacity.combined(with: .scale(scale: 0.9)))
             }

@@ -49,6 +49,15 @@ enum OnlineSteam {
         return bottleProcesses().map(\.commandLine).contains(where: isSteamClient)
     }
 
+    /// `isRunning` and the number of games running beside Windows Steam, from one look at the
+    /// bottle's processes. Off the main thread, like `isRunning`.
+    static func look() -> (steam: Bool, games: Int) {
+        guard !isInstalling, isInUse else { return (false, 0) }
+        let processes = bottleProcesses()
+        return (processes.contains { isSteamClient($0.commandLine) },
+                processes.filter { imageName($0.commandLine).map(isGame) == true }.count)
+    }
+
     /// True once something of the bottle shows a real window: Steam's sign-in or main window, or a
     /// game. Steam's window belongs to steamwebhelper, a Wine process of its own, and it shows up to a
     /// minute after steam.exe starts. Window owners and sizes need no screen-recording permission.
@@ -252,19 +261,26 @@ enum OnlineSteam {
     /// Ends a running shutdown without waiting for Steam Cloud to finish (the user's "Close now").
     static func hurryShutdown() { state.hurry = true }
 
-    /// Writes the High Resolution Mode choice into the bottle when it differs. Only while the bottle
-    /// is closed: Wine reads it when a process starts, and saves the registry when its server quits.
-    /// Returns false when the bottle was busy and the settings could not be written yet.
+    /// Writes the High Resolution Mode choice into the bottle when it differs, and the App Nap values
+    /// when a bottle made by an older Unwine lacks them. Only while the bottle is closed: Wine reads
+    /// them when a process starts, and saves the registry when its server quits. Returns false when
+    /// the bottle was busy and the user's display settings could not be written yet.
     @discardableResult
     static func applyDisplaySettings(engine: InstalledEngine) async -> Bool {
         let want = highResolution ? "y" : "n"
         let userReg = prefix.appendingPathComponent("user.reg")
         let saved = (try? Data(contentsOf: userReg)).map { String(decoding: $0, as: UTF8.self) } ?? ""
         let fills = saved.contains("\"CaptureDisplaysForFullscreen\"=\"y\"")
-        guard isInstalled, !saved.contains("\"RetinaMode\"=\"\(want)\"") || fills != fillScreen else { return true }
+        let display = !saved.contains("\"RetinaMode\"=\"\(want)\"") || fills != fillScreen
+        guard isInstalled, display || !saved.contains("\"EnableAppNap\"=\"y\"") else { return true }
+        // App Nap alone never holds up a start: it waits for a closed bottle, without a word.
+        if !display, isInUse { return true }
         // Just after Steam quits, Wine's server can take a few seconds to go.
         for _ in 0..<15 where isInUse { await pause(1000) }
-        guard !isInUse else { log.line("The display settings change the next time the bottle closes."); return false }
+        guard !isInUse else {
+            log.line("The display settings change the next time the bottle closes.")
+            return false
+        }
         var env = makeEnvironment(engine: engine, profile: nil).env
         env["WINELOADER"] = engine.wine.path
         let regFile = prefix.appendingPathComponent("drive_c/unwine-display.reg")
@@ -290,8 +306,16 @@ enum OnlineSteam {
             "[HKEY_CURRENT_USER\\Control Panel\\Desktop]",
             "\"LogPixels\"=dword:\(highResolution ? "000000c0" : "00000060")",
             "",
-        ]
+        ] + appNapLines
         return Data([0xFF, 0xFE]) + (lines.joined(separator: "\r\n").data(using: .utf16LittleEndian) ?? Data())
+    }
+
+    /// Wine keeps macOS from napping its programs (App Nap), even with every window hidden. Windows
+    /// Steam's own programs, its client and the web views that draw its windows, may nap: hidden, they
+    /// only use battery. The value is set per program, so a game stays awake: a hidden game in an
+    /// online match is never slowed down. Wine reads it when a program starts.
+    private static let appNapLines = ["steam.exe", "steamwebhelper.exe"].flatMap { exe in
+        ["[HKEY_CURRENT_USER\\Software\\Wine\\AppDefaults\\\(exe)\\Mac Driver]", "\"EnableAppNap\"=\"y\"", ""]
     }
 
     /// The bottle's settings as a .reg file. Wine's regedit wants UTF-16 with a byte-order mark and CRLF
@@ -315,7 +339,7 @@ enum OnlineSteam {
             "[HKEY_CURRENT_USER\\Software\\Wine\\DllOverrides]",
             "\"winemenubuilder.exe\"=\"\"",
             "",
-        ]
+        ] + appNapLines
         return Data([0xFF, 0xFE]) + (lines.joined(separator: "\r\n").data(using: .utf16LittleEndian) ?? Data())
     }
 
@@ -1068,6 +1092,10 @@ enum OnlineSteam {
                 return .gamesRunning(running)
             }
             log.line("Asking \(running.joined(separator: ", ")) to close")
+            // The wait looks at the bottle's own process list: tasklist starts a whole Wine process
+            // each time. Tasklist stays only for the rare case that the list cannot see the games.
+            let asked = Set(running.map { $0.lowercased() })
+            let listed = !imagesInBottle().isDisjoint(with: asked)
             // Without /F, taskkill asks a program's windows to close, as their close button does.
             await run(loader, ["taskkill.exe"] + games.flatMap { ["/pid", String($0.pid)] }, env: env,
                       timeout: .seconds(30), cancellable: false)
@@ -1075,7 +1103,11 @@ enum OnlineSteam {
             let deadline = clock.now.advanced(by: .seconds(20))
             while clock.now < deadline, !state.hurry {
                 await pause(1000)
-                guard let left = await programsInBottleAsync(loader: loader, env: env), left.contains(where: { isGame($0.name) }) else { break }
+                if listed {
+                    guard !imagesInBottle().isDisjoint(with: asked) else { break }
+                } else {
+                    guard let left = await programsInBottleAsync(loader: loader, env: env), left.contains(where: { isGame($0.name) }) else { break }
+                }
             }
         }
         if isRunning {
@@ -1207,6 +1239,20 @@ enum OnlineSteam {
         return out
     }
 
+    /// The Windows program a process of the bottle runs, such as "left4dead2.exe", from its command
+    /// line. Nil for Wine's own Unix side (its server), which runs no .exe.
+    static func imageName(_ commandLine: String) -> String? {
+        guard let exe = commandLine.range(of: ".exe", options: .caseInsensitive) else { return nil }
+        let path = commandLine[..<exe.upperBound]
+        let name = path.split(whereSeparator: { $0 == "\\" || $0 == "/" }).last.map(String.init) ?? String(path)
+        return name.trimmingCharacters(in: CharacterSet(charactersIn: "\" "))
+    }
+
+    /// The programs running in the bottle now, by name in lower case.
+    private static func imagesInBottle() -> Set<String> {
+        Set(bottleProcesses().compactMap { imageName($0.commandLine)?.lowercased() })
+    }
+
     /// A process's executable path (as it was started), arguments and environment, from the kernel.
     /// Nil for another user's process.
     private static func processArguments(_ pid: pid_t) -> (executable: String, arguments: [String], environment: [String])? {
@@ -1286,10 +1332,14 @@ enum OnlineSteam {
         }
     }
 
-    /// Steam's own programs and Wine's, which are not games.
+    /// Steam's own programs and Wine's, which are not games. Steam's include the helpers it ships in
+    /// its folder (driver checks, crash reports, Remote Play, updaters), which run for a moment.
     private static let notGames: Set<String> = [
         "steam.exe", "steamwebhelper.exe", "steamservice.exe", "gameoverlayui.exe", "gameoverlayui64.exe",
         "streaming_client.exe", "x86launcher.exe", "x64launcher.exe", "steamxboxutil.exe", "steamxboxutil64.exe",
+        "gldriverquery.exe", "gldriverquery64.exe", "vulkandriverquery.exe", "vulkandriverquery64.exe", "steamsysinfo.exe",
+        "steam_monitor.exe", "writeminidump.exe", "drivers.exe", "secure_desktop_capture.exe", "fossilize-replay.exe",
+        "fossilize-replay64.exe", "hardwareupdater.exe", "uninstall.exe",
         "services.exe", "winedevice.exe", "plugplay.exe", "explorer.exe", "rpcss.exe", "svchost.exe", "conhost.exe",
         "start.exe", "tasklist.exe", "taskkill.exe", "wineboot.exe", "winemenubuilder.exe", "rundll32.exe",
         "reg.exe", "regedit.exe", "winedbg.exe",
@@ -1321,35 +1371,79 @@ enum OnlineSteam {
         return url
     }
 
+    // MARK: Reading the log
+
+    /// The size of Online mode's log now, so a later read takes only the lines after it.
+    static func logEnd() -> UInt64 {
+        ((try? FileManager.default.attributesOfItem(atPath: log.url.path))?[.size] as? NSNumber)?.uint64Value ?? 0
+    }
+
+    /// How many times a game rebuilt its picture after `offset` in the log, and how far this read got.
+    /// DXVK logs "recreating swapchain" each time the size the game draws at and its window's size
+    /// differ. A game set to the screen's full pixel size with High Resolution Mode off did it 421
+    /// times in one session, which costs speed and battery.
+    static func pictureRebuilds(since offset: UInt64) -> (count: Int, end: UInt64) {
+        guard let file = try? FileHandle(forReadingFrom: log.url) else { return (0, offset) }
+        defer { try? file.close() }
+        let end = (try? file.seekToEnd()) ?? 0
+        guard end > offset else { return (0, end) }     // nothing new, or the log started over
+        try? file.seek(toOffset: offset)
+        // At most 8 MB a look; the rest comes with the next one.
+        let data = (try? file.read(upToCount: min(Int(end - offset), 8 << 20))) ?? Data()
+        let needle = Data("recreating swapchain".utf8)
+        var count = 0, from = data.startIndex
+        while let hit = data.range(of: needle, in: from..<data.endIndex) {
+            count += 1
+            from = hit.upperBound
+        }
+        return (count, offset + UInt64(data.count))
+    }
+
     // MARK: Running Wine
 
     /// Runs one Wine tool to the end, with its output in the log. A tool that outlives `timeout`, or the
-    /// task being cancelled, stops it. The clock skips time the Mac sleeps, since Wine sleeps too.
-    /// Returns the exit code, or nil when the tool had to be stopped.
+    /// task being cancelled, stops it. Returns the exit code, or nil when the tool had to be stopped.
+    /// Nothing polls: the tool's exit, its deadline, a cancel and the user's "Close now" each wake the
+    /// wait, which can last 25 minutes during setup. Dispatch's clock skips time the Mac sleeps, since
+    /// Wine sleeps too.
     @discardableResult
     private static func run(_ exe: URL, _ args: [String], env: [String: String], cwd: URL? = nil,
                             timeout: Duration, cancellable: Bool = true, hurryable: Bool = false) async -> Int32? {
+        let wait = ToolEnd(), gone = ToolEnd()     // gone also hears the exit that follows a stop
         let process: Process
         do {
-            process = try Shell.spawn(exe, args, env: env, cwd: cwd, log: log)
+            process = try Shell.spawn(exe, args, env: env, cwd: cwd, log: log, onExit: { status in
+                wait.finish(.exited(status))
+                gone.finish(.exited(status))
+            })
         } catch {
             log.line("Could not start \(exe.lastPathComponent): \(error.localizedDescription)")
             return nil
         }
-        let clock = SuspendingClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while process.isRunning {
-            let cancelled = (cancellable && Task.isCancelled) || (hurryable && state.hurry)
-            if cancelled || clock.now >= deadline {
-                log.line(cancelled ? "Stopped \(exe.lastPathComponent)." : "\(exe.lastPathComponent) took too long and was stopped.")
-                process.terminate()
-                for _ in 0..<30 where process.isRunning { await pause(100) }
-                if process.isRunning { kill(process.processIdentifier, SIGKILL) }
-                return nil
-            }
-            await pause(250)
+        let deadline = DispatchWorkItem { wait.finish(.timedOut) }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + seconds(timeout), execute: deadline)
+        defer { deadline.cancel() }
+        let hurry = hurryable ? state.whenHurried { wait.finish(.stopped) } : nil
+        defer { if let hurry { state.forget(hurry) } }
+        let outcome = await withTaskCancellationHandler {
+            await wait.wait()
+        } onCancel: {
+            if cancellable { wait.finish(.stopped) }
         }
-        return process.terminationStatus
+        if case .exited(let status) = outcome { return status }
+        log.line(outcome == .stopped ? "Stopped \(exe.lastPathComponent)." : "\(exe.lastPathComponent) took too long and was stopped.")
+        if process.isRunning { process.terminate() }
+        // Three seconds to quit by itself, then it is killed.
+        let grace = DispatchWorkItem { gone.finish(.timedOut) }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3, execute: grace)
+        if await gone.wait() == .timedOut { kill(process.processIdentifier, SIGKILL) }
+        grace.cancel()
+        return nil
+    }
+
+    /// A Duration in seconds, for Dispatch.
+    private static func seconds(_ d: Duration) -> Double {
+        Double(d.components.seconds) + Double(d.components.attoseconds) / 1e18
     }
 
     /// Runs a short tool to the end and returns its exit code and output, or a nil code when it outlived
@@ -1430,10 +1524,34 @@ private final class OnlineState: @unchecked Sendable {
     }
 
     private var rush = false
+    private var hurryCalls: [UUID: @Sendable () -> Void] = [:]
+    /// Setting it wakes every wait that `whenHurried` registered.
     var hurry: Bool {
         get { lock.withLock { rush } }
-        set { lock.withLock { rush = newValue } }
+        set {
+            let calls: [@Sendable () -> Void] = lock.withLock {
+                rush = newValue
+                guard newValue else { return [] }
+                defer { hurryCalls.removeAll() }
+                return Array(hurryCalls.values)
+            }
+            for call in calls { call() }
+        }
     }
+
+    /// Runs `call` once the user asks to hurry, or at once when they already did. The key is for `forget`.
+    func whenHurried(_ call: @escaping @Sendable () -> Void) -> UUID {
+        let key = UUID()
+        let now: Bool = lock.withLock {
+            if rush { return true }
+            hurryCalls[key] = call
+            return false
+        }
+        if now { call() }
+        return key
+    }
+
+    func forget(_ key: UUID) { lock.withLock { _ = hurryCalls.removeValue(forKey: key) } }
 
     private var fill = false
     var fillScreen: Bool {
@@ -1451,6 +1569,36 @@ private final class OnlineState: @unchecked Sendable {
     var wholeBundle: Bool {
         get { lock.withLock { whole } }
         set { lock.withLock { whole = newValue } }
+    }
+}
+
+/// How the wait for a Wine tool ended. The first answer wins: the tool's exit, its deadline, or a stop
+/// (a cancel, or the user's "Close now"). One task waits at a time.
+private final class ToolEnd: @unchecked Sendable {
+    enum Outcome: Equatable { case exited(Int32), timedOut, stopped }
+    private let lock = NSLock()
+    private var outcome: Outcome?
+    private var waiter: CheckedContinuation<Outcome, Never>?
+
+    func finish(_ end: Outcome) {
+        let waiting: CheckedContinuation<Outcome, Never>? = lock.withLock {
+            guard outcome == nil else { return nil }
+            outcome = end
+            defer { waiter = nil }
+            return waiter
+        }
+        waiting?.resume(returning: end)
+    }
+
+    func wait() async -> Outcome {
+        await withCheckedContinuation { c in
+            let done: Outcome? = lock.withLock {
+                if let outcome { return outcome }
+                waiter = c
+                return nil
+            }
+            if let done { c.resume(returning: done) }
+        }
     }
 }
 

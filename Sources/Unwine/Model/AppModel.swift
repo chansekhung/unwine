@@ -110,10 +110,12 @@ struct OnlineStatus: Equatable, Sendable {
     var running = false                 // the Windows Steam client itself
     var inUse = false                   // anything alive in its bottle: Steam, a game or a helper
     var signedIn = false
+    var games = 0                       // games running beside Windows Steam
 
     static func read() -> OnlineStatus {
-        OnlineStatus(installed: OnlineSteam.isInstalled, installing: OnlineSteam.isInstalling, running: OnlineSteam.isRunning,
-                     inUse: OnlineSteam.isInUse, signedIn: OnlineSteam.isSignedIn)
+        let look = OnlineSteam.look()   // one look at the bottle's processes answers both
+        return OnlineStatus(installed: OnlineSteam.isInstalled, installing: OnlineSteam.isInstalling, running: look.steam,
+                            inUse: OnlineSteam.isInUse, signedIn: OnlineSteam.isSignedIn, games: look.games)
     }
 }
 
@@ -189,6 +191,20 @@ final class AppModel {
     private var localLogs: [Int: LogFile] = [:]   // one writer per added game's log
     private var lastHighballCheck = Date()
     private var runnerNeedsRefresh = false  // the runner is from an older Unwine and was in use at launch
+
+    // Steam game feedback, running state and Online mode (group c): what starts, runs and stops now.
+    var steamStarting: [Int: [String]] = [:]    // Steam games starting now, with the words for the wait
+    var steamGamesRunning = Set<Int>()          // Steam games whose Windows bottle is open
+    var quittingGames = Set<Int>()              // Steam games that Quit game is closing
+    var steamRestartWords: [String]?            // phase words while Unwine restarts Mac Steam
+    var onlineQuitOffer: String?                // a game closed and Windows Steam stays open ("" when Unwine did not start it)
+    var onlineRebuilds: [Int: Int] = [:]        // picture rebuilds per game in its latest online session
+    private var startTokens: [Int: UUID] = [:]  // the watcher that owns each Steam game's start
+    private var onlineSession: SteamGame?       // the game Unwine last started in Windows Steam
+    private var onlineGameSeen = false          // a game ran in Windows Steam since the last offer
+    private var onlineGameLooks = 0             // refreshes in a row with a game in Windows Steam
+    private var onlineGoneLooks = 0             // refreshes in a row with no game in Windows Steam
+    private var onlineLogRead: UInt64?          // how far the session's log is counted
 
     /// Switching between Mac Steam and Windows Steam.
     var onlineBusy: Bool { onlineWords != nil }
@@ -349,6 +365,7 @@ final class AppModel {
         // A closed bottle has no settings left to compare with, so the next start sets them fresh.
         if !online.inUse, stored.onlineEnvHash != nil, !onlineBusy { stored.onlineEnvHash = nil; stored.onlineEnv = nil; save() }
         reopenMacSteamIfOnlineEnded()
+        await refreshRunState()
         steamChecked = true
     }
 
@@ -524,15 +541,40 @@ final class AppModel {
         }
     }
 
-    /// Restarts Steam, but never while a game runs (Steam's quit would close the game).
+    /// Restarts Steam, but never while a game runs (Steam's quit would close the game), and one
+    /// restart at a time. Then it waits until Steam runs again and its Steam Play add-on has reported
+    /// back, looking once a second for a minute at most, so Unwine shows the new state when it ends.
     func restartSteam() async {
-        guard !gameRunning else { banner = "A game is running. Close it first, then restart Steam."; return }
+        guard steamRestartWords == nil, busyGame == nil else { return }
+        if let name = startingSteamGame { banner = "\(name) is starting in Steam. Wait for its window, then close the game first."; return }
+        guard !gameRunning else { banner = "\(closeRunningFirst()), then restart Steam."; return }
         guard macSteamAllowed() else { return }
+        steamRestartWords = ["Closing Steam…"]
+        defer { steamRestartWords = nil }
         guard await MacSteam.quit() else { banner = "Steam did not close. Close it yourself, then open it again."; return }
+        // The add-on writes its lines for the new start after this point of its log.
+        let mark = MacSteam.addOnLogEnd(), addOn = MacSteam.hasAddOn
+        steamRestartWords = ["Opening Steam again…"]
         MacSteam.start()
-        try? await Task.sleep(nanoseconds: 8_000_000_000)
+        var open = false, ready = false
+        let start = Date()
+        while Date().timeIntervalSince(start) < 60 {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            let look = await Task.detached(priority: .utility) { () -> (running: Bool, settled: Bool) in
+                (MacSteam.isRunning, addOn && MacSteam.addOnSettled(since: mark))
+            }.value
+            if look.running, !open {
+                open = true
+                if addOn { steamRestartWords = ["Waiting for Steam Play…"] }
+            }
+            if look.running, !addOn || look.settled { ready = true; break }
+        }
         await refreshSteam()
         if !stored.setupComplete { checkSteamConnection() }
+        if !ready {
+            banner = open ? "Steam is open, but Steam Play did not answer within a minute. If Steam does not list Unwine, restart Steam again."
+                          : "Steam did not open within a minute. It can be updating itself. Unwine keeps checking."
+        }
     }
 
     // MARK: GPTK 4
@@ -708,27 +750,126 @@ final class AppModel {
 
     func play(_ game: SteamGame) {
         if game.localExe != nil { Task { await playLocal(game) }; return }
+        // One start at a time: a second click would ask Steam for a second launch.
+        guard runState(of: game) == .idle else {
+            if runState(of: game) == .running { banner = "\(game.name) is already running." }
+            return
+        }
+        // Steam that is closing for a restart could lose the start, or open again too early.
+        guard steamRestartWords == nil, busyGame == nil else { banner = "Steam is restarting. Wait for it to finish, then press Play again."; return }
         guard macSteamAllowed() else { return }
         writeProfile(for: game.id)
-        MacSteam.play(game.id)
-        // Steam starts the game in the background; bring its window to the front once it shows,
-        // so the keyboard and mouse go to the game at once.
         let pfx = game.compatData.appendingPathComponent("pfx")
-        Task { [weak self] in
-            for _ in 0..<120 {
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                let pids = await Task.detached(operation: { Self.bottlePIDs(prefix: pfx) }).value
-                if let pid = Self.withWindows(pids).first {
-                    self?.bringToFront(pid)
-                    return
-                }
+        // Steam Play builds the bottle on the first start, which takes longer. The words say so.
+        let building = !FileManager.default.fileExists(atPath: pfx.path)
+        steamStarting[game.id] = ["Steam is starting \(game.name)…"] + (building ? ["Building the Windows bottle…"] : [])
+            + ["Windows games start slowly on a Mac"]
+        let token = UUID()
+        startTokens[game.id] = token
+        let mark = SteamRunLog.end(of: game.runLog)     // this start's lines come after it
+        MacSteam.play(game.id)
+        Task { await watchSteamStart(game, prefix: pfx, logMark: mark, token: token) }
+    }
+
+    /// Waits for a Steam game's first window and brings it to the front, so the keyboard and mouse go
+    /// to the game at once. Until then the tile and page show the start, and Play waits. NotProton's run
+    /// log and the bottle's lock say how the start goes (see SteamStartWatch). The lock check and the
+    /// log read are cheap; the process scan runs only while the bottle is open.
+    private func watchSteamStart(_ game: SteamGame, prefix pfx: URL, logMark: UInt64, token: UUID) async {
+        defer {
+            if startTokens[game.id] == token { startTokens[game.id] = nil; steamStarting[game.id] = nil }
+        }
+        let start = Date(), runLog = game.runLog
+        var watch = SteamStartWatch(start: start)
+        var read = logMark
+        while true {
+            try? await Task.sleep(nanoseconds: Self.watchInterval(since: start))
+            guard startTokens[game.id] == token else { return }     // Quit game or Stop waiting ended the start
+            let from = read
+            let look = await Task.detached(priority: .utility) { () -> (open: Bool, pids: [pid_t], log: (events: [SteamRunLog.Event], end: UInt64)) in
+                let open = Runner.isPrefixRunning(pfx)
+                return (open, open ? Self.bottlePIDs(prefix: pfx) : [], SteamRunLog.events(in: runLog, since: from))
+            }.value
+            guard startTokens[game.id] == token else { return }
+            read = look.log.end
+            let verdict = watch.look(open: look.open, events: look.log.events, logGrew: look.log.end != from, now: Date())
+            // Play stays off after the start, and Quit game shows for a start that hangs.
+            if look.open, verdict != .closedEarly, !steamGamesRunning.contains(game.id) { steamGamesRunning.insert(game.id) }
+            if verdict == .closedEarly {
+                steamGamesRunning.remove(game.id)
+                banner = "\(game.name) closed before it showed a window. On its page, Show logs says why."
+                log.line("\(game.name) closed before it showed a window")
+                return
+            }
+            if look.open, let pid = Self.withWindows(look.pids).first {
+                bringToFront(pid)
+                return
+            }
+            if case .timedOut(let started) = verdict {
+                banner = started
+                    ? "\(game.name) is still starting. Its window shows soon, or Show logs on its page says what it is doing."
+                    : "Steam has not started \(game.name) yet. Look in Steam: it can ask a question or update the game first."
+                return
             }
         }
     }
 
+    /// Ends the wait for a Steam game's window and leaves the game alone. When Steam asked something
+    /// and the start was cancelled there, Play works again at once instead of after two minutes.
+    func stopWaiting(for game: SteamGame) {
+        startTokens[game.id] = nil
+        steamStarting[game.id] = nil
+    }
+
+    /// A start watcher looks every second while a window is most likely, then every two seconds, so a
+    /// slow start takes less from the game.
+    nonisolated private static func watchInterval(since start: Date) -> UInt64 {
+        Date().timeIntervalSince(start) < 15 ? 1_000_000_000 : 2_000_000_000
+    }
+
+    /// Ends a running Steam game, as Quit game does for an added game: `wineserver -k` ends every
+    /// program in its Windows bottle, and Steam then sees the game end. It is the runner's own
+    /// wineserver, given the game's bottle and Steam's folder for it, so the wrapper loads the game's
+    /// profile (the same sync mode as the running server) and the request reaches that bottle.
+    func quitSteamGame(_ game: SteamGame) async {
+        guard game.localExe == nil, !quittingGames.contains(game.id) else { return }
+        guard let engine else { banner = "Unwine's engine is not set up yet."; return }
+        let pfx = game.compatData.appendingPathComponent("pfx")
+        quittingGames.insert(game.id)
+        defer { quittingGames.remove(game.id) }
+        startTokens[game.id] = nil      // a start that hangs ends here, without a "closed early" notice
+        steamStarting[game.id] = nil
+        var env = WineEnvironment.base(engine: engine, prefix: pfx)
+        let server = Runner.root.appendingPathComponent("bin/wineserver")
+        env["WINESERVER"] = server.path
+        env["WINELOADER"] = Runner.root.appendingPathComponent("lib/wine/x86_64-unix/wine").path
+        env["STEAM_COMPAT_DATA_PATH"] = game.compatData.path
+        log.line("Quit game: ending everything in the Windows bottle of \(game.name)")
+        // wineserver -k waits until the server is gone (about 10 seconds at most), so this look is current.
+        _ = try? await Shell.run(FileManager.default.isExecutableFile(atPath: server.path) ? server : engine.wineserver,
+                                 ["-k"], env: env, log: log, check: false)
+        if await Task.detached(priority: .utility, operation: { Runner.isPrefixRunning(pfx) }).value {
+            banner = "\(game.name) did not close. Try Quit game again in a moment."
+        } else {
+            steamGamesRunning.remove(game.id)   // at once: a refresh already under way would skip the next one
+        }
+        await refreshSteam()
+    }
+
+    /// Which Steam games have their Windows bottle open: the same lock check as added games, a stat and
+    /// a file lock per game, no process scan. Then Online mode's game. Runs with every refresh.
+    private func refreshRunState() async {
+        let bottles = windowsGames.filter { $0.localExe == nil }.map { (id: $0.id, pfx: $0.compatData.appendingPathComponent("pfx")) }
+        let open = await Task.detached(priority: .utility) { Set(bottles.filter { Runner.isPrefixRunning($0.pfx) }.map(\.id)) }.value
+        if open != steamGamesRunning { steamGamesRunning = open }
+        await watchOnlineSession()
+    }
+
     /// Sets this game to use Unwine in Steam. Steam must restart for that.
     func useDecant(_ on: Bool, for game: SteamGame) async {
-        guard !gameRunning else { banner = "A game is running. Close it first: Steam restarts for this."; return }
+        guard steamRestartWords == nil, busyGame == nil else { return }    // one Steam restart at a time
+        if let name = startingSteamGame { banner = "\(name) is starting in Steam. Wait for its window, then close the game first."; return }
+        guard !gameRunning else { banner = "\(closeRunningFirst()): Steam restarts for this."; return }
         busyGame = game.id
         defer { busyGame = nil }
         let wasRunning = MacSteam.isRunning
@@ -746,6 +887,9 @@ final class AppModel {
     /// Moves this game's Windows bottle to the Trash (not the game, not its Steam Cloud saves).
     func resetBottle(_ game: SteamGame) {
         let pfx = game.compatData.appendingPathComponent("pfx")
+        // The page turns Fresh bottle off while the game starts, runs or closes; a start the page
+        // has not seen yet still stops here.
+        if let why = bottleBusyReason(game) { banner = why; return }
         guard !Runner.isPrefixRunning(pfx) else { banner = "\(game.name) is running. Quit the game first."; return }
         guard FileManager.default.fileExists(atPath: pfx.path) else { banner = "\(game.name) has no Windows bottle yet."; return }
         if game.localExe != nil,
@@ -946,16 +1090,19 @@ final class AppModel {
                                        phase: { [weak self] words in self?.localStarting[game.id] = words },
                                        onExit: { status in log.line("The game's process ended with status \(status)") })
             // Wait for the game to show a window, so the waiting screen covers the slow part. Stop
-            // when the bottle closes (the game ended).
+            // when the bottle closes (the game ended). The process scan runs only while it is open.
             var seenAlive = false, ended = false, shown = false
-            for second in 0..<90 {
-                let alive = await Task.detached(operation: { LocalGames.isRunning(game) }).value
-                if alive { seenAlive = true; localRunning.insert(game.id) }
-                if let pid = Self.withWindows(await Task.detached(operation: { Self.bottlePIDs(prefix: LocalGames.prefix(game)) }).value).first {
+            let watchStart = Date()
+            while Date().timeIntervalSince(watchStart) < 90 {
+                let look = await Task.detached(priority: .utility) { () -> (alive: Bool, pids: [pid_t]) in
+                    LocalGames.isRunning(game) ? (true, Self.bottlePIDs(prefix: LocalGames.prefix(game))) : (false, [])
+                }.value
+                if look.alive { seenAlive = true; localRunning.insert(game.id) }
+                if let pid = Self.withWindows(look.pids).first {
                     bringToFront(pid); shown = true; break
                 }
-                if !alive && (seenAlive || second >= 10) { ended = true; break }
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if !look.alive && (seenAlive || Date().timeIntervalSince(watchStart) >= 10) { ended = true; break }
+                try? await Task.sleep(nanoseconds: Self.watchInterval(since: watchStart))
             }
             if ended {
                 localRunning.remove(game.id)
@@ -986,11 +1133,21 @@ final class AppModel {
         Set(pids.filter { NSRunningApplication(processIdentifier: $0)?.activationPolicy == .regular })
     }
 
-    /// Every process whose Wine bottle is `prefix`.
+    /// Every process whose Wine bottle is `prefix`. Wine's processes all run a file whose name starts
+    /// with "wine", so a look at the file name comes first: reading every process's arguments and
+    /// environment cost about six times more (11 ms against 1.8 ms a scan on 800 processes).
     nonisolated private static func bottlePIDs(prefix: URL) -> [pid_t] {
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
-        return pids.prefix(max(0, count)).filter { $0 > 0 && processUsesPrefix($0, prefix.path) }
+        var path = [UInt8](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        var out: [pid_t] = []
+        for pid in pids.prefix(max(0, count)) where pid > 0 {
+            let length = Int(proc_pidpath(pid, &path, UInt32(path.count)))
+            guard length > 0, String(decoding: path.prefix(length), as: UTF8.self).split(separator: "/").last?.hasPrefix("wine") == true,
+                  processUsesPrefix(pid, prefix.path) else { continue }
+            out.append(pid)
+        }
+        return out
     }
 
     /// The process of this bottle that shows a real window, once there is one. With `small`, a small
@@ -1066,6 +1223,10 @@ final class AppModel {
     /// sign-in window. Mac Steam closes first, so the two never write the same game files at once.
     func openOnline(_ game: SteamGame?, restart: Bool? = nil) async {
         guard let engine, online.installed, !onlineBusy, !onlineStep.isRunning else { return }
+        // Online mode closes Mac Steam, which would cut a restart of Mac Steam short.
+        guard steamRestartWords == nil else { banner = "Mac Steam is restarting. Wait for it to finish, then try again."; return }
+        // A start in Mac Steam has no open bottle yet, so the check below cannot see it.
+        if let name = startingSteamGame { banner = "\(name) is starting in Mac Steam. Wait for its window, then close it first."; return }
         guard !Runner.isInUse() else { banner = "A game is running in Mac Steam. Close it first."; return }
         // After an engine update the bottle needs the new engine's files once (no new download).
         // Its progress shows in the Online play section like the first setup.
@@ -1120,6 +1281,7 @@ final class AppModel {
                 try OnlineSteam.shareGames(onlineGames(adding: game))
             }
             let before = Self.withWindows(await Task.detached(priority: .userInitiated, operation: { OnlineSteam.processIDs() }).value)
+            if let game { beginOnlineSession(game) }
             try OnlineSteam.start(engine: engine, profile: profile, appID: game?.id, silent: online.signedIn && game != nil)
             if !steamUp {
                 stored.onlineEnvHash = hash
@@ -1162,6 +1324,7 @@ final class AppModel {
         } catch {
             banner = "Windows Steam did not start: \(error.localizedDescription)"
             log.line("online start failed: \(error)")
+            onlineSession = nil
         }
         await refreshSteam()
     }
@@ -1171,6 +1334,7 @@ final class AppModel {
     func stopOnline(force: Bool = false) async {
         guard let engine, !onlineBusy, !onlineStep.isRunning else { return }
         onlineForceQuit = nil
+        onlineQuitOffer = nil
         onlineWords = force ? ["Asking the game to close…", "Closing Windows Steam…", "Syncing Steam Cloud saves…"]
                             : ["Closing Windows Steam…", "Syncing Steam Cloud saves…", "This can take a minute"]
         onlineClosing = true
@@ -1188,6 +1352,69 @@ final class AppModel {
             setReopenMacSteam(false)
             if !MacSteam.isRunning { MacSteam.start() }
         }
+    }
+
+    /// A game starts in Windows Steam: its picture rebuilds count from here, and its end is watched.
+    private func beginOnlineSession(_ game: SteamGame) {
+        onlineSession = game
+        if onlineQuitOffer != nil { onlineQuitOffer = nil }
+        onlineGameSeen = false
+        onlineGameLooks = 0
+        onlineGoneLooks = 0
+        onlineRebuilds[game.id] = nil
+        onlineLogRead = OnlineSteam.logEnd()
+    }
+
+    /// Online mode, on each refresh. It counts the picture rebuilds of the game Unwine started, for
+    /// the tip on its page. It also sees when the last game closes while Windows Steam stays open:
+    /// Windows Steam then only uses battery and keeps Mac Steam closed, so Unwine offers to quit it.
+    /// Both take two looks in a row: a game counts once it runs for two looks, so a helper of a moment
+    /// does not; and its end needs two looks without one, so a launcher that hands over to its game,
+    /// or a game that restarts itself, is not the end.
+    private func watchOnlineSession() async {
+        guard !onlineBusy else { return }       // Unwine is opening or closing Windows Steam: the next look counts
+        guard online.running else {
+            if onlineQuitOffer != nil { onlineQuitOffer = nil }
+            if onlineSession != nil || onlineGameSeen || onlineGameLooks > 0 || onlineLogRead != nil {
+                onlineSession = nil
+                onlineGameSeen = false
+                onlineGameLooks = 0
+                onlineGoneLooks = 0
+                onlineLogRead = nil
+            }
+            return
+        }
+        if let game = onlineSession, let from = onlineLogRead {
+            let read = await Task.detached(priority: .utility) { OnlineSteam.pictureRebuilds(since: from) }.value
+            guard !onlineBusy, onlineSession?.id == game.id, onlineLogRead == from else { return }   // a new start began meanwhile
+            onlineLogRead = read.end
+            if read.count > 0 { onlineRebuilds[game.id, default: 0] += read.count }
+        }
+        if online.games > 0 {
+            onlineGoneLooks = 0
+            onlineGameLooks += 1
+            guard onlineGameLooks >= 2 else { return }
+            onlineGameSeen = true
+            if onlineQuitOffer != nil { onlineQuitOffer = nil }     // a game runs again
+        } else {
+            onlineGameLooks = 0
+            guard onlineGameSeen else { return }
+            onlineGoneLooks += 1
+            guard onlineGoneLooks >= 2 else { return }
+            onlineQuitOffer = onlineSession?.name ?? ""
+            onlineGameSeen = false
+            onlineGoneLooks = 0
+            onlineSession = nil         // its count stays for its page; a later game is a new session
+            onlineLogRead = nil
+        }
+    }
+
+    /// High Resolution Mode for Windows Steam's bottle, from a game's page as from Settings. It applies
+    /// the next time Windows Steam starts.
+    func setOnlineHighResolution(_ on: Bool) {
+        stored.onlineHighResolution = on
+        OnlineSteam.highResolution = on
+        save()
     }
 
     /// Gives every closed Windows bottle the font stand-ins (see BottleFonts), once per run.

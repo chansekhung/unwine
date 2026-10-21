@@ -8,6 +8,7 @@ struct GameSheet: View {
     @State private var confirmReset = false
     @State private var confirmOnlineSetup = false
     @State private var confirmRemove = false
+    @State private var confirmQuit = false
     @State private var locating = false
     @State private var renaming = false
     @State private var newName = ""
@@ -72,13 +73,19 @@ struct GameSheet: View {
                             .buttonStyle(PrimaryButtonStyle())
                             .disabled(model.localStarting[game.id] != nil)
                             .help(model.localStarting[game.id] ?? "Starts the game with these settings, without Steam")
+                    } else if model.steamGamesRunning.contains(game.id) {
+                        // The bottle is open: the game runs, or its start hangs before a window shows.
+                        Button { confirmQuit = true } label: { Label("Quit game…", systemImage: "stop.fill") }
+                            .buttonStyle(QuietButtonStyle())
+                            .disabled(model.quittingGames.contains(game.id))
+                            .help(model.quittingGames.contains(game.id) ? "Unwine is closing \(game.name). Wait a moment."
+                                  : "Ends the game and everything in its Windows bottle. Unwine asks first.")
                     } else {
+                        let blocker = model.steamPlayBlocker(game)
                         Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
                             .buttonStyle(PrimaryButtonStyle())
-                            .disabled(game.state != .installed || model.macSteamBlocked)
-                            .help(model.macSteamBlocked ? AppModel.macSteamBlockedReason
-                                  : game.state == .installed ? (needsOnline != nil ? "Single player and offline, through Mac Steam" : "Starts in Steam with these settings")
-                                  : "Finish the download in Steam first")
+                            .disabled(blocker != nil)
+                            .help(blocker ?? (needsOnline != nil ? "Single player and offline, through Mac Steam" : "Starts in Steam with these settings"))
                     }
                 }
                 .padding(18)
@@ -92,12 +99,16 @@ struct GameSheet: View {
                                 .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Hide this message")
                         }
                     }
-                    if let step = model.localStarting[game.id] {
+                    if let words = model.runState(of: game).waitWords {
                         HStack(spacing: 10) {
                             UnwineMark(progress: nil, size: 22)
-                            PhaseWords(words: step.hasPrefix("Closing") ? [step, "Ending the game's programs…"]
-                                                                       : [step, "Windows games start slowly on a Mac", "The game's window opens soon"])
-                                .font(.system(size: 12)).foregroundStyle(Palette.glow)
+                            PhaseWords(words: words).font(.system(size: 12)).foregroundStyle(Palette.glow)
+                            // Before the bottle opens there is nothing to quit, only a wait to end.
+                            if !isLocal, model.steamStarting[game.id] != nil, !model.steamGamesRunning.contains(game.id) {
+                                Spacer()
+                                Button("Stop waiting") { model.stopWaiting(for: game) }.buttonStyle(QuietButtonStyle())
+                                    .help("Play works again at once. Use it when Steam asked something and you cancelled the start there.")
+                            }
                         }
                     }
                     if isLocal, let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {
@@ -111,6 +122,8 @@ struct GameSheet: View {
                         NoticeRow(color: Palette.warn, icon: "wrench.and.screwdriver",
                                   text: "This game's Windows bottle is incomplete: its 32-bit part is missing, so the game and its launcher quit at once. A fresh bottle fixes it.\(isLocal ? " Saves the game keeps in its own folder stay." : " Steam Cloud saves stay.")") {
                             Button("Fresh bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
+                                .disabled(model.bottleBusyReason(game) != nil)
+                                .help(model.bottleBusyReason(game) ?? "Moves this game's Windows bottle to the Trash. A new one comes on the next Play.")
                         }
                     }
                     if case .publisherBlocked = advice.online {
@@ -127,8 +140,8 @@ struct GameSheet: View {
                                     ? "Steam runs this game with another tool (\(model.mappings[game.id] ?? "")), so these settings do nothing. Switch it to Unwine? Steam restarts for a few seconds."
                                     : "Steam is not set to use Unwine for this game yet. Steam restarts for a few seconds.") {
                             Button("Use Unwine") { Task { await model.useDecant(true, for: game) } }
-                                .buttonStyle(PrimaryButtonStyle()).disabled(model.busyGame != nil || model.gameRunning)
-                                .help(model.gameRunning ? "Close your running game first" : "Steam restarts for a few seconds")
+                                .buttonStyle(PrimaryButtonStyle()).disabled(model.steamSwitchBlocker != nil)
+                                .help(model.steamSwitchBlocker ?? "Steam restarts for a few seconds")
                         }
                     }
 
@@ -227,10 +240,9 @@ struct GameSheet: View {
                             Button("Reset settings") { model.resetSettings(game.id) }.buttonStyle(QuietButtonStyle())
                                 .help("Back to Unwine's defaults for new games")
                             Button("Fresh Windows bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
-                                .disabled(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id)))
-                                .help(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
-                                      ? "Quit the game first"
-                                      : "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
+                                .disabled(model.bottleBusyReason(game) != nil)
+                                .help(model.bottleBusyReason(game)
+                                      ?? "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
                             Button("Show logs") {
                                 NSWorkspace.shared.activateFileViewerSelecting([game.runLog, game.wineLog].filter { FileManager.default.fileExists(atPath: $0.path) })
                             }
@@ -253,8 +265,8 @@ struct GameSheet: View {
                             Button("Show game files") { NSWorkspace.shared.activateFileViewerSelecting([game.localExe ?? game.installDir]) }.buttonStyle(QuietButtonStyle())
                             if usesDecant {
                                 Button("Stop using Unwine") { Task { await model.useDecant(false, for: game) } }
-                                    .buttonStyle(QuietButtonStyle()).disabled(model.busyGame != nil || model.gameRunning)
-                                    .help("Steam goes back to its default for this game")
+                                    .buttonStyle(QuietButtonStyle()).disabled(model.steamSwitchBlocker != nil)
+                                    .help(model.steamSwitchBlocker ?? "Steam goes back to its default for this game")
                             }
                         }
                         Text("Settings apply the next time the game starts.").font(.system(size: 11)).foregroundStyle(Palette.muted)
@@ -295,6 +307,11 @@ struct GameSheet: View {
             Button("Play without restarting") { Task { await model.openOnline(ask.game, restart: false) } }
         } message: { ask in
             Text(restartMessage(ask))
+        }
+        .confirmationDialog("Quit \(game.name)?", isPresented: $confirmQuit) {
+            Button("Quit game", role: .destructive) { Task { await model.quitSteamGame(game) } }
+        } message: {
+            Text(AppModel.quitGameWarning)
         }
         .confirmationDialog("Start this game with a fresh Windows bottle?", isPresented: $confirmReset) {
             Button("Move bottle to Trash", role: .destructive) { model.resetBottle(game) }
@@ -400,7 +417,15 @@ struct GameSheet: View {
     /// Why Play online cannot start now, or nil when it can.
     private func playOnlineBlocker(_ game: SteamGame) -> String? {
         if game.state != .installed { return "Finish the download in Steam first" }
+        return windowsSteamBlocker
+    }
+
+    /// Why Windows Steam cannot open now, or nil when it can. It closes Mac Steam, and with it a game
+    /// that runs or starts there.
+    private var windowsSteamBlocker: String? {
+        if let name = model.startingSteamGame { return "\(name) is starting in Mac Steam. Wait for its window, then close it first." }
         if model.gameRunning { return "A game is running in Mac Steam. Close it first." }
+        if model.steamRestartWords != nil { return "Mac Steam is restarting. Wait for it to finish." }
         if model.onlineStep.isRunning { return "Online mode is still setting up" }
         if model.onlineBusy { return "Unwine is switching Steam. Wait a moment." }
         return nil
@@ -458,6 +483,8 @@ struct GameSheet: View {
         return section("Online play") {
             Text("\(game.name) uses \(anticheat). Mac Steam's Steam Play cannot load \(anticheat), so online servers block you. Online mode runs Windows Steam inside Unwine, like CrossOver does. It is experimental.")
                 .font(.system(size: 12))
+            OnlineQuitOffer(card: false)
+            PictureRebuildTip(game: game)
             // Setup, and the re-setup after an engine update, show here whether installed or not.
             switch model.onlineStep {
             case .running(let progress, let words):
@@ -513,10 +540,8 @@ struct GameSheet: View {
             HStack(spacing: 8) {
                 Button(online.running ? "Windows Steam is open" : "Sign in to Windows Steam") { Task { await model.openOnline(nil) } }
                     .buttonStyle(PrimaryButtonStyle())
-                    .disabled(online.running || model.onlineBusy || model.gameRunning)
-                    .help(online.running ? "Sign in in the Windows Steam window"
-                          : model.gameRunning ? "A game is running in Mac Steam. Close it first."
-                          : model.onlineBusy ? "Unwine is switching Steam. Wait a moment." : "Opens Windows Steam's sign-in window")
+                    .disabled(online.running || windowsSteamBlocker != nil)
+                    .help(online.running ? "Sign in in the Windows Steam window" : windowsSteamBlocker ?? "Opens Windows Steam's sign-in window")
                 quitControl(online)
             }
             hint(online.running
