@@ -165,6 +165,7 @@ struct GameSheet: View {
                         NoticeRow(color: Palette.accent, icon: "arrow.triangle.branch",
                                   text: "This \(LocalGames.role(of: game.localExe!)?.lowercased() ?? "program") starts with the settings of \(followed.name), because the game it opens gets everything the \(LocalGames.role(of: game.localExe!)?.lowercased() ?? "program") got. To change graphics, speed or Apple extras, close this page and open \(followed.name).")
                     } else {
+                    SessionRow(game: game)
                     adviceSection(game, advice)
 
                     if let ac = needsOnline { onlineSection(game, anticheat: ac) }
