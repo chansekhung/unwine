@@ -15,6 +15,8 @@ struct GameSettings: Codable, Equatable, Sendable {
     var lowLatency = false              // DXVK's latency sleep, a Reflex-like wait before the game reads input
     var asyncShaders = true             // DirectX 8/9: build new shaders in the background, never stop the game for one
     var fps120 = false                  // 120 fps mode: DXMT paces DirectX 10/11 games to the screen's refresh, not a 60 Hz game mode
+    var x87 = false                     // Faster x87 math: x87sidecar speeds up a 32-bit game's x87 math under Rosetta
+    var x87PreciseFaults = false        // set by Unwine after the game stopped on an x87 fault (X87_PRECISE_FAULTS=1)
 }
 
 extension GameSettings {
@@ -34,6 +36,8 @@ extension GameSettings {
         lowLatency = (try? c.decodeIfPresent(Bool.self, forKey: .lowLatency)) ?? d.lowLatency
         asyncShaders = (try? c.decodeIfPresent(Bool.self, forKey: .asyncShaders)) ?? d.asyncShaders
         fps120 = (try? c.decodeIfPresent(Bool.self, forKey: .fps120)) ?? d.fps120
+        x87 = (try? c.decodeIfPresent(Bool.self, forKey: .x87)) ?? d.x87
+        x87PreciseFaults = (try? c.decodeIfPresent(Bool.self, forKey: .x87PreciseFaults)) ?? d.x87PreciseFaults
     }
 }
 
@@ -149,6 +153,7 @@ enum Profiles {
 
         export("WINEMSYNC", s.msync && engine.supportsMsync ? "1" : "0")
         export("ROSETTA_ADVERTISE_AVX", s.advertiseAVX ? "1" : "0")
+        for (k, v) in X87Sidecar.exports(s) { export(k, v) }     // Faster x87 math: ROSETTA_X87_PATH (X87Sidecar.swift)
         if s.metalHUD { export("MTL_HUD_ENABLED", "1") }
 
         // DirectX 9 and DirectDraw helpers ride along with every modern layer.

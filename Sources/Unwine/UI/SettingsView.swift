@@ -159,7 +159,7 @@ struct SettingsView: View {
                     }
 
                     group("Credits") {
-                        Text("Wine (LGPL) · Sikarugir engine by Gcenx · DXMT by 3Shain · DXVK · KosmicKrisp (Mesa/LunarG) · MoltenVK · Steam Play parts and Steam bridge by NotProton (GPL-3.0), built on Valve's Proton code · Apple D3DMetal, used under Apple's licence from your own download · Game advice from the Highball database (CC0) and AreWeAntiCheatYet (MIT). Unwine is free and GPL-3.0.")
+                        Text("Wine (LGPL) · Sikarugir engine by Gcenx · DXMT by 3Shain · DXVK · KosmicKrisp (Mesa/LunarG) · MoltenVK · Steam Play parts and Steam bridge by NotProton (GPL-3.0), built on Valve's Proton code · Apple D3DMetal, used under Apple's licence from your own download · x87sidecar by Lifeisawful and athei (MIT), downloaded only when you turn on Faster x87 math · Game advice from the Highball database (CC0) and AreWeAntiCheatYet (MIT). Unwine is free and GPL-3.0.")
                             .font(.system(size: 11)).foregroundStyle(Palette.muted)
                     }
                 }

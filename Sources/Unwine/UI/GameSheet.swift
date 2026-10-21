@@ -173,6 +173,7 @@ struct GameSheet: View {
                         hint("Faster in most games. Turn off if a game freezes or a download stalls.")
                         Toggle("Tell games the CPU has AVX", isOn: binding(game.id, \.advertiseAVX))
                         hint("Some new games refuse to start without it. Rosetta handles it.")
+                        if analysis?.is64Bit == false { X87Switch(game: game) }     // Faster x87 math, 32-bit games only
                         Picker("Frame rate cap", selection: binding(game.id, \.fpsCap)) {
                             Text("Off").tag(Int?.none)
                             ForEach([30, 40, 60, 120], id: \.self) { Text("\($0) fps").tag(Int?.some($0)) }
