@@ -512,8 +512,6 @@ struct GameTile: View {
         }
     }
 
-    private var busy: Bool { model.localStarting[game.id] != nil || model.localRunning.contains(game.id) }
-
     var body: some View {
         let badge = model.badges(for: game).first
         VStack(alignment: .leading, spacing: 8) {

@@ -258,7 +258,6 @@ struct GameSheet: View {
                         Toggle("Metal 4 mode (GPTK 4)", isOn: binding(game.id, \.metal4))
                         note(metal4Note(resolved), warn: false)
                     }
-                    }
 
                     section("Display") { DisplayControls(game: game) }
                     if analysis?.api == .dx12 { section("Experimental") { DXMTD3D12Control(game: game) } }
