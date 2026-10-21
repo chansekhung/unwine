@@ -231,12 +231,7 @@ struct GameSheet: View {
                                 .help(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
                                       ? "Quit the game first"
                                       : "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
-                            Button("Show logs") {
-                                NSWorkspace.shared.activateFileViewerSelecting([game.runLog, game.wineLog].filter { FileManager.default.fileExists(atPath: $0.path) })
-                            }
-                            .buttonStyle(QuietButtonStyle())
-                            .disabled(!FileManager.default.fileExists(atPath: game.runLog.path))
-                            .help("Logs appear after the first Play")
+                            ShowLogsButton(game: game)
                         }
                         HStack(spacing: 8) {
                             if isLocal {
@@ -257,6 +252,7 @@ struct GameSheet: View {
                                     .help("Steam goes back to its default for this game")
                             }
                         }
+                        ShaderCacheRow(game: game)
                         Text("Settings apply the next time the game starts.").font(.system(size: 11)).foregroundStyle(Palette.muted)
                     }
                 }

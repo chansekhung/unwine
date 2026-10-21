@@ -31,6 +31,37 @@ final class AppUpdater {
 
     init() { status = repo == nil ? .off : .idle }
 
+    /// True while a check, download or unpack runs, so a clean-up leaves Downloads alone.
+    var isBusy: Bool {
+        switch status {
+        case .checking, .downloading: return true
+        default: return false
+        }
+    }
+
+    /// Where a new Unwine waits for the user's click: next to the app, so the final move is on one disk.
+    private static var stagedCopy: URL {
+        Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent(".Unwine-update.app")
+    }
+
+    /// At launch: a newer Unwine that the last run got but did not install is ready again, with no
+    /// new download. An older copy (this Unwine is that version or newer) is a leftover and goes.
+    func reclaimStaged() async {
+        guard repo != nil, staged == nil, status == .idle else { return }
+        let copy = Self.stagedCopy
+        guard FileManager.default.fileExists(atPath: copy.path) else { return }
+        let v = Bundle(url: copy)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+        let signed = LooseVersion(v) > LooseVersion(currentVersion)
+            ? (try? await Shell.run(URL(fileURLWithPath: "/usr/bin/codesign"), ["--verify", "--deep", copy.path], check: false))?.status == 0
+            : false
+        guard signed, staged == nil, status == .idle else {
+            if !signed { try? FileManager.default.removeItem(at: copy) }
+            return
+        }
+        staged = copy
+        status = .readyToInstall(v)
+    }
+
     /// Checks, downloads and stages a newer build. Installing waits for the user's click,
     /// so a game is never closed under them.
     func checkAndStage() async {
@@ -55,12 +86,18 @@ final class AppUpdater {
                 return
             }
             status = .downloading(0)
+            // Download and unpack hold off idle sleep, which would cut them off.
+            let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled],
+                                                                 reason: "Getting Unwine \(newest.tag_name)")
+            defer { ProcessInfo.processInfo.endActivity(activity) }
             let file = try await Downloader.fetch(
                 dmg.browser_download_url,
                 to: Paths.downloads.appendingPathComponent("Unwine-\(newest.tag_name).dmg"),
                 expectedBytes: dmg.size, sha256: dmg.sha256
             ) { p in Task { @MainActor in self.status = .downloading(p) } }
             let app = try await Self.extractApp(fromDMG: file)
+            // The new app waits next to this one now, so the disk image has done its job.
+            try? FileManager.default.removeItem(at: file)
             let v = Bundle(url: app)?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
             guard LooseVersion(v) > LooseVersion(currentVersion) else {
                 try? FileManager.default.removeItem(at: app)
@@ -112,7 +149,7 @@ final class AppUpdater {
             throw NSError(domain: "Unwine", code: 1, userInfo: [NSLocalizedDescriptionKey: "The update file has no Unwine.app inside."])
         }
         // Stage next to the running app so the final move is on the same disk.
-        let dest = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent(".Unwine-update.app")
+        let dest = stagedCopy
         try? FileManager.default.removeItem(at: dest)
         try await Shell.run(URL(fileURLWithPath: "/usr/bin/ditto"), [src.path, dest.path])
         try await Shell.run(URL(fileURLWithPath: "/usr/bin/codesign"), ["--verify", "--deep", dest.path])

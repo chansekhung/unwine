@@ -14,6 +14,8 @@ struct EngineRelease: Codable, Equatable, Sendable {
 
     var key: String { "\(id)+\(runtimeID)" }
     var totalBytes: Int64 { engineSize + runtimeSize }
+    /// The two archives' names in Downloads.
+    var archiveNames: [String] { [engineURL.lastPathComponent, runtimeURL.lastPathComponent] }
 
     /// Tested on an M4 Pro with macOS 27.0.1 on 2026-10-19: Windows Steam renders and signs in.
     static let pinned = EngineRelease(
@@ -48,6 +50,10 @@ struct InstalledEngine: Codable, Equatable, Sendable {
     func renderer(_ name: String) -> URL { rendererRoot.appendingPathComponent("\(name)/wine", isDirectory: true) }
 
     func supports(_ variable: String) -> Bool { rendererVars.contains(variable) }
+
+    /// The engine's name for people: its Wine version and its runtime, because two engines can
+    /// share a Wine version.
+    var label: String { "\(wineVersion), \(release.runtimeID.replacingOccurrences(of: "-", with: " "))" }
 }
 
 enum EngineError: LocalizedError {
@@ -88,11 +94,17 @@ enum EngineStore {
         case checking
     }
 
-    /// Full install. Re-uses verified archives already in Downloads.
-    static func install(_ release: EngineRelease, log: LogFile,
+    /// Full install. Re-uses verified archives already in Downloads, and deletes them once the engine
+    /// passed its checks (their pinned checksums fetch them again if ever needed). `keepArchives`
+    /// leaves them for the caller, which deletes them with `removeArchives` once it keeps the engine.
+    static func install(_ release: EngineRelease, keepArchives: Bool = false, log: LogFile,
                         progress: @escaping @Sendable (Step) -> Void) async throws -> InstalledEngine {
         try Paths.ensure(Paths.downloads)
         try Paths.ensure(Paths.engines)
+        // Minutes of download and unpacking: idle sleep would cut them off.
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled],
+                                                             reason: "Installing Unwine's engine")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
 
         let engineFile = Paths.downloads.appendingPathComponent(release.engineURL.lastPathComponent)
         let runtimeFile = Paths.downloads.appendingPathComponent(release.runtimeURL.lastPathComponent)
@@ -143,7 +155,13 @@ enum EngineStore {
         let data = try JSONEncoder.unwine.encode(engine)
         try data.write(to: final.appendingPathComponent(recordName))
         log.line("Engine ready: \(engine.wineVersion) [\(engine.rendererVars.joined(separator: ","))]")
+        if !keepArchives { removeArchives(of: release) }
         return engine
+    }
+
+    /// Deletes a release's two archives from Downloads.
+    static func removeArchives(of release: EngineRelease) {
+        for name in release.archiveNames { try? FileManager.default.removeItem(at: Paths.downloads.appendingPathComponent(name)) }
     }
 
     /// Reads the engine's own files to learn the switches it needs. Nothing is hardcoded
@@ -188,15 +206,23 @@ enum EngineStore {
         _ = try await Downloader.fetch(url, to: file, expectedBytes: size, sha256: sha, progress: progress)
     }
 
+    /// Unpacks in one xz pass. tar names each entry as it writes it (-v), and the names are checked
+    /// after: an archive that tries to write outside the target folder is refused. tar itself never
+    /// writes outside `dir`: it stops with an error at "..", and it strips a leading "/" (it says so).
+    /// `dir` is a staging folder that goes away on any failure, so nothing from a refused archive is used.
     private static func untar(_ archive: URL, into dir: URL, excludes: [String], log: LogFile) async throws {
-        // Refuse archives that try to write outside the target folder.
-        let listing = try await Shell.run(URL(fileURLWithPath: "/usr/bin/tar"), ["-tf", archive.path], keep: 64_000_000)
-        for line in listing.output.split(separator: "\n") where line.hasPrefix("/") || line.contains("../") {
-            throw EngineError.broken("unsafe path in archive: \(line)")
-        }
-        var args = ["-xf", archive.path, "-C", dir.path, "--no-xattrs", "--no-mac-metadata"]
+        var args = ["-xvf", archive.path, "-C", dir.path, "--no-xattrs", "--no-mac-metadata"]
         for pattern in excludes { args += ["--exclude", pattern] }
-        try await Shell.run(URL(fileURLWithPath: "/usr/bin/tar"), args, log: log)
+        // The list of names is long, so it stays out of the log.
+        let result = try await Shell.run(URL(fileURLWithPath: "/usr/bin/tar"), args, keep: 64_000_000)
+        for line in result.output.split(separator: "\n") {
+            if line.hasPrefix("tar: Removing leading") { throw EngineError.broken("unsafe path in archive: \(line)") }
+            let name = line.hasPrefix("x ") ? line.dropFirst(2) : line[...]
+            if name.hasPrefix("/") || name.split(separator: "/").contains("..") {
+                throw EngineError.broken("unsafe path in archive: \(name)")
+            }
+        }
+        log.line("Unpacked \(archive.lastPathComponent)")
     }
 
     private static func singleChild(of dir: URL) throws -> URL {

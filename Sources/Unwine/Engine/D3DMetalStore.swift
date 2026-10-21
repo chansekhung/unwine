@@ -60,6 +60,18 @@ enum D3DMetalStore {
         .sorted { $1.sortKey.lexicographicallyPrecedes($0.sortKey) }   // newest first
     }
 
+    /// Deletes every imported GPTK except `keep`, the one games use. Each import is a copy of Apple's
+    /// file, which the user still has. Callers make sure no game runs. Returns the bytes freed.
+    @discardableResult
+    static func removeOld(keeping keep: D3DMetalInstall) -> Int64 {
+        var freed: Int64 = 0
+        for old in installed() where old.folder != keep.folder {
+            let bytes = DiskUse.size(of: old.root)
+            if (try? FileManager.default.removeItem(at: old.root)) != nil { freed += bytes }
+        }
+        return freed
+    }
+
     /// GPTK disk images sitting in ~/Downloads, newest first. Reading Downloads may show a macOS permission prompt.
     static func findInDownloads() -> [URL] {
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask)[0]
