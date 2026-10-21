@@ -39,7 +39,7 @@ struct X87Switch: View {
         .confirmationDialog("Turn on Faster x87 math?", isPresented: $asking) {
             Button("Download and turn on") { Task { await model.enableX87(for: game.id) } }
         } message: {
-            Text("Old 32-bit games do a lot of x87 math, and Rosetta runs it slowly. x87sidecar makes this math much faster. It is a free program by other people (MIT licence), from github.com/athei/x87sidecar. Unwine downloads it one time (\(X87Sidecar.sizeText)) and checks it with your Mac's Rosetta.\n\nThe first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. x87sidecar uses 64-bit math, not the 80-bit math of old PCs, so a few games can glitch. If a game glitches, turn the switch off. x87sidecar stays off for every other game.")
+            Text("Old 32-bit games do a lot of x87 math, and Rosetta runs it slowly. x87sidecar makes this math much faster. It is a free program by other people (MIT licence), from github.com/athei/x87sidecar. Unwine downloads it one time (\(X87Sidecar.sizeText)) and checks it with your Mac's Rosetta.\n\nThe first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. Allow it: if you do not, the game does not start. x87sidecar uses 64-bit math, not the 80-bit math of old PCs, so a few games can glitch. If a game glitches, turn the switch off. x87sidecar stays off for every other game.")
         }
         .task(id: game.id) { session = await model.x87Session(for: game.id) }
     }
@@ -93,7 +93,9 @@ struct X87Switch: View {
             + (X87Sidecar.isInstalled ? "It runs only in the games where you turn it on." : "Unwine asks first. Then it downloads x87sidecar (\(X87Sidecar.sizeText)).")
     }
 
-    private let onNote = "x87sidecar makes this game's x87 math much faster. The first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. Allow it, or the game runs without it. If the game glitches or crashes, turn this off."
+    // x87sidecar's entitled build attaches by itself (this engine has no cooperative handshake), and an
+    // attach that fails does not start the game: its README says so for this mode.
+    private let onNote = "x87sidecar makes this game's x87 math much faster. The first time a game starts with it after you log in, macOS asks for your password to allow Developer Tools. Allow it: if you do not, the game does not start. If the game glitches, crashes or does not start, turn this off."
 
     private func notAttachedNote(_ reason: String) -> String {
         "Last time, x87sidecar did not attach, so the game ran without faster x87 math. "

@@ -22,6 +22,53 @@ How to keep this list. The build reads it, so follow these rules.
    commands to tag and publish.
 -->
 
+## 1.0.4 · not released yet
+
+- **Automatic battery mode.** On battery, in Low Power Mode or when your Mac is hot, games start with a frame cap of 60 fps. In Low Power Mode or heat, the cap is 40 fps (30 fps on a 60 Hz screen). 120 fps mode waits until you plug in. Plugged in, nothing changes.
+  - Each game page has the switch **Save battery when unplugged**. A line under it says what the game gets now. Your own frame cap always stays.
+  - It also works for games that you start in Steam. Keep Unwine open. Its window can be closed.
+- **Best battery** is better. It turns on MetalFX for DLSS only when the game has DLSS. It turns ray tracing off for D3DMetal games. It uses less tessellation (fine surface detail) for DirectX 11 games on DXMT.
+  - Best battery no longer turns on MetalFX sharpening, because sharpening uses more power. Did you use Best battery before? Click it again to get the new settings.
+- **Ray tracing** has its own choice for D3DMetal games: Apple's default, Off or On.
+- **Smoother frame caps** for DirectX 8 and 9 games and the DXVK layer. The list of caps now fits your screen, for example 30, 40, 60 and 120 fps on a 120 Hz screen.
+- **New games** in Settings: choose Best speed or Best battery, a frame cap and battery mode for every game that you did not change.
+- **Find a game fast.** Search (⌘F), sort and filter your library. Right-click a game to add it to your **Favourites** or to hide it.
+  - Each game shows when you last played it and for how long, for example "Played 3 days ago · 12 h".
+  - Labels on covers show a problem before you open a game: **Blocked**, **Online mode**, **Not using Unwine** or **Running**.
+- **Add a game by dragging it** onto the Unwine window. You can also use Open With > Unwine in Finder.
+- **Added games start much faster the first time.** Unwine copies a ready Windows bottle in about a second. (A bottle is the small Windows system that Unwine makes for each game.)
+- **Launch options and mods** is a new part of each game page.
+  - Type launch options, such as -windowed, and extra settings, such as DXVK_HUD=fps.
+  - Tick **DLL overrides** for mod loaders, such as dinput8. Wine then loads the mod's DLL first.
+  - Pick a **game language**, such as Japanese or Traditional Chinese, so old games show their text correctly.
+  - **Run a program in this bottle** runs an installer, a patch or a mod tool with the game's settings.
+  - **Wine tools** opens Wine settings, the registry editor, the task manager or the uninstaller.
+  - **Show bottle (C: drive)** opens the game's Windows drive in Finder. Many games keep their saves there.
+- After an installer ends, its page offers **Pick the installed program**. The game then starts from the same bottle.
+- **Steam games show when they start and when they run.** If a game closes before it shows a window, Unwine tells you. You can quit a running Steam game from its page or its right-click menu.
+- **Restart Steam** shows each step. It waits until Steam Play is ready.
+- **Display** is a new part of each game page: **Sharp picture (Retina)**, **Game takes the whole screen**, **Command key acts as Ctrl**, an **HDR** Off choice, and a window or full screen for old DirectDraw games.
+- **Faster x87 math (experimental)** for old 32-bit games. (x87 is how old PCs calculate with decimal numbers. Rosetta runs it slowly.) The switch is off at the start.
+  - The first time you turn it on, Unwine downloads x87sidecar (181 KB, free, from github.com/athei/x87sidecar) and checks it.
+  - macOS asks for your password once after each login. Allow it. If you do not, the game does not start.
+  - A few games can glitch. Then turn the switch off for that game.
+- **Last session** on each game page (macOS 27): frames each second, GPU time for each frame and shader time, with one tip.
+- **DirectX 12 through DXMT** is a new test switch for DirectX 12 games without GPTK. The game can fail to start.
+- **Storage** in Settings shows what uses space and can clean it up. Unwine also deletes each download after it installs.
+- **Clear shader cache** is on each game page. Use it when a game stops starting. The next start is slower one time.
+- **Logs open inside Unwine.** You can copy details for a bug report or report a problem on GitHub.
+  - Logs are quieter now. When a game does not start, turn on **Detailed logs** on its page and play again.
+- **Safer engine updates.** If a new engine does not take one of Unwine's fixes, Unwine keeps your engine and asks you. Settings can also go back to your previous engine.
+- **Updates wait while you are on battery**, on a phone hotspot or in Low Data Mode. A download that stops continues from where it stopped.
+- **Added games look like themselves.** They show their own icon. You can choose a cover. They get Highball advice too.
+- **Online mode:** after your game closes, Unwine asks if you want to quit Windows Steam. macOS can now slow down Windows Steam's hidden windows to save battery.
+  - Windows Steam restarts one time after this update, because its log settings changed.
+- Messages have a button for the next step. Problems show in red.
+- New menu items: Settings… (⌘,), Add Game… (⌘O), Find… (⌘F), and Report a Problem in the Help menu.
+- You can use the library with the keyboard and VoiceOver. Reduce Motion stops the waiting animations.
+- Setup has **Use without Steam for now** when Steam is not on your Mac.
+- A game page shows the controllers that are connected.
+
 ## 1.0.3 · not released yet
 
 - **A game and its launcher share one Windows bottle.** (A bottle is the small Windows system that Unwine makes for each game.) Add two programs from one game folder, such as a launcher and its game. Settings that you make in the launcher now go to the game.
