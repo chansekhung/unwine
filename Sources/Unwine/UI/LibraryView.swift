@@ -6,8 +6,9 @@ struct LibraryView: View {
     @State private var selected: SteamGame?
     @State private var showSettings = false
     @State private var addingGame = false
-    @State private var choosingProgram: [(url: URL, size: Int64)] = []
     @State private var choosingFolder: URL?
+    @State private var showsChooser = false
+    @State private var chosenProgram: (exe: URL, folder: URL?)?   // added once the chooser has closed, so a question can show
     @State private var renaming: SteamGame?
     @State private var newName = ""
     @State private var removing: SteamGame?
@@ -51,6 +52,7 @@ struct LibraryView: View {
         .alert("Rename \(renaming?.name ?? "")", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Name", text: $newName)
             Button("Rename") { if let game = renaming { model.renameLocalGame(game.id, to: newName) } }
+                .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button("Cancel", role: .cancel) {}
         }
         .confirmationDialog("Remove \(removing?.name ?? "") from Unwine?",
@@ -63,26 +65,23 @@ struct LibraryView: View {
         .fileImporter(isPresented: $addingGame, allowedContentTypes: [UTType(filenameExtension: "exe") ?? .data, .folder]) { result in
             guard case .success(let url) = result else { return }
             if url.hasDirectoryPath || (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-                // A game folder: find its programs, then let the user pick when it is not obvious.
-                let programs = LocalGames.programs(in: url)
-                if programs.isEmpty {
-                    model.banner = "No .exe file in \(url.lastPathComponent). Pick the folder that holds the game's program."
-                } else if programs.count == 1 {
-                    model.addLocalGame(exe: programs[0].url, folder: url)
-                } else {
-                    choosingFolder = url
-                    choosingProgram = programs
-                }
+                // A game folder: the chooser finds its programs, and asks when it is not obvious.
+                choosingFolder = url
+                showsChooser = true
             } else {
                 model.addLocalGame(exe: url)
             }
         }
-        .sheet(isPresented: Binding(get: { !choosingProgram.isEmpty }, set: { if !$0 { choosingProgram = [] } })) {
-            ProgramChooser(folder: choosingFolder, programs: choosingProgram) { exe in
-                choosingProgram = []
-                if let exe { model.addLocalGame(exe: exe, folder: choosingFolder) }
+        .sheet(isPresented: $showsChooser, onDismiss: {
+            if let chosen = chosenProgram { model.addLocalGame(exe: chosen.exe, folder: chosen.folder) }
+            chosenProgram = nil
+        }) {
+            ProgramChooser(folder: choosingFolder) { exe in
+                if let exe { chosenProgram = (exe, choosingFolder) }
+                showsChooser = false
             }
         }
+        .modifier(SteamCopyDialog(open: { selected = $0 }))
     }
 
     private var topBar: some View {
@@ -235,6 +234,9 @@ struct GameTile: View {
             Button { model.play(game) } label: { Label(busy ? "Play (already running)" : "Play", systemImage: "play.fill") }
                 .disabled(busy)
             Button { open() } label: { Label("Settings…", systemImage: "slider.horizontal.3") }
+            if let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {
+                Button { model.locateLocalGame(game) } label: { Label("Locate \(exe.lastPathComponent)…", systemImage: "questionmark.folder") }
+            }
             Divider()
             Button { rename() } label: { Label("Rename…", systemImage: "pencil") }
             Button(role: .destructive) { remove() } label: {
@@ -309,39 +311,43 @@ extension Renderer {
 
 // MARK: - Picking the program in a game folder
 
-/// Lists the programs found in a game folder, the likeliest first, so the user picks the one that
-/// starts the game.
+/// Lists the programs in a game folder, the likeliest first, so the user picks the one that starts
+/// the game. Without a list it looks through the folder itself, three folders deep and off the main
+/// thread, with a designed wait. Return picks the first program; "Choose another file…" any other.
 struct ProgramChooser: View {
     let folder: URL?
-    let programs: [(url: URL, size: Int64)]
+    /// The programs to list. Nil: the chooser looks through `folder` itself.
+    var programs: [(url: URL, size: Int64)]? = nil
+    var title = "Which program starts the game?"
+    var intro: String? = nil
+    /// When the folder holds only one program, it is picked with no question.
+    var pickSingle = true
     let done: (URL?) -> Void
+    @State private var found: [(url: URL, size: Int64)]?
+
+    private var list: [(url: URL, size: Int64)]? { programs ?? found }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Which program starts the game?").font(.system(size: 17, weight: .semibold)).foregroundStyle(Palette.text)
-            Text("Unwine found \(programs.count) programs in \(folder?.lastPathComponent ?? "the folder"). The likeliest is first: usually the biggest one that is not a setup or a tool. A launcher works too, if the game has one.")
-                .font(.system(size: 12)).foregroundStyle(Palette.muted)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(programs.enumerated()), id: \.offset) { i, p in
-                        Button { done(p.url) } label: {
-                            HStack {
-                                Image(systemName: i == 0 ? "star.fill" : "app").foregroundStyle(i == 0 ? Palette.glow : Palette.muted)
-                                Text(relative(p.url)).foregroundStyle(Palette.text)
-                                Spacer()
-                                Text(ByteCountFormatter.string(fromByteCount: p.size, countStyle: .file)).foregroundStyle(Palette.muted)
-                            }
-                            .font(.system(size: 12))
-                            .padding(.horizontal, 10).padding(.vertical, 7)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(i == 0 ? Palette.accent.opacity(0.18) : Palette.card))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Adds \(p.url.lastPathComponent) as the game")
-                    }
+            Text(title).font(.system(size: 17, weight: .semibold)).foregroundStyle(Palette.text)
+            if let list {
+                if list.isEmpty {
+                    Text("No .exe file is in \(folder?.lastPathComponent ?? "this folder") or in the folders in it. Press Choose another file… to pick the program yourself, or press Cancel and add the folder that holds it.")
+                        .font(.system(size: 12)).foregroundStyle(Palette.muted)
+                } else {
+                    Text(intro ?? "Unwine found \(list.count == 1 ? "1 program" : "\(list.count) programs") in \(folder?.lastPathComponent ?? "the folder"). The likeliest is first: usually the biggest one that is not a setup or a tool. A launcher works too, if the game has one. Press Return to add the first one.")
+                        .font(.system(size: 12)).foregroundStyle(Palette.muted)
+                    rows(list)
                 }
+            } else {
+                searching
             }
-            .frame(maxHeight: 320)
             HStack {
+                Button("Choose another file…") {
+                    if let url = FilePicker.pick(message: "Pick the program that starts the game.", prompt: "Choose", extensions: ["exe"], in: folder) { done(url) }
+                }
+                .buttonStyle(QuietButtonStyle())
+                .help("Pick any .exe file yourself")
                 Spacer()
                 Button("Cancel") { done(nil) }.buttonStyle(QuietButtonStyle()).keyboardShortcut(.cancelAction)
             }
@@ -349,6 +355,55 @@ struct ProgramChooser: View {
         .padding(20)
         .frame(width: 480)
         .background(AppBackground())
+        .task(id: folder) { await scan() }
+    }
+
+    private func rows(_ list: [(url: URL, size: Int64)]) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(list.enumerated()), id: \.offset) { i, p in
+                    let row = Button { done(p.url) } label: {
+                        HStack {
+                            Image(systemName: i == 0 ? "star.fill" : "app").foregroundStyle(i == 0 ? Palette.glow : Palette.muted)
+                            Text(relative(p.url)).foregroundStyle(Palette.text).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                            if i == 0 { Text("Return").font(.system(size: 10, weight: .medium)).foregroundStyle(Palette.glow) }
+                            Text(ByteCountFormatter.string(fromByteCount: p.size, countStyle: .file)).foregroundStyle(Palette.muted)
+                        }
+                        .font(.system(size: 12))
+                        .padding(.horizontal, 10).padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(i == 0 ? Palette.accent.opacity(0.18) : Palette.card))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Uses \(p.url.lastPathComponent) as the game")
+                    if i == 0 { row.keyboardShortcut(.defaultAction) } else { row }
+                }
+            }
+        }
+        .frame(maxHeight: 320)
+    }
+
+    /// While the folder is read: the coil, words that change, and rows still to come.
+    private var searching: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                UnwineMark(progress: nil, size: 22)
+                PhaseWords(words: ["Looking for the game's program…", "Reading \(folder?.lastPathComponent ?? "the folder") and the folders in it",
+                                   "Big games have many files"])
+                    .font(.system(size: 12)).foregroundStyle(Palette.glow)
+            }
+            ForEach(0..<4, id: \.self) { _ in
+                Shimmer().frame(height: 30).clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+        }
+    }
+
+    private func scan() async {
+        guard programs == nil else { return }
+        guard let folder else { found = []; return }
+        let list = await Task.detached(priority: .userInitiated) { LocalGames.programs(in: folder) }.value
+        if pickSingle, list.count == 1 { done(list[0].url) } else { found = list }
     }
 
     private func relative(_ url: URL) -> String {

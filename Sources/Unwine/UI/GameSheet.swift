@@ -11,6 +11,8 @@ struct GameSheet: View {
     @State private var locating = false
     @State private var renaming = false
     @State private var newName = ""
+    @State private var pickingInstalled = false
+    @State private var installedList: [(url: URL, size: Int64)] = []   // kept while the chooser closes
 
     private var game: SteamGame? { model.games.first { $0.id == gameID } }
 
@@ -105,6 +107,15 @@ struct GameSheet: View {
                                   text: "Unwine cannot find \(exe.lastPathComponent) in \(exe.deletingLastPathComponent().path). If the game moved, or its drive is not connected, point Unwine at it again. Its bottle and saves stay.") {
                             Button("Locate…") { locating = true }.buttonStyle(QuietButtonStyle())
                                 .help("Pick the game's program where it is now")
+                        }
+                    }
+                    if let found = model.installedPrograms[game.id], !found.isEmpty {
+                        NoticeRow(color: Palette.ok, icon: "shippingbox",
+                                  text: "The installer put \(found.count == 1 ? "a new program" : "\(found.count) new programs") in this game's Windows bottle. Pick the one that starts the game. This entry then starts it, in the same bottle.") {
+                            Button("Pick the installed program") { installedList = found; pickingInstalled = true }.buttonStyle(PrimaryButtonStyle())
+                                .help("Shows the new programs, the likeliest first")
+                            Button { model.installedPrograms[game.id] = nil } label: { Image(systemName: "xmark") }
+                                .buttonStyle(.plain).foregroundStyle(Palette.muted).help("Keep the installer as this entry")
                         }
                     }
                     if game.bottleIncomplete {
@@ -222,39 +233,75 @@ struct GameSheet: View {
                     }
                     }
 
+                    section("Launch options and mods") {
+                        LaunchOptionsEditor(game: game, followed: followed)
+                    }
+
                     section("Fix things") {
+                        let busy = isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
+                        let logs = [game.runLog, game.wineLog, Paths.logs.appendingPathComponent("tools-\(game.id).log")]
+                            .filter { FileManager.default.fileExists(atPath: $0.path) }
                         HStack(spacing: 8) {
                             Button("Reset settings") { model.resetSettings(game.id) }.buttonStyle(QuietButtonStyle())
                                 .help("Back to Unwine's defaults for new games")
                             Button("Fresh Windows bottle…") { confirmReset = true }.buttonStyle(QuietButtonStyle())
-                                .disabled(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id)))
-                                .help(isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
-                                      ? "Quit the game first"
+                                .disabled(busy)
+                                .help(busy ? "Quit the game first"
                                       : "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
-                            Button("Show logs") {
-                                NSWorkspace.shared.activateFileViewerSelecting([game.runLog, game.wineLog].filter { FileManager.default.fileExists(atPath: $0.path) })
-                            }
-                            .buttonStyle(QuietButtonStyle())
-                            .disabled(!FileManager.default.fileExists(atPath: game.runLog.path))
-                            .help("Logs appear after the first Play")
+                            Button("Show logs") { NSWorkspace.shared.activateFileViewerSelecting(logs) }
+                                .buttonStyle(QuietButtonStyle())
+                                .disabled(logs.isEmpty)
+                                .help(logs.isEmpty ? "Logs appear after the first Play" : "Shows the game's logs in Finder")
                         }
                         HStack(spacing: 8) {
                             if isLocal {
                                 Button("Rename…") { newName = game.name; renaming = true }.buttonStyle(QuietButtonStyle())
                                     .help("Change the name Unwine shows for this game")
+                                Button("Change program…") { model.changeLocalProgram(game) }.buttonStyle(QuietButtonStyle())
+                                    .disabled(busy)
+                                    .help(busy ? "Quit the game first" : "Points this game at another .exe, such as the game after its launcher, or the program that an installer put in the bottle. The bottle and its saves stay.")
                                 Button("Remove from Unwine…") { confirmRemove = true }.buttonStyle(QuietButtonStyle())
-                                    .disabled(model.localRunning.contains(game.id) || model.localStarting[game.id] != nil)
-                                    .help(model.localRunning.contains(game.id) || model.localStarting[game.id] != nil
-                                          ? "Quit the game first" : "Asks first. The game's own files stay where they are.")
+                                    .disabled(busy)
+                                    .help(busy ? "Quit the game first" : "Asks first. The game's own files stay where they are.")
                             } else {
                                 Button("Show in Steam") { model.showInSteam(game.id) }.buttonStyle(QuietButtonStyle())
                                     .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens this game's page in Mac Steam")
+                                if usesDecant {
+                                    Button("Stop using Unwine") { Task { await model.useDecant(false, for: game) } }
+                                        .buttonStyle(QuietButtonStyle()).disabled(model.busyGame != nil || model.gameRunning)
+                                        .help(model.gameRunning ? "Close your running game first" : "Steam goes back to its default for this game")
+                                }
                             }
-                            Button("Show game files") { NSWorkspace.shared.activateFileViewerSelecting([game.localExe ?? game.installDir]) }.buttonStyle(QuietButtonStyle())
-                            if usesDecant {
-                                Button("Stop using Unwine") { Task { await model.useDecant(false, for: game) } }
-                                    .buttonStyle(QuietButtonStyle()).disabled(model.busyGame != nil || model.gameRunning)
-                                    .help("Steam goes back to its default for this game")
+                        }
+                        // The game's Windows bottle: programs for it (installers, patches, mod tools),
+                        // Wine's own tools, and its C: drive, where games keep saves and settings.
+                        let blocker = model.bottleBlocker(game)
+                        HStack(spacing: 8) {
+                            Button("Run a program in this bottle…") { model.pickProgramForBottle(game) }.buttonStyle(QuietButtonStyle())
+                                .disabled(blocker != nil)
+                                .help(blocker ?? "Runs an .exe, .msi, .bat or .cmd file inside this game's bottle, with the game's settings")
+                            Menu {
+                                ForEach(WineTool.allCases) { tool in
+                                    Button(tool.title) { Task { await model.runInBottle(game, .tool(tool)) } }
+                                }
+                            } label: { Text("Wine tools") }
+                                .menuStyle(.button).buttonStyle(QuietButtonStyle()).fixedSize()
+                                .disabled(blocker != nil)
+                                .help(blocker ?? "Wine settings, the registry editor, the task manager and the uninstaller, for this game's bottle")
+                        }
+                        HStack(spacing: 8) {
+                            Button("Show bottle (C: drive)") { model.showBottleDrive(game) }.buttonStyle(QuietButtonStyle())
+                                .disabled(!model.bottleExists(game))
+                                .help(model.bottleExists(game) ? "Opens the bottle's C: drive in Finder. Games keep saves and settings in its users folder."
+                                      : "Play the game once first. \(isLocal ? "Unwine" : "Steam") makes its Windows bottle then.")
+                            Button("Show game files") { model.showGameFiles(game) }.buttonStyle(QuietButtonStyle())
+                                .help(isLocal ? "Opens the game's folder in Finder" : "Shows the game's folder in Finder")
+                        }
+                        if let step = model.bottleToolStarting[game.id] {
+                            HStack(spacing: 10) {
+                                UnwineMark(progress: nil, size: 20)
+                                PhaseWords(words: [step, "Windows programs start slowly on a Mac", "Its window opens soon"])
+                                    .font(.system(size: 12)).foregroundStyle(Palette.glow)
                             }
                         }
                         Text("Settings apply the next time the game starts.").font(.system(size: 11)).foregroundStyle(Palette.muted)
@@ -314,7 +361,18 @@ struct GameSheet: View {
         .alert("Rename \(game.name)", isPresented: $renaming) {
             TextField("Name", text: $newName)
             Button("Rename") { model.renameLocalGame(game.id, to: newName) }
+                .disabled(newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             Button("Cancel", role: .cancel) {}
+        }
+        .sheet(isPresented: $pickingInstalled) {
+            ProgramChooser(folder: game.compatData.appendingPathComponent("pfx/drive_c", isDirectory: true),
+                           programs: installedList,
+                           title: "Which program did the installer put in the bottle?",
+                           intro: "The likeliest is first. Press Return to use it. This entry keeps its bottle and takes the program's name.",
+                           pickSingle: false) { exe in
+                pickingInstalled = false
+                if let exe { model.useInstalledProgram(game.id, exe: exe) }
+            }
         }
     }
 
