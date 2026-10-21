@@ -32,13 +32,17 @@ How to keep this list. The build reads it, so follow these rules.
 - **No more crash when a game shares a picture between two DirectX parts.** Romance of the Three Kingdoms XIV is one of these games. Before, it closed or showed only a black screen with music. Now it opens and you can play.
   - The videos in these games stay black, but you hear the sound. Push Esc to skip a video.
 - **Chinese, Japanese and Korean text shows correctly** in dialogs and launchers. Before, some of this text showed as empty boxes. Unwine now uses the Mac's own fonts for these languages.
+- **Fresh bottle** no longer deletes a game that you installed inside its bottle. Unwine keeps the bottle and tells you why.
+- **On macOS 15 to 25, games that use Vulkan get a driver that loads.** (Vulkan is the graphics system that DXVK uses.) Before, Unwine gave them a driver that needs macOS 26. Now it uses MoltenVK on these versions. MoltenVK cannot do all that DXVK needs, so some games can still fail.
+- Unwine uses less of the Mac's power in the background. When its window is hidden, it looks at Steam less often.
 
 ## 1.0.2 · 2026-10-21
 
 - **Add game.** You can now add a Windows program that is not in Steam. Pick its .exe file or its folder. Each program gets its own Windows bottle and its own settings.
   - When you pick a folder, Unwine shows the programs in it. The most likely program is first. Unwine gives the game the name of its folder.
 - **Fewer stutters in DirectX 8 and 9 games.** Unwine now makes more shaders in the background. (A shader is a small program that draws a part of the picture.) The graphics driver also gets the correct amount of memory.
-- **No more freezes in 32-bit DXMT games**, such as Age of Mythology. (DXMT is one of Unwine's graphics layers. It changes DirectX into Metal, the graphics system of the Mac.) Now only the game's .exe can turn off DEP, a memory guard, as on Windows.
+  - The switch "Build shaders in the background" on the game page controls this. It is on at the start. When it is on, a new effect can show a moment late the first time. When it is off, the game stops for a moment for each new effect.
+- **Far fewer freezes in 32-bit DXMT games**, such as Age of Mythology. (DXMT is one of Unwine's graphics layers. It changes DirectX into Metal, the graphics system of the Mac.) Now only the game's .exe can turn off DEP, a memory guard, as on Windows. A game whose .exe turns off DEP still runs that way.
 - **No more empty buttons in launchers.** Windows fonts such as Palatino Linotype now use the Mac's Palatino.
 - **120 fps mode** for DXMT games that ask for 60 Hz on a faster screen. It is off at the start. The note under the switch tells you when it helps. If the motion is not smooth, turn it off.
 - **Games come to the front when they open.** This also works when Stage Manager is on. Your keyboard then goes to the game.
@@ -47,9 +51,10 @@ How to keep this list. The build reads it, so follow these rules.
 - The game page now finds a Windows bottle that cannot run 32-bit programs. It offers to make a new bottle.
 - When you add GPTK, Unwine shows the progress. A second click does nothing.
 - **Online mode:**
-  - High Resolution Mode makes text sharp. The first start is no longer too large.
+  - **High Resolution Mode** is a new switch in Settings. It is off at the start. When it is on, text is sharp, and a game that you set to the full size of your screen shows at the correct size.
   - The switch "Games fill the whole screen" puts full-screen games over the Dock and the menu bar.
   - "Close now" stops Windows Steam immediately.
+  - In Settings, "Quit Windows Steam" now asks "Quit the game too?" when a game is still open. Before, the button did nothing that you could see.
   - Unwine shows the progress while Windows Steam opens.
   - Unwine asks you before it restarts Windows Steam for a new setting.
   - Low latency and frame caps no longer restart Windows Steam.
@@ -59,7 +64,8 @@ How to keep this list. The build reads it, so follow these rules.
 
 Decant is now Unwine. It is the same free app, with a new name and a new blue look. Decant 1.0.0 updates itself to Unwine. Your engine, GPTK and settings move with it, and you do not download them again.
 
-- **Advisor.** Each game gets suggested settings for speed or for battery life. The suggestions come from the Highball database. The advisor only suggests. Your own settings always win.
+- **Advisor.** Each game gets two sets of suggested settings: one for speed and one for battery life. Unwine makes them from what it finds in the game's files. A set changes nothing until you click it.
+- **Automatic** graphics layer now follows the advice. If the Highball database lists the game, Unwine uses the layer from the list. (Highball is a list of games that people tested on a Mac.) If not, Unwine uses the layer that fits the game's files. A layer that you select yourself always stays.
 - **Online mode (test version).** Unwine can run Windows Steam for games with Valve Anti-Cheat (VAC), such as Left 4 Dead 2 online. VAC finds cheats, and it needs Windows Steam. Mac Steam closes while Windows Steam runs. Unwine never changes the game files.
 - **Low latency** switch for DXVK games. It can make the game react faster to your keys and mouse. It is off at the start. (DXVK is one of Unwine's graphics layers. It changes DirectX into Vulkan.)
 - **MetalFX sharpening** for DXMT games. MetalFX is Apple's tool that makes the picture sharper.
