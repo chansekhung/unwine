@@ -263,8 +263,6 @@ struct GameSheet: View {
 
                     section("Fix things") {
                         let busy = isLocal && (model.localStarting[game.id] != nil || model.localRunning.contains(game.id))
-                        let logs = [game.runLog, game.wineLog, Paths.logs.appendingPathComponent("tools-\(game.id).log")]
-                            .filter { FileManager.default.fileExists(atPath: $0.path) }
                         HStack(spacing: 8) {
                             Button("Reset settings") { model.resetSettings(game.id) }.buttonStyle(QuietButtonStyle())
                                 .help("Back to Unwine's defaults for new games")
@@ -272,10 +270,8 @@ struct GameSheet: View {
                                 .disabled(model.bottleBusyReason(game) != nil)
                                 .help(model.bottleBusyReason(game)
                                       ?? "Moves this game's Windows bottle to the Trash. \(isLocal ? "Unwine" : "Steam") builds a new one on next Play.")
-                            Button("Show logs") { NSWorkspace.shared.activateFileViewerSelecting(logs) }
-                                .buttonStyle(QuietButtonStyle())
-                                .disabled(logs.isEmpty)
-                                .help(logs.isEmpty ? "Logs appear after the first Play" : "Shows the game's logs in Finder")
+                            // The Logs sheet: the game's logs (with the log of programs run in its bottle) and Unwine's.
+                            ShowLogsButton(game: game)
                         }
                         DetailedLogsControl(game: game)
                         HStack(spacing: 8) {
@@ -329,6 +325,7 @@ struct GameSheet: View {
                                     .font(.system(size: 12)).foregroundStyle(Palette.glow)
                             }
                         }
+                        ShaderCacheRow(game: game)
                         Text("Settings apply the next time the game starts.").font(.system(size: 11)).foregroundStyle(Palette.muted)
                     }
                 }

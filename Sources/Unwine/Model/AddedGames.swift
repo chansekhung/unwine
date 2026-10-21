@@ -284,11 +284,14 @@ extension AppModel {
         return nil
     }
 
+    /// The file name of the log for programs run in a Steam game's bottle. The Logs sheet shows it too.
+    nonisolated static func bottleLogName(_ id: Int) -> String { "tools-\(id).log" }
+
     /// The log for programs run in a Steam game's bottle. An added game's programs write to its own log.
     func bottleLog(_ game: SteamGame) -> LogFile {
         if game.localExe != nil { return localLog(game.id) }
         if let log = toolLogs[game.id] { return log }
-        let log = LogFile("tools-\(game.id).log")
+        let log = LogFile(Self.bottleLogName(game.id))
         toolLogs[game.id] = log
         return log
     }

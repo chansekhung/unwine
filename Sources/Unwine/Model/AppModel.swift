@@ -27,6 +27,13 @@ struct StoredState: Codable {
     var lastLocalID = 0                     // the highest id ever given to an added game, so none is reused
     var lastSeenVersion: String?            // the Unwine whose "What's new" the user has seen; nil on a fresh install
     var launchOptions: [Int: LaunchOptions] = [:]   // each game's launch options, mods and language (its page's "Launch options and mods")
+    // Storage, logs, updates and safety
+    var updateChecked: [String: Date] = [:]  // last good check per update source, so one that fails does not repeat the rest
+    var deferredEngine: EngineRelease?       // a new engine found while the Mac saved battery or data; "Update now" fetches it
+    var heldEngine: HeldEngine?              // an installed engine Unwine did not switch to: a fix does not fit it yet
+    var skippedEngine: String?               // release key of the engine the user went back from; updates leave it out
+    var pendingRelease: EngineRelease?       // pendingEngine in full, so its archives stay for a newer Unwine
+    var pendingSince: String?                // the Unwine that found pendingEngine; a newer one tries it again
 
     init() {}
 
@@ -56,6 +63,13 @@ struct StoredState: Codable {
         // Unwine 1.0.2 and older did not keep this. Someone who set one of them up sees what came after 1.0.2.
         lastSeenVersion = (try? c.decodeIfPresent(String.self, forKey: .lastSeenVersion)) ?? (setupComplete ? "1.0.2" : nil)
         launchOptions = (try? c.decodeIfPresent([Int: LaunchOptions].self, forKey: .launchOptions)) ?? [:]
+        // Storage, logs, updates and safety
+        updateChecked = (try? c.decodeIfPresent([String: Date].self, forKey: .updateChecked)) ?? [:]
+        deferredEngine = try? c.decodeIfPresent(EngineRelease.self, forKey: .deferredEngine)
+        heldEngine = try? c.decodeIfPresent(HeldEngine.self, forKey: .heldEngine)
+        skippedEngine = try? c.decodeIfPresent(String.self, forKey: .skippedEngine)
+        pendingRelease = try? c.decodeIfPresent(EngineRelease.self, forKey: .pendingRelease)
+        pendingSince = try? c.decodeIfPresent(String.self, forKey: .pendingSince)
     }
 }
 
@@ -238,6 +252,17 @@ final class AppModel {
     var updateNote: String?
     var isCheckingUpdates = false
     let appUpdater = AppUpdater()
+
+    // Storage, logs, updates and safety
+    var engineSwitching: [String]?              // phase words while Unwine moves its Steam tool to another engine
+    var engineDownload: EngineStore.Step?       // an engine update's step while it downloads and unpacks
+    var storageReport: StorageReport?           // Unwine's disk use, from the last measure in Settings
+    var storageProgress: Double?                // 0...1 while Settings measures it, else nil
+    var storageWork: [String]?                  // phase words while a clean-up in Storage runs
+    var storageNote: String?                    // what the last clean-up in Storage did
+    var highballRefreshing = false              // Settings' Refresh now is asking Highball for its list
+    var highballNote: String?                   // what the last Refresh now found
+    private var updateLoop: Task<Void, Never>?  // checks for updates about every 6 hours while Unwine stays open
 
     var stored = StoredState()
     let log = LogFile("unwine.log")
@@ -434,6 +459,9 @@ final class AppModel {
         guard !isSettingUp else { return }
         isSettingUp = true
         defer { isSettingUp = false }
+        // Setup downloads, unpacks and copies for minutes: idle sleep would cut it off.
+        let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled], reason: "Setting up Unwine")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
         guard await checkMac() else { return }
         guard await installEngine() else { return }
         guard await installKit() else { return }
@@ -1158,9 +1186,10 @@ final class AppModel {
         save()
         LaunchOptions.publish(stored.launchOptions)
         Profiles.remove(appID: game.id)
-        // Its log goes too: no page can show it once the game is gone.
+        // Its log goes too, with the part kept when it moved on at 10 MB: no page can show it once the game is gone.
         localLogs[game.id] = nil
-        try? FileManager.default.removeItem(at: Paths.logs.appendingPathComponent(LocalGames.logName(game.id)))
+        let gameLog = Paths.logs.appendingPathComponent(LocalGames.logName(game.id))
+        for file in [gameLog, LogFile.previous(of: gameLog)] { try? FileManager.default.removeItem(at: file) }
         installedPrograms[game.id] = nil
         games.removeAll { $0.id == game.id }
         banner = sharers.isEmpty
@@ -1696,97 +1725,386 @@ final class AppModel {
 
     // MARK: Updates
 
+    /// Where updates come from. Each keeps the time of its last good check, so one that fails (a
+    /// server that is down) is asked again soon, without the others being asked again too.
+    enum UpdateSource: String, CaseIterable {
+        case kit, engine, app
+    }
+
+    /// Runs at launch, then from the update loop about every 6 hours while Unwine stays open. Each
+    /// source is checked at most once in 20 hours. The first call starts that loop.
     func autoUpdateIfDue() async {
-        guard stored.autoUpdate, showsLibrary else { return }
-        if let last = stored.lastUpdateCheck, Date().timeIntervalSince(last) < 20 * 3600 { return }
-        await checkForUpdates()
+        if updateLoop == nil {
+            startUpdateLoop()
+            // Before any check: a new Unwine that the last run got waits again with no new download,
+            // and the clean-up of Downloads never meets a download.
+            await appUpdater.reclaimStaged()
+            await sweepDownloads()
+        }
+        guard stored.autoUpdate, showsLibrary, !isSettingUp else { return }
+        var due = Set(UpdateSource.allCases.filter { source in
+            guard let last = stored.updateChecked[source.rawValue] ?? stored.lastUpdateCheck else { return true }
+            return Date().timeIntervalSince(last) >= 20 * 3600
+        })
+        // A new engine that waited for power or a normal network goes ahead as soon as it may.
+        if stored.deferredEngine != nil, updateDeferralReason == nil { due.insert(.engine) }
+        if !due.isEmpty { await checkForUpdates(due, automatic: true) }
+    }
+
+    /// The loop that checks for updates while Unwine stays open, and the watch on power and network
+    /// that starts an engine download that waited. Runs once, from the first autoUpdateIfDue.
+    private func startUpdateLoop() {
+        _ = NetworkPath.shared      // starts watching the network now, so the first check knows it
+        updateLoop = Task { [weak self] in
+            while !Task.isCancelled {
+                // During setup it looks every 2 minutes, so the first check comes soon after setup ends.
+                let wait: Duration = (self?.showsLibrary ?? true) ? .seconds(6 * 3600) : .seconds(120)
+                try? await Task.sleep(for: wait, tolerance: .seconds(60))
+                guard let self else { return }
+                await self.sweepDownloads()     // what a setup or an Online setup left since the last look
+                await self.autoUpdateIfDue()
+            }
+        }
+        PowerState.shared.onChange { [weak self] in Task { await self?.fetchDeferredEngineIfAllowed() } }
+        NetworkPath.shared.onChange { [weak self] in Task { await self?.fetchDeferredEngineIfAllowed() } }
+    }
+
+    /// Why a big download that Unwine starts by itself waits now, or nil when it may start.
+    var updateDeferralReason: String? {
+        if let why = PowerState.shared.reason { return why }
+        if NetworkPath.shared.isConstrained { return "Low Data Mode is on" }
+        if NetworkPath.shared.isExpensive { return "Your Mac uses a metered network, such as a phone hotspot" }
+        return nil
+    }
+
+    /// A new engine that waited for power or a normal network. With "Update by itself" on, it downloads
+    /// as soon as the Mac is plugged in on a normal network.
+    func fetchDeferredEngineIfAllowed() async {
+        guard stored.autoUpdate, stored.deferredEngine != nil, showsLibrary, !isCheckingUpdates, updateDeferralReason == nil else { return }
+        await checkForUpdates([.engine], automatic: true)
+    }
+
+    /// Settings' "Update now": fetches a new engine that waited, on battery or a metered network too.
+    func downloadDeferredEngine() async {
+        await checkForUpdates([.engine], automatic: false)
     }
 
     /// Engine, Steam Play files and Unwine itself. Nothing is swapped while a game runs.
     func checkForUpdates() async {
-        guard showsLibrary, !isSettingUp, !isCheckingUpdates else { return }
+        await checkForUpdates(Set(UpdateSource.allCases), automatic: false)
+    }
+
+    /// Checks `sources`. An `automatic` check waits with a big engine download while the Mac saves
+    /// battery or data.
+    private func checkForUpdates(_ sources: Set<UpdateSource>, automatic: Bool) async {
+        guard showsLibrary, !isSettingUp, !isCheckingUpdates, engineSwitching == nil else { return }
         isCheckingUpdates = true
         defer { isCheckingUpdates = false }
         var notes: [String] = []
         var failures = 0
 
         // 1. Steam Play signature files help the add-on match new Steam builds. Only new files are added.
-        do {
-            if let latest = try await SteamPlayKit.latestRelease(), LooseVersion(latest.version) > LooseVersion(stored.kitVersion ?? "0") {
-                try await SteamPlayKit.download(latest, log: log) { _ in }
-                let added = try addNewSignatures(from: latest)
-                stored.kitVersion = latest.version
-                SteamPlayKit.prune(keep: latest)
-                notes.append(added > 0 ? "Steam Play now matches \(added) more Steam version(s)." : "Steam Play files are current.")
+        if sources.contains(.kit) {
+            do {
+                if let latest = try await SteamPlayKit.latestRelease(), LooseVersion(latest.version) > LooseVersion(stored.kitVersion ?? "0") {
+                    // A download and an unpack of minutes: idle sleep would cut them off.
+                    let activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .idleSystemSleepDisabled],
+                                                                         reason: "Getting Steam Play files \(latest.version)")
+                    defer { ProcessInfo.processInfo.endActivity(activity) }
+                    try await SteamPlayKit.download(latest, log: log) { _ in }
+                    let added = try addNewSignatures(from: latest)
+                    stored.kitVersion = latest.version
+                    SteamPlayKit.prune(keep: latest)
+                    notes.append(added > 0 ? "Steam Play now matches \(added) more Steam version(s)." : "Steam Play files are current.")
+                }
+                if case .outdated = steamPlay {
+                    notes.append("Steam updated past Steam Play's add-on. A newer add-on comes from NotProton's project; Unwine cannot put it into Steam.app.")
+                }
+                stored.updateChecked[UpdateSource.kit.rawValue] = Date()
+            } catch {
+                failures += 1
+                notes.append("Steam Play check failed: \(error.localizedDescription)")
             }
-            if case .outdated = steamPlay {
-                notes.append("Steam updated past Steam Play's add-on. A newer add-on comes from NotProton's project; Unwine cannot put it into Steam.app.")
-            }
-        } catch {
-            failures += 1
-            notes.append("Steam Play check failed: \(error.localizedDescription)")
         }
 
         // 2. Engine: install side by side; switch only when no game runs and this Unwine can bridge it.
-        do {
-            if let candidate = try await EngineFeed.newest(), candidate.key != engine?.release.key,
-               candidate.id != stored.pendingEngine, stored.stagedEngine == nil {
-                let next = try await EngineStore.install(candidate, log: log) { _ in }
-                if NtdllPatcher.supports(wineLib: next.wineDir.appendingPathComponent("lib/wine")) {
-                    stored.stagedEngine = next.folder
-                    save()
-                    if gameRunning || OnlineSteam.isInUse || !localRunning.isEmpty {
-                        notes.append("New engine \(next.wineVersion) is ready. Unwine switches to it after your games and Windows Steam close.")
-                    } else {
-                        await activateStagedEngine()
-                        notes.append(updateNote ?? "")
-                    }
-                } else {
-                    try? FileManager.default.removeItem(at: next.root)
-                    stored.pendingEngine = candidate.id
-                    notes.append("New engine \(candidate.id) needs a newer Unwine. Your current engine keeps working.")
-                }
+        if sources.contains(.engine) {
+            do {
+                if let note = try await checkEngine(automatic: automatic) { notes.append(note) }
+                stored.updateChecked[UpdateSource.engine.rawValue] = Date()
+            } catch {
+                failures += 1
+                notes.append("Engine check failed: \(error.localizedDescription)")
             }
-        } catch {
-            failures += 1
-            notes.append("Engine check failed: \(error.localizedDescription)")
         }
 
         // 3. Unwine itself (only when an update source is set up).
-        await appUpdater.checkAndStage()
-        if case .failed(let why) = appUpdater.status { notes.append(why) }
+        if sources.contains(.app) {
+            await appUpdater.checkAndStage()
+            if case .failed(let why) = appUpdater.status { notes.append(why) } else { stored.updateChecked[UpdateSource.app.rawValue] = Date() }
+        }
 
-        if failures == 0 { stored.lastUpdateCheck = Date() }
+        // "Last checked" counts once every source had a good check.
+        if failures == 0, UpdateSource.allCases.allSatisfy({ stored.updateChecked[$0.rawValue] != nil }) { stored.lastUpdateCheck = Date() }
         save()
         let text = notes.filter { !$0.isEmpty }.joined(separator: " ")
-        updateNote = text.isEmpty ? "Everything is up to date." : text
+        // A new engine that waits has its own notice with its button, so the note does not say "up to date".
+        let waiting = stored.deferredEngine != nil || stored.heldEngine != nil
+        updateNote = !text.isEmpty ? text : waiting ? nil : "Everything is up to date."
+        isCheckingUpdates = false   // the clean-up waits for checks
+        await sweepDownloads()
     }
 
-    /// Switches to an engine installed by the updater. Keeps the old one for rollback.
-    private func activateStagedEngine() async {
+    /// Looks for a newer engine and installs it side by side. Returns what Settings should say.
+    private func checkEngine(automatic: Bool) async throws -> String? {
+        // A newer Unwine may bridge an engine that an older one could not, so it tries again once.
+        if stored.pendingEngine != nil, stored.pendingSince != appUpdater.currentVersion {
+            stored.pendingEngine = nil
+            stored.pendingRelease = nil
+            stored.pendingSince = nil
+        }
+        await retryHeldEngine()
+        if let staged = stored.stagedEngine, EngineStore.installed().contains(where: { $0.folder == staged }) {
+            return "A new engine is ready. Unwine switches to it after your games and Windows Steam close."
+        }
+        guard let candidate = try await EngineFeed.newest() else { stored.deferredEngine = nil; return nil }
+        let onDisk = EngineStore.installed()
+        let held = onDisk.first { $0.folder == stored.heldEngine?.folder }
+        guard candidate.key != engine?.release.key, candidate.id != stored.pendingEngine, candidate.key != stored.skippedEngine,
+              candidate.key != held?.release.key else {
+            if stored.deferredEngine?.key != candidate.key { stored.deferredEngine = nil }
+            return nil
+        }
+        let copy = onDisk.first { $0.release.key == candidate.key }    // an engine the user went back from earlier
+        // Only a download waits. The deferred-download notice in Settings says so, with its Update now button.
+        if automatic, copy == nil, updateDeferralReason != nil {
+            stored.deferredEngine = candidate
+            return nil
+        }
+        stored.deferredEngine = nil
+        let next: InstalledEngine
+        if let copy {
+            next = copy
+        } else {
+            engineDownload = .downloading(0)
+            defer { engineDownload = nil }
+            next = try await EngineStore.install(candidate, keepArchives: true, log: log) { step in
+                // A late report after the install ended must not bring the progress back.
+                Task { @MainActor in if self.engineDownload != nil { self.engineDownload = step } }
+            }
+        }
+        guard NtdllPatcher.supports(wineLib: next.wineDir.appendingPathComponent("lib/wine")) else {
+            // The archives stay: a newer Unwine installs this engine from them.
+            await removeEngineFolder(next.root)
+            stored.pendingEngine = candidate.id
+            stored.pendingRelease = candidate
+            stored.pendingSince = appUpdater.currentVersion
+            return "New engine \(candidate.id) needs a newer Unwine. Your current engine keeps working."
+        }
+        EngineStore.removeArchives(of: candidate)
+        stored.stagedEngine = next.folder
+        save()
+        let waits = "New engine \(next.wineVersion) is ready. Unwine switches to it after your games and Windows Steam close."
+        if gameRunning || OnlineSteam.isInUse || !localRunning.isEmpty || !localStarting.isEmpty
+            || !steamStarting.isEmpty || bottleProgramsRun { return waits }
+        return await activateStagedEngine() ?? waits     // nil: a game started meanwhile
+    }
+
+    /// An engine held back because a fix did not fit gets one more look after Unwine itself updated:
+    /// the newer Unwine may carry the fix. Then it waits to switch like any new engine.
+    private func retryHeldEngine() async {
+        guard let held = stored.heldEngine else { return }
+        guard let copy = EngineStore.installed().first(where: { $0.folder == held.folder }), let current = engine else {
+            stored.heldEngine = nil     // its folder is gone
+            return
+        }
+        guard held.since != appUpdater.currentVersion, stored.stagedEngine == nil else { return }
+        let log = self.log
+        let missing = await Task.detached(priority: .utility) { () -> [UnwineFix.Kind] in
+            RendererPatches.prepare(engine: copy, log: log)
+            return PatchStatus.lost(from: current, to: copy)
+        }.value
+        if missing.isEmpty {
+            stored.heldEngine = nil
+            stored.stagedEngine = copy.folder
+        } else {
+            stored.heldEngine = HeldEngine(folder: copy.folder, since: appUpdater.currentVersion, missing: missing)
+        }
+        save()
+    }
+
+    /// Switches to an engine installed by the updater. Keeps the old one, so Settings can go back to it.
+    /// When a fix that the current engine has does not fit the new one, it does not switch: the new
+    /// engine waits in Settings, and the user decides. Returns what Settings should say.
+    @discardableResult
+    private func activateStagedEngine() async -> String? {
         guard let folder = stored.stagedEngine,
-              let next = EngineStore.installed().first(where: { $0.folder == folder }) else { stored.stagedEngine = nil; return }
+              let next = EngineStore.installed().first(where: { $0.folder == folder }) else { stored.stagedEngine = nil; return nil }
         // Online mode's bottle runs on the engine itself, so it must be closed as well.
-        guard !Runner.isInUse(), !OnlineSteam.isInUse, localRunning.isEmpty else { return }   // waits for every game
-        do {
+        // An added game that is still starting has no running bottle yet, but it uses the engine already.
+        // So does a Steam game that Steam is starting (Steam runs the tool that the switch rebuilds),
+        // and a program Unwine runs in a game's bottle.
+        guard !Runner.isInUse(), !OnlineSteam.isInUse, localRunning.isEmpty, localStarting.isEmpty,
+              steamStarting.isEmpty, !bottleProgramsRun, engineSwitching == nil else { return nil }   // waits for every game
+        engineSwitching = ["Checking Unwine's fixes on the new engine…"]
+        defer { engineSwitching = nil }
+        let log = self.log
+        let current = engine
+        let missing = await Task.detached(priority: .utility) { () -> [UnwineFix.Kind] in
             RendererPatches.prepare(engine: next, log: log)
-            try await Runner.build(engine: next, d3dmetal: d3dmetal, log: log)
-            stored.previousEngine = engine?.folder
-            stored.activeEngine = next.folder
+            return current.map { PatchStatus.lost(from: $0, to: next) } ?? []
+        }.value
+        if !missing.isEmpty {
             stored.stagedEngine = nil
-            engine = next
-            runnerReady = true
-            writeAllProfiles()
-            EngineStore.prune(keep: [next.folder, stored.previousEngine].compactMap { $0 })
+            await dropHeldEngine(except: next.folder)   // an older held one is of no more use
+            stored.heldEngine = HeldEngine(folder: next.folder, since: appUpdater.currentVersion, missing: missing)
+            save()
+            log.line("Stayed on \(current?.folder ?? "the current engine"): \(next.folder) lacks \(missing.map(\.rawValue).joined(separator: ", "))")
+            return PatchStatus.heldNote(next, missing: missing)
+        }
+        do {
+            try await switchEngine(to: next)
+            stored.stagedEngine = nil
+            stored.skippedEngine = nil
+            await dropHeldEngine(except: next.folder)   // the engine in use now is newer than a held one
             save()
             updateNote = "Engine updated to \(next.wineVersion)."
         } catch {
             log.line("engine switch failed: \(error)")
             stored.stagedEngine = nil
-            try? FileManager.default.removeItem(at: next.root)
+            await removeEngineFolder(next.root)
             save()
             updateNote = "Engine update failed and was undone: \(error.localizedDescription)"
         }
+        return updateNote
+    }
+
+    /// Builds Unwine's Steam tool on `target` and makes it the engine in use. The engine it leaves stays
+    /// one step back, so Settings can go back to it. Callers make sure nothing runs on the engine.
+    private func switchEngine(to target: InstalledEngine) async throws {
+        engineSwitching = ["Getting the engine ready…", "Building Unwine's Steam tool…", "Writing your games' settings…"]
+        let log = self.log
+        await Task.detached(priority: .userInitiated) { RendererPatches.prepare(engine: target, log: log) }.value
+        do {
+            try await Runner.build(engine: target, d3dmetal: d3dmetal, log: log)
+        } catch {
+            // A last small step can fail after the new tool is in place. Then the tool runs on `target`
+            // already, and the switch must count: undoing it would delete the engine the tool uses.
+            guard Runner.record()?.engineFolder == target.folder else { throw error }
+            log.line("Steam tool is on \(target.folder), with a late error: \(error.localizedDescription)")
+        }
+        if let current = engine, current.folder != target.folder { stored.previousEngine = current.folder }
+        stored.activeEngine = target.folder
+        engine = target
+        runnerReady = true
+        writeAllProfiles()
+        save()
+        // Older engines hold thousands of files each, so they go off the main thread.
+        let keep = [target.folder, stored.previousEngine, stored.heldEngine?.folder].compactMap { $0 }
+        await Task.detached(priority: .utility) { EngineStore.prune(keep: keep) }.value
+        log.line("Now on engine \(target.folder)")
+    }
+
+    /// Deletes an engine's folder off the main thread: it holds thousands of files.
+    private func removeEngineFolder(_ root: URL) async {
+        await Task.detached(priority: .utility) { try? FileManager.default.removeItem(at: root) }.value
+    }
+
+    /// Why Unwine cannot switch engines now, or nil when it can. Games, Windows Steam and setup all run
+    /// on the engine, so a switch waits for them.
+    var engineSwitchBlocker: String? {
+        if isSettingUp { return "Setup is running. Wait for it to finish." }
+        if engineSwitching != nil { return "Unwine is switching engines now." }
+        if isCheckingUpdates { return "Unwine is checking for updates. Wait for it to finish." }
+        if let name = startingSteamGame { return "\(name) is starting in Steam. Wait for its window, then quit the game first." }
+        if gameRunning { return "\(closeRunningFirst())." }
+        if !localRunning.isEmpty || !localStarting.isEmpty { return "A game you added is running. Quit it first." }
+        if bottleProgramsRun { return "A program runs in a game's Windows bottle. Close it first." }
+        if online.inUse || onlineBusy || onlineStep.isRunning { return "Windows Steam is open. Quit it first." }
+        return nil
+    }
+
+    /// A program that Unwine starts or runs in a game's Windows bottle (Fix things). It runs on the
+    /// engine too, so an engine switch waits for it.
+    var bottleProgramsRun: Bool { !bottleToolStarting.isEmpty || bottleRuns.values.contains { $0 > 0 } }
+
+    /// The engine one step back, when it is still on disk.
+    var previousEngineInstalled: InstalledEngine? {
+        guard let folder = stored.previousEngine, folder != engine?.folder else { return nil }
+        return EngineStore.installed().first { $0.folder == folder }
+    }
+
+    /// The new engine that waits because a fix does not fit it, when it is still on disk.
+    var heldEngineInstalled: InstalledEngine? {
+        guard let folder = stored.heldEngine?.folder else { return nil }
+        return EngineStore.installed().first { $0.folder == folder }
+    }
+
+    /// Settings' "Go back to …": the engine one step back becomes the one in use again. Updates then
+    /// leave out the engine the user left, until a newer one comes or the user switches back.
+    func goBackToPreviousEngine() async {
+        guard let target = previousEngineInstalled, let from = engine else { return }
+        guard engineSwitchBlocker == nil, !Runner.isInUse(), !OnlineSteam.isInUse else {
+            updateNote = engineSwitchBlocker ?? "A game is running. Quit it first."
+            return
+        }
+        defer { engineSwitching = nil }
+        stored.stagedEngine = nil   // the user picked this engine: a waiting one must not switch away from it
+        do {
+            try await switchEngine(to: target)
+            // Going back to the engine left before means the user wants it again: updates may offer it.
+            stored.skippedEngine = stored.skippedEngine == target.release.key ? nil : from.release.key
+            stored.deferredEngine = nil
+            save()
+            updateNote = "Unwine uses \(target.label) again. Games use it the next time they start."
+        } catch {
+            log.line("going back to \(target.folder) failed: \(error)")
+            updateNote = "Unwine could not go back to \(target.label): \(error.localizedDescription) Your engine did not change."
+        }
+    }
+
+    /// Settings' "Use it anyway" for a held engine: the user switches without the fix that does not fit.
+    func useHeldEngine() async {
+        guard let held = stored.heldEngine, let target = heldEngineInstalled else { stored.heldEngine = nil; save(); return }
+        guard engineSwitchBlocker == nil, !Runner.isInUse(), !OnlineSteam.isInUse else {
+            updateNote = engineSwitchBlocker ?? "A game is running. Quit it first."
+            return
+        }
+        defer { engineSwitching = nil }
+        stored.heldEngine = nil     // it becomes the engine in use, so prune must not keep it as held
+        stored.stagedEngine = nil   // the user picked this engine: a waiting one must not switch away from it
+        do {
+            try await switchEngine(to: target)
+            stored.skippedEngine = nil
+            save()
+            updateNote = "Engine updated to \(target.wineVersion). If a game breaks, go back to the old engine in Engine rollback."
+        } catch {
+            log.line("engine switch failed: \(error)")
+            stored.heldEngine = held
+            save()
+            updateNote = "Unwine could not switch to \(target.label): \(error.localizedDescription) Your engine did not change."
+        }
+    }
+
+    /// Forgets the held engine and deletes its folder, unless it is `folder` or in use.
+    private func dropHeldEngine(except folder: String) async {
+        guard let held = stored.heldEngine, held.folder != folder else { return }
+        stored.heldEngine = nil
+        if held.folder != engine?.folder, held.folder != stored.previousEngine,
+           let copy = EngineStore.installed().first(where: { $0.folder == held.folder }) {
+            await removeEngineFolder(copy.root)
+        }
+    }
+
+    /// Settings' "Delete it" for a held engine. Updates then leave that engine out.
+    func deleteHeldEngine() async {
+        guard engineSwitching == nil else { return }
+        let copy = heldEngineInstalled
+        stored.heldEngine = nil
+        if let copy { stored.skippedEngine = copy.release.key }
+        save()
+        if let copy { await removeEngineFolder(copy.root) }
+        updateNote = "The new engine is deleted. Unwine keeps your current engine, and updates do not get that engine again."
     }
 
     private func addNewSignatures(from release: SteamPlayKitRelease) throws -> Int {

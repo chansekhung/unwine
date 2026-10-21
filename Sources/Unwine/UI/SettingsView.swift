@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var confirmRemoveOnline = false
     @State private var removeSizes: (games: Int64, saves: Int64)?
     @State private var measuring = false
+    @State private var showingLog = false
 
     var body: some View {
         @Bindable var model = model
@@ -33,6 +34,7 @@ struct SettingsView: View {
                             Text("New engine \(pending) is out. It needs a newer Unwine; your current engine keeps working.")
                                 .font(.system(size: 11)).foregroundStyle(Palette.warn)
                         }
+                        EngineUpdateNotices()
                         row("Steam Play files", model.stored.kitVersion.map { "NotProton \($0)" } ?? "Not installed")
                         HStack(spacing: 10) {
                             row("Unwine", appVersionText)
@@ -42,17 +44,32 @@ struct SettingsView: View {
                         }
                         HStack(spacing: 10) {
                             Button(model.isCheckingUpdates ? "Checking…" : "Check now") { Task { await model.checkForUpdates() } }
-                                .buttonStyle(QuietButtonStyle()).disabled(model.isCheckingUpdates || !model.showsLibrary)
-                            if model.isCheckingUpdates { ProgressTrack(progress: nil).frame(width: 120) }
+                                .buttonStyle(QuietButtonStyle()).disabled(model.isCheckingUpdates || !model.showsLibrary || model.engineSwitching != nil)
+                                .help(model.engineSwitching != nil ? "Unwine is switching engines now." : "Checks the engine, the Steam Play files and Unwine itself")
+                            if model.isCheckingUpdates && model.engineDownload == nil { ProgressTrack(progress: nil).frame(width: 120) }
                             if case .readyToInstall(let v) = model.appUpdater.status {
                                 Button("Install Unwine \(v)") { model.appUpdater.installAndRelaunch() }.buttonStyle(PrimaryButtonStyle())
                             }
                         }
-                        if let note = model.updateNote { Text(note).font(.system(size: 11)).foregroundStyle(Palette.muted) }
+                        if let note = model.updateNote {
+                            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                Text(note).font(.system(size: 11)).foregroundStyle(Palette.muted)
+                                if note.localizedCaseInsensitiveContains("failed") || note.localizedCaseInsensitiveContains("could not") {
+                                    Button("Show log") { showingLog = true }.buttonStyle(.link).font(.system(size: 11))
+                                        .help("Shows Unwine's log, which says what went wrong")
+                                }
+                            }
+                        }
                         if let last = model.stored.lastUpdateCheck {
                             Text("Last checked \(last.formatted(.relative(presentation: .named))).").font(.system(size: 11)).foregroundStyle(Palette.muted)
                         }
                     }
+
+                    group("Engine rollback") { EngineRollbackSection() }
+
+                    group("Unwine fixes") { UnwineFixesSection() }
+
+                    group("Compatibility data") { CompatibilityDataSection() }
 
                     group("GPTK (Apple D3DMetal)") {
                         row("Installed", addingGPTK ? "Adding…" : model.d3dmetal?.label ?? "Not added")
@@ -152,6 +169,10 @@ struct SettingsView: View {
                         }
                     }
 
+                    group("Storage") { StorageSection() }
+
+                    group("Logs") { LogsSection() }
+
                     group("Moving to a new Mac") {
                         Text("1. Copy Unwine.dmg to the new Mac and drag Unwine to Applications.\n2. Open Unwine and run setup again (it downloads the engine once).\n3. Steam Play must be on in the new Mac's Steam.\n4. Your games come back with Steam: copy the Steam library folder, or let Steam download them.")
                             .font(.system(size: 12)).foregroundStyle(Palette.text.opacity(0.9))
@@ -182,6 +203,7 @@ struct SettingsView: View {
         .fileImporter(isPresented: $pickingGPTK, allowedContentTypes: [UTType(filenameExtension: "dmg") ?? .data]) { result in
             if case .success(let url) = result { Task { await model.importGPTK(url) } }
         }
+        .sheet(isPresented: $showingLog) { LogsView(gameID: nil).environment(model) }
     }
 
     private var appVersionText: String {

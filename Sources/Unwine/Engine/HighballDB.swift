@@ -87,9 +87,27 @@ enum HighballDB {
     private static let retryAfter: TimeInterval = 600
 
     private static let cacheURL = Paths.support.appendingPathComponent("Cache/highball-games.json")
+    /// The server's tag for the cached file (its ETag). Sent back with the next request, so a list
+    /// that did not change costs one short answer instead of the whole file again.
+    private static let tagURL = Paths.support.appendingPathComponent("Cache/highball-games.etag")
 
     /// Highball's entry for a Steam app, from the cached file. Safe from any thread.
     static func game(_ appID: Int) -> HighballGame? { index.games[appID] }
+
+    /// How many games the cached list holds, those without a Steam app id too. Safe from any thread.
+    static var gameCount: Int { _ = index.games; return index.count }
+
+    /// When Unwine last got the list, or last heard that it had not changed: the cache file's date.
+    static var updatedAt: Date? {
+        (try? FileManager.default.attributesOfItem(atPath: cacheURL.path))?[.modificationDate] as? Date
+    }
+
+    enum Refresh: Equatable, Sendable {
+        case updated(Int)       // a new list, with this many games
+        case unchanged          // Highball's list is the one Unwine has
+        case failed(String)
+        case notNeeded          // the copy is new enough, or the last try was a moment ago
+    }
 
     /// Downloads the database when the cached copy is missing, unreadable or older than three days.
     /// The old copy stays in place unless the new one passes `parse`, so any failure is harmless.
@@ -97,18 +115,33 @@ enum HighballDB {
     /// retry wait, so a timer can call it often. Returns true only when it wrote a new cache file.
     @discardableResult
     static func refreshIfStale(log: LogFile? = nil) async -> Bool {
-        guard isStale, await throttle.allow(every: retryAfter) else { return false }
+        if case .updated = await refresh(force: false, log: log) { return true }
+        return false
+    }
+
+    /// Asks Highball for the list. `force` (Settings' Refresh now) skips the age check and the retry wait.
+    static func refresh(force: Bool, log: LogFile? = nil) async -> Refresh {
+        if !force { guard isStale, await throttle.allow(every: retryAfter) else { return .notNeeded } }
         do {
-            let data = try await download()
+            // Only a readable copy may be kept on "not changed".
+            let tag = index.games.isEmpty ? nil : (try? String(contentsOf: tagURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let fresh = try await download(tag: tag.flatMap { $0.isEmpty ? nil : $0 }) else {
+                // The date of the copy says when Unwine last made sure it is current.
+                try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: cacheURL.path)
+                log?.line("Highball database unchanged")
+                return .unchanged
+            }
+            let (data, newTag) = fresh
             guard let games = parse(data) else { throw RefreshError.notADatabase }
             try Paths.ensure(cacheURL.deletingLastPathComponent())
             try data.write(to: cacheURL, options: .atomic)
-            index.set(byAppID(games))
+            if let newTag { try? newTag.write(to: tagURL, atomically: true, encoding: .utf8) } else { try? FileManager.default.removeItem(at: tagURL) }
+            index.set(byAppID(games), count: games.count)
             log?.line("Highball database refreshed: \(games.count) games")
-            return true
+            return .updated(games.count)
         } catch {
             log?.line("Highball database not refreshed: \(error.localizedDescription)")
-            return false
+            return .failed(error.localizedDescription)
         }
     }
 
@@ -123,30 +156,39 @@ enum HighballDB {
         return age < 0 || age > maxAge || index.games.isEmpty
     }
 
-    /// Parsed once, then kept. `refreshIfStale` replaces it after writing a new file.
+    /// Parsed once, then kept. `refresh` replaces it after writing a new file.
     private final class Index: @unchecked Sendable {
         private let lock = NSLock()
         private var cached: [Int: HighballGame]?
+        private var total = 0
 
         var games: [Int: HighballGame] {
             lock.lock(); defer { lock.unlock() }
             if let cached { return cached }
             let loaded = HighballDB.loadFromDisk()
-            cached = loaded
-            return loaded
+            cached = loaded.byID
+            total = loaded.count
+            return loaded.byID
         }
 
-        func set(_ games: [Int: HighballGame]) {
+        /// All games in the list, read with `games`.
+        var count: Int {
+            lock.lock(); defer { lock.unlock() }
+            return total
+        }
+
+        func set(_ games: [Int: HighballGame], count: Int) {
             lock.lock(); defer { lock.unlock() }
             cached = games
+            total = count
         }
     }
 
     private static let index = Index()
 
-    private static func loadFromDisk() -> [Int: HighballGame] {
-        guard let data = try? Data(contentsOf: cacheURL), let games = parse(data) else { return [:] }
-        return byAppID(games)
+    private static func loadFromDisk() -> (byID: [Int: HighballGame], count: Int) {
+        guard let data = try? Data(contentsOf: cacheURL), let games = parse(data) else { return ([:], 0) }
+        return (byAppID(games), games.count)
     }
 
     private static func byAppID(_ games: [HighballGame]) -> [Int: HighballGame] {
@@ -213,10 +255,13 @@ enum HighballDB {
     private static let throttle = Throttle()
 
     /// Reads at most `maxBytes`, counted after decompression, so a bad server cannot fill memory.
-    private static func download() async throws -> Data {
+    /// With the cached copy's `tag`, a list that has not changed returns nil (the server's 304).
+    /// Otherwise it returns the file and its new tag.
+    private static func download(tag: String?) async throws -> (Data, String?)? {
         var request = URLRequest(url: source, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
         request.setValue("Unwine", forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let tag { request.setValue(tag, forHTTPHeaderField: "If-None-Match") }
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForResource = 60
         config.waitsForConnectivity = false   // fail fast offline; the next launch tries again
@@ -224,15 +269,16 @@ enum HighballDB {
         defer { session.invalidateAndCancel() }
 
         let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw DownloadError.http((response as? HTTPURLResponse)?.statusCode ?? -1, source)
-        }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+        if status == 304, tag != nil { return nil }
+        guard let http = response as? HTTPURLResponse, status == 200 else { throw DownloadError.http(status, source) }
         guard response.expectedContentLength <= Int64(maxBytes) else { throw RefreshError.tooLarge }
         var data = Data()
+        data.reserveCapacity(Int(max(0, min(response.expectedContentLength, Int64(maxBytes)))))
         for try await byte in bytes {
             data.append(byte)
             if data.count > maxBytes { throw RefreshError.tooLarge }
         }
-        return data
+        return (data, http.value(forHTTPHeaderField: "ETag"))
     }
 }

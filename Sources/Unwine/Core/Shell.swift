@@ -5,24 +5,36 @@ final class LogFile: @unchecked Sendable {
     let url: URL
     private let queue = DispatchQueue(label: "unwine.log")
     private var handle: FileHandle?
+    private var written = 0     // bytes in the current file; read and changed only on `queue`
+
+    /// A log that reaches this size moves to "<name>.1" (the one before it goes) and starts again,
+    /// also while a game writes to it. The last part before the move stays readable for a bug report.
+    static let rotateAt = 10_000_000
 
     init(_ name: String) {
         url = Paths.logs.appendingPathComponent(name)
         try? FileManager.default.createDirectory(at: Paths.logs, withIntermediateDirectories: true)
-        // Keep logs small: start fresh once they pass 20 MB.
-        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int, size > 20_000_000 {
-            try? FileManager.default.removeItem(at: url)
+        let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int ?? 0
+        if size >= Self.rotateAt {
+            rotate()
+        } else {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                FileManager.default.createFile(atPath: url.path, contents: nil)
+            }
+            handle = try? FileHandle(forWritingTo: url)
+            _ = try? handle?.seekToEnd()
+            written = size
         }
-        if !FileManager.default.fileExists(atPath: url.path) {
-            FileManager.default.createFile(atPath: url.path, contents: nil)
-        }
-        handle = try? FileHandle(forWritingTo: url)
-        _ = try? handle?.seekToEnd()
     }
 
     func write(_ text: String) {
         let data = Data(text.utf8)
-        queue.async { [weak self] in try? self?.handle?.write(contentsOf: data) }
+        queue.async { [weak self] in
+            guard let self else { return }
+            try? self.handle?.write(contentsOf: data)
+            self.written += data.count
+            if self.written >= Self.rotateAt { self.rotate() }
+        }
     }
 
     func line(_ text: String) {
@@ -30,14 +42,41 @@ final class LogFile: @unchecked Sendable {
         write("[\(stamp)] \(text)\n")
     }
 
+    /// The log before the newest one, kept when the log moved on at `rotateAt`.
+    static func previous(of url: URL) -> URL { url.appendingPathExtension("1") }
+
+    /// Keeps the full log as "<name>.1" and starts an empty one. Runs in `init` or on `queue`.
+    private func rotate() {
+        let fm = FileManager.default
+        try? handle?.close()
+        handle = nil
+        let old = Self.previous(of: url)
+        try? fm.removeItem(at: old)
+        try? fm.moveItem(at: url, to: old)
+        fm.createFile(atPath: url.path, contents: nil)
+        handle = try? FileHandle(forWritingTo: url)
+        written = 0
+    }
+
     /// Last `bytes` of the log, for the in-app viewer.
-    func tail(_ bytes: Int = 64_000) -> String {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return "" }
-        defer { try? h.close() }
-        let end = (try? h.seekToEnd()) ?? 0
-        try? h.seek(toOffset: end > UInt64(bytes) ? end - UInt64(bytes) : 0)
-        let data = (try? h.readToEnd()) ?? Data()
-        return String(decoding: data, as: UTF8.self)
+    func tail(_ bytes: Int = 64_000) -> String { Self.tail(of: url, bytes: bytes) }
+
+    /// Last `bytes` of any log file, whole lines only. Just after the log moved on, the end of the
+    /// one before it comes first, so the newest lines are never missing. Empty when there is no file.
+    static func tail(of url: URL, bytes: Int = 64_000) -> String {
+        func read(_ file: URL, _ count: Int) -> Data {
+            guard count > 0, let h = try? FileHandle(forReadingFrom: file) else { return Data() }
+            defer { try? h.close() }
+            let end = (try? h.seekToEnd()) ?? 0
+            try? h.seek(toOffset: end > UInt64(count) ? end - UInt64(count) : 0)
+            return (try? h.readToEnd()) ?? Data()
+        }
+        let newest = read(url, bytes)
+        let data = newest.count < bytes ? read(previous(of: url), bytes - newest.count) + newest : newest
+        var text = String(decoding: data, as: UTF8.self)
+        // A cut in the middle of a line would start with half a line.
+        if data.count >= bytes, let cut = text.firstIndex(of: "\n") { text = String(text[text.index(after: cut)...]) }
+        return text
     }
 }
 
@@ -59,6 +98,10 @@ enum Shell {
         let output: String
     }
 
+    /// Tools that copy or unpack many files. They run at utility priority, so a game that runs at the
+    /// same time keeps the fast cores, and the work goes to the cores that use less power.
+    static let bulkTools: Set<String> = ["tar", "cp", "ditto", "hdiutil", "unzip"]
+
     /// Runs a tool to completion without blocking the main thread.
     /// Output is mirrored to `log` and the last 64 KB is returned.
     @discardableResult
@@ -69,6 +112,7 @@ enum Shell {
         process.arguments = args
         if let env { process.environment = env }
         if let cwd { process.currentDirectoryURL = cwd }
+        if bulkTools.contains(exe.lastPathComponent) { process.qualityOfService = .utility }
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
@@ -77,7 +121,8 @@ enum Shell {
         let buffer = OutputBuffer(limit: keep)
         pipe.fileHandleForReading.readabilityHandler = { h in
             let data = h.availableData
-            guard !data.isEmpty else { return }
+            // End of file: a handler left in place is called again and again with no data (a busy loop).
+            guard !data.isEmpty else { h.readabilityHandler = nil; return }
             buffer.append(data)
             log?.write(String(decoding: data, as: UTF8.self))
         }
