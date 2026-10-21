@@ -230,9 +230,12 @@ enum Runner {
     /// wineboot and to the programs it starts: macOS could then ask for the password while only a bottle is
     /// made. Wine starts those programs through this wrapper too, with the game's profile, so a mark that
     /// they inherit keeps it off for them. The game starts from NotProton, without the mark.
+    /// NotProton also runs `wine reg import` at every start; when the bottle is not there yet, Wine makes
+    /// it from inside that reg.exe, so reg counts as making a bottle too.
     static let bootWithoutX87 = """
         case "${1:-}" in
           wineboot|wineboot.exe|*/wineboot|*/wineboot.exe|*'\\'wineboot|*'\\'wineboot.exe) DECANT_NO_X87=1 ;;
+          reg|reg.exe|*/reg|*/reg.exe|*'\\'reg|*'\\'reg.exe) DECANT_NO_X87=1 ;;
         esac
         if [ -n "${DECANT_NO_X87:-}" ]; then
           unset -v ROSETTA_X87_PATH X87_PRECISE_FAULTS
