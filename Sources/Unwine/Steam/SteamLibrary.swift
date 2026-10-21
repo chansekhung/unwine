@@ -20,6 +20,8 @@ struct SteamGame: Identifiable, Hashable, Sendable {
     var localExe: URL? = nil
     /// An added game that shares another added game's bottle (one game folder, one bottle).
     var bottleID: Int? = nil
+    /// Minutes played. Unwine counts them for added games; nil when it does not know.
+    var playtimeMinutes: Int? = nil
 
     var compatData: URL { steamapps.appendingPathComponent("compatdata/\(bottleID ?? id)", isDirectory: true) }
     var runLog: URL {

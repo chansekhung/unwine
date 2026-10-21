@@ -320,6 +320,7 @@ enum Profiles {
             if s.metalFXSpatial { export("DXMT_METALFX_SPATIAL_SWAPCHAIN", "1") }
             if hasDXMTConfig { export("DXMT_CONFIG_FILE", dxmtConfig(for: appID).path) }
         }
+        out += LaunchOptions.profileLines(for: appID)   // the game page's language, DLL overrides and extra settings
         return out.joined(separator: "\n") + "\n"
     }
 }

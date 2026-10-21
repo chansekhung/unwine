@@ -26,6 +26,7 @@ struct StoredState: Codable {
     var localGames: [LocalGameRecord] = []  // Windows games the user added by their .exe
     var lastLocalID = 0                     // the highest id ever given to an added game, so none is reused
     var lastSeenVersion: String?            // the Unwine whose "What's new" the user has seen; nil on a fresh install
+    var launchOptions: [Int: LaunchOptions] = [:]   // each game's launch options, mods and language (its page's "Launch options and mods")
 
     init() {}
 
@@ -54,6 +55,7 @@ struct StoredState: Codable {
         lastLocalID = (try? c.decodeIfPresent(Int.self, forKey: .lastLocalID)) ?? 0
         // Unwine 1.0.2 and older did not keep this. Someone who set one of them up sees what came after 1.0.2.
         lastSeenVersion = (try? c.decodeIfPresent(String.self, forKey: .lastSeenVersion)) ?? (setupComplete ? "1.0.2" : nil)
+        launchOptions = (try? c.decodeIfPresent([Int: LaunchOptions].self, forKey: .launchOptions)) ?? [:]
     }
 }
 
@@ -197,6 +199,16 @@ final class AppModel {
     var bottleWaiting = Set<Int>()      // Steam games whose settings wait for their bottle (open, or not made yet)
     var bottleFailed = Set<Int>()       // Steam games whose last bottle write did not take
     var bottlePlayQueued = Set<Int>()   // Play waits for a bottle write to finish
+
+    // Added games, bottles, mods and Wine tools (group b). See AddedGames.swift.
+    var bottleToolStarting: [Int: String] = [:]     // a program or Wine tool starting in a game's bottle, with the step to show
+    var installedPrograms: [Int: [(url: URL, size: Int64)]] = [:]   // after an installer ended: programs it put in its bottle
+    var steamCopyAsk: SteamCopyAsk?                 // an added .exe that the Steam library has already: add it anyway?
+    var templateTask: Task<URL?, Never>?            // the engine's bottle template while it is made (one at a time)
+    var templateFailed = Set<String>()              // engines whose template failed this run: their bottles use wineboot
+    var toolLogs: [Int: LogFile] = [:]              // one writer per Steam game's log of programs run in its bottle
+    var bottleRuns: [String: Int] = [:]             // programs Unwine ran in a bottle (by its path) that still run
+    var watchedBottles = Set<String>()              // added games' bottles (by path) whose session Unwine follows now
 
     /// Switching between Mac Steam and Windows Steam.
     var onlineBusy: Bool { onlineWords != nil }
@@ -356,7 +368,7 @@ final class AppModel {
         steamPlay = snap.play
         steamVersion = snap.version
         mappings = snap.mappings
-        games = snap.games + stored.localGames.map(LocalGames.game(from:))
+        games = LocalGames.inLibraryOrder(snap.games + stored.localGames.map(LocalGames.game(from:)))
         localRunning = Set(games.filter { $0.localExe != nil && LocalGames.isRunning($0) }.map(\.id))
         gameRunning = snap.runnerInUse
         online = snap.online
@@ -839,37 +851,54 @@ final class AppModel {
     // MARK: Games added by their .exe
 
     /// Adds a Windows game or program by its .exe. It shows in the library like a Steam game.
-    func addLocalGame(exe: URL, folder: URL? = nil) {
-        if let known = stored.localGames.first(where: { $0.exePath == exe.path }) {
+    /// `folder` is the game folder the user picked, if any. A program that Steam's library already has
+    /// is added only `anyway`: until then Unwine asks (`steamCopyAsk`).
+    func addLocalGame(exe: URL, folder: URL? = nil, anyway: Bool = false) {
+        let path = exe.standardizedFileURL.path
+        if let known = stored.localGames.first(where: { URL(fileURLWithPath: $0.exePath).standardizedFileURL.path == path }) {
             banner = "\(known.name) is already in your library."
+            return
+        }
+        if !anyway, let ask = steamCopy(of: exe, folder: folder) {
+            steamCopyAsk = ask
             return
         }
         let id = max(LocalGames.idBase, stored.lastLocalID, stored.localGames.map(\.id).max() ?? 0) + 1
         stored.lastLocalID = id
-        // Named after the folder the user picked, else the folder the program sits in.
-        var name = folder.map { $0.lastPathComponent.replacingOccurrences(of: "_", with: " ").trimmingCharacters(in: .whitespaces) }
-            .flatMap { $0.isEmpty ? nil : $0 } ?? LocalGames.suggestedName(for: exe)
+        // Named after the game folder the user picked, else the folder the program sits in.
+        let root = LocalGames.gameRoot(for: exe, picked: folder)
+        var name = LocalGames.suggestedName(for: exe, root: root)
         // A second program from the same game (often its launcher) shares the first one's bottle.
         // A launcher or tool says so in its name, so the tiles differ.
         let mate = LocalGames.bottleMate(for: exe, in: stored.localGames)
-        if let role = LocalGames.role(of: exe) {
-            name += " · \(role)"
-        } else if stored.localGames.contains(where: { $0.name == name }) {
-            name += " (\(exe.deletingPathExtension().lastPathComponent))"
-        }
-        let record = LocalGameRecord(id: id, name: name, exePath: exe.path, addedAt: Date(), bottleOf: mate?.bottle)
+        if let role = LocalGames.role(of: exe) { name += " · \(role)" }
+        name = uniqueLocalName(name, exe: exe)
+        let record = LocalGameRecord(id: id, name: name, exePath: exe.path, addedAt: Date(), bottleOf: mate?.bottle, rootPath: root?.path)
         stored.localGames.append(record)
         save()
         let game = LocalGames.game(from: record)
-        games.append(game)
-        let lower = exe.lastPathComponent.lowercased()
-        banner = ["setup", "install", "unins"].contains(where: lower.contains)
-            ? "\(record.name) looks like an installer. Play runs it inside the game's own bottle. When it finishes, use Add game again and pick the installed program (Unwine's LocalGames folder holds the bottle)."
+        games = LocalGames.inLibraryOrder(games + [game])
+        banner = LocalGames.looksLikeInstaller(exe)
+            ? "\(record.name) looks like an installer. Press Play to run it in a Windows bottle of its own. When it ends, its page offers the program it installed, in the same bottle."
             : mate.map { m in LocalGames.isInside(exe, bottle: m.bottle)
                 ? "\(record.name) is in your library. It runs in the Windows bottle that \(m.name) installed it into."
                 : "\(record.name) is in your library. It shares a Windows bottle with \(m.name), so settings you make in one, such as in a launcher, reach the other." }
                 ?? "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
         Task { await analyze(game) }
+        // The first Play then only copies a bottle: the template is made while the user looks around.
+        warmBottleTemplate()
+    }
+
+    /// A name no other game in the library has: the program's name goes after a name that is taken.
+    func uniqueLocalName(_ base: String, exe: URL, except id: Int? = nil) -> String {
+        let taken = Set(games.filter { $0.id != id }.map { $0.name.lowercased() })
+            .union(stored.localGames.filter { $0.id != id }.map { $0.name.lowercased() })
+        guard taken.contains(base.lowercased()) else { return base }
+        let named = "\(base) (\(exe.deletingPathExtension().lastPathComponent))"
+        guard taken.contains(named.lowercased()) else { return named }
+        var n = 2
+        while taken.contains("\(named) \(n)".lowercased()) { n += 1 }
+        return "\(named) \(n)"
     }
 
     /// Programs from one game folder added before Unwine 1.0.3 each got their own bottle, so a
@@ -879,6 +908,8 @@ final class AppModel {
     /// bottles both hold files stays apart, because Unwine cannot tell which saves count. Bottles
     /// in use are left for the next start. A launcher or tool also gets its role in its name.
     private func mergeLocalBottles() {
+        // start() calls this right after it reads state.json, before it picks the engine and writes the profiles.
+        startAddedGames()
         var owners: [LocalGameRecord] = []
         var notes: [String] = []
         for r in stored.localGames.sorted(by: { $0.addedAt < $1.addedAt }) where r.bottleOf == nil {
@@ -946,35 +977,51 @@ final class AppModel {
 
     /// Takes an added game out of the library. Its files stay where they are; its Windows bottle
     /// (settings and saves the game kept inside it) goes to the Trash, unless another added game
-    /// from the same folder still uses it.
+    /// from the same folder still uses it. The bottle goes first: when it cannot go to the Trash, the
+    /// game stays in the library, so no bottle is ever left behind without a game.
     func removeLocalGame(_ game: SteamGame) {
         guard game.localExe != nil else { return }
-        guard !localRunning.contains(game.id) else { banner = "\(game.name) is running. Quit it first."; return }
+        guard !localRunning.contains(game.id), localStarting[game.id] == nil else { banner = "\(game.name) is running. Quit it first."; return }
         let sharers = bottleSharers(of: game)
-        stored.localGames.removeAll { $0.id == game.id }
-        stored.games[game.id] = nil
-        stored.analyses[game.id] = nil
-        stored.presetChoice[game.id] = nil
-        save()
-        Profiles.remove(appID: game.id)
         if sharers.isEmpty {
             if FileManager.default.fileExists(atPath: game.compatData.path) {
-                try? FileManager.default.trashItem(at: game.compatData, resultingItemURL: nil)
+                do {
+                    try FileManager.default.trashItem(at: game.compatData, resultingItemURL: nil)
+                } catch {
+                    banner = "\(game.name) stays in your library, because Unwine could not move its Windows bottle to the Trash: \(error.localizedDescription)"
+                    log.line("Could not move the bottle of \(game.name) to the Trash: \(error)")
+                    return
+                }
             }
         } else {
             try? FileManager.default.removeItem(at: game.compatData.appendingPathComponent(game.bottleID == nil ? "Game.app" : "Game-\(game.id).app"))
         }
+        stored.localGames.removeAll { $0.id == game.id }
+        stored.games[game.id] = nil
+        stored.analyses[game.id] = nil
+        stored.presetChoice[game.id] = nil
+        stored.launchOptions[game.id] = nil
+        save()
+        LaunchOptions.publish(stored.launchOptions)
+        Profiles.remove(appID: game.id)
+        // Its log goes too: no page can show it once the game is gone.
+        localLogs[game.id] = nil
+        try? FileManager.default.removeItem(at: Paths.logs.appendingPathComponent(LocalGames.logName(game.id)))
+        installedPrograms[game.id] = nil
         games.removeAll { $0.id == game.id }
         banner = sharers.isEmpty
             ? "\(game.name) is out of your library. Its files stay in \(game.installDir.path)."
             : "\(game.name) is out of your library. Its Windows bottle stays, because \(sharers[0].name) uses it too."
     }
 
-    /// Points an added game at its program's new place (moved folder, other drive), keeping its bottle.
+    /// Points an added game at another program, or at its program's new place (moved folder, other
+    /// drive), keeping its bottle and saves. The game folder follows when the whole game moved.
     func relocateLocalGame(_ id: Int, exe: URL) {
         guard let i = stored.localGames.firstIndex(where: { $0.id == id }) else { return }
+        stored.localGames[i].rootPath = LocalGames.movedRoot(of: stored.localGames[i], to: exe)?.path
         stored.localGames[i].exePath = exe.path
         stored.analyses[id] = nil
+        installedPrograms[id] = nil     // the entry has its program now
         save()
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
         banner = "\(stored.localGames[i].name) now starts \(exe.lastPathComponent) from \(exe.deletingLastPathComponent().path)."
@@ -989,7 +1036,7 @@ final class AppModel {
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
     }
 
-    private func localLog(_ id: Int) -> LogFile {
+    func localLog(_ id: Int) -> LogFile {
         if let log = localLogs[id] { return log }
         let log = LogFile(LocalGames.logName(id))
         localLogs[id] = log
@@ -1000,6 +1047,10 @@ final class AppModel {
         guard let engine else { banner = "Unwine's engine is not set up yet."; return }
         guard localStarting[game.id] == nil else { return }
         if localRunning.contains(game.id) { banner = "\(game.name) is already running."; return }
+        guard let arguments = LaunchOptions.words(launchOptions(for: game.id).arguments) else {
+            banner = "\(game.name) did not start: a quote in its launch options is not closed. Open its page to fix them."
+            return
+        }
         localStarting[game.id] = "Getting \(game.name) ready…"
         defer { localStarting[game.id] = nil }
         // The first start waits for the file check, so the settings fit the game. A launcher runs
@@ -1009,10 +1060,15 @@ final class AppModel {
         writeProfile(for: source.id)
         let log = localLog(game.id)
         if source.id != game.id { log.line("\(game.name) starts with the settings of \(source.name), so the game it opens gets them") }
+        let exited = ExitFlag()
         do {
-            try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: source.id), log: log,
-                                       phase: { [weak self] words in self?.localStarting[game.id] = words },
-                                       onExit: { status in log.line("The game's process ended with status \(status)") })
+            let before = try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: source.id), arguments: arguments, log: log,
+                                                    template: { [weak self] in await self?.bottleTemplate() },
+                                                    watchInstalls: game.localExe.map(LocalGames.looksLikeInstaller) ?? false,
+                                                    phase: { [weak self] words in self?.localStarting[game.id] = words },
+                                                    onExit: { status in log.line("The game's process ended with status \(status)"); exited.set(status) })
+            let launched = Date()
+            markPlayed(game.id)
             // Wait for the game to show a window, so the waiting screen covers the slow part. Stop
             // when the bottle closes (the game ended).
             var seenAlive = false, ended = false, shown = false
@@ -1029,8 +1085,11 @@ final class AppModel {
                 localRunning.remove(game.id)
                 banner = "\(game.name) closed before it showed a window. On its page, Show logs says why."
                 log.line("The game closed before it showed a window")
-            } else if !shown {
-                banner = "\(game.name) is still starting. Its window shows soon, or Show logs on its page says what it is doing."
+                await offerInstalledPrograms(game, before: before)
+            } else {
+                if !shown { banner = "\(game.name) is still starting. Its window shows soon, or Show logs on its page says what it is doing." }
+                // Until the bottle closes: playtime, the display kept awake, and leftovers closed.
+                Task { await self.watchLocalSession(game, exited: exited, installsBefore: before, since: launched) }
             }
         } catch {
             banner = "\(game.name) did not start: \(error.localizedDescription)"
@@ -1050,12 +1109,12 @@ final class AppModel {
     /// The processes, of those given, that opened a window. A Wine program turns into a normal Mac app
     /// when it shows its first window, even one that Stage Manager keeps as a tile in its strip, so
     /// this works where looking at window sizes cannot.
-    private static func withWindows(_ pids: [pid_t]) -> Set<pid_t> {
+    static func withWindows(_ pids: [pid_t]) -> Set<pid_t> {
         Set(pids.filter { NSRunningApplication(processIdentifier: $0)?.activationPolicy == .regular })
     }
 
     /// Every process whose Wine bottle is `prefix`.
-    nonisolated private static func bottlePIDs(prefix: URL) -> [pid_t] {
+    nonisolated static func bottlePIDs(prefix: URL) -> [pid_t] {
         var pids = [pid_t](repeating: 0, count: 4096)
         let count = Int(proc_listallpids(&pids, Int32(pids.count * MemoryLayout<pid_t>.size)))
         return pids.prefix(max(0, count)).filter { $0 > 0 && processUsesPrefix($0, prefix.path) }
@@ -1340,7 +1399,9 @@ final class AppModel {
             try? Profiles.write(appID: nil, settings: stored.defaults, renderer: r, engine: engine, d3dmetal: d3dmetal,
                                 battery: stored.defaults.saveBatteryUnplugged ? batteryOverlayNow : nil)
         }
-        for id in Set(stored.games.keys).union(stored.analyses.keys) { writeProfile(for: id) }
+        // A game with only launch options has a profile of its own too (AddedGames), which must follow
+        // the engine and the battery overlay like the others.
+        for id in Set(stored.games.keys).union(stored.analyses.keys).union(stored.launchOptions.keys) { writeProfile(for: id) }
     }
 
     // MARK: Battery mode
