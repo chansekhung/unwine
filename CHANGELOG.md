@@ -22,6 +22,10 @@ How to keep this list. The build reads it, so follow these rules.
    commands to tag and publish.
 -->
 
+## 1.0.6 · not released yet
+
+- **Fix for a crash at start in DirectX 10 and 11 games.** DXMT (the layer that draws these games with Metal) used its device before it set it up. Then a game could close at start, Age of Mythology too. Unwine now fixes this in its own copy of DXMT. DXMT itself fixed it on 30 Sep 2026, so newer DXMT builds do not need the copy.
+
 ## 1.0.5 · 2026-10-21
 
 - **Faster x87 math works now.** In 1.0.4 it stopped every 32-bit game at start, Age of Mythology too. Wine gave x87sidecar a file that this engine does not have. Now x87sidecar gets the right file, in added games and in Steam games. In a test, x87 math ran about 28 times faster. It is still experimental. Some games crash with it, and Steam can show "Stop" after you quit the game. Unwine now says so beside the switch.

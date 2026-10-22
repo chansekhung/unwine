@@ -7,6 +7,7 @@ struct UnwineFix: Identifiable, Equatable, Sendable {
         case dxvk           // dxvk3-unwine: DXVK as the game's whole graphics layer
         case dep            // wine/lib/wine-unwine: 32-bit games keep DEP on
         case vulkanMemory   // the KosmicKrisp driver copy that reports the real free memory
+        case dxmt           // dxmt-unwine: DXMT sets up its device before its first shaders
 
         var title: String {
             switch self {
@@ -14,6 +15,7 @@ struct UnwineFix: Identifiable, Equatable, Sendable {
             case .dxvk: return "Games on the DXVK layer"
             case .dep: return "32-bit games (DEP)"
             case .vulkanMemory: return "Vulkan memory (KosmicKrisp)"
+            case .dxmt: return "Games on DXMT (DirectX 10 and 11)"
             }
         }
 
@@ -24,6 +26,7 @@ struct UnwineFix: Identifiable, Equatable, Sendable {
             case .dxvk: return "games on the DXVK layer"
             case .dep: return "32-bit games"
             case .vulkanMemory: return "Vulkan memory"
+            case .dxmt: return "games on DXMT"
             }
         }
 
@@ -34,6 +37,7 @@ struct UnwineFix: Identifiable, Equatable, Sendable {
             case .dxvk: return "A picture that the Mac cannot share no longer closes the game."
             case .dep: return "Only the game's own .exe can turn DEP off, as on Windows. This stops freezes like the ones in Age of Mythology."
             case .vulkanMemory: return "Vulkan tells games how much memory the Mac really has free."
+            case .dxmt: return "DXMT sets up its device before it builds its first shaders. This stops a crash at start, like the one in Age of Mythology."
             }
         }
     }
@@ -99,6 +103,15 @@ enum PatchStatus {
                 ? "Unwine could not make its fixed copy. Quit and open Unwine to try again."
                 : newBuild
         out.append(UnwineFix(kind: .vulkanMemory, on: vkOn, why: vkWhy))
+
+        // A DXMT build from 30 Sep 2026 on has the fix in its own source, so it needs no copy.
+        let dxmtUpstream = RendererPatches.dxmtFixedUpstream(engine: engine)
+        let dxmtOn = dxmtUpstream || RendererPatches.fixedDir("dxmt", engine: engine) != nil
+        let dxmtWhy = dxmtUpstream ? "This engine's DXMT has the fix already. " + UnwineFix.Kind.dxmt.effect
+            : dxmtOn ? UnwineFix.Kind.dxmt.effect
+            : !has(engine.rendererRoot.appendingPathComponent("dxmt")) ? "This engine has no DXMT."
+            : newBuild
+        out.append(UnwineFix(kind: .dxmt, on: dxmtOn, why: dxmtWhy))
         return out
     }
 

@@ -7,8 +7,13 @@ import Foundation
 enum DXMTD3D12 {
     private static let markerName = ".unwine-d3d12"
 
+    /// DXMT's folder: Unwine's fixed copy when ready (RendererPatches), else the engine's own.
+    private static func dxmtRoot(_ engine: InstalledEngine) -> URL {
+        RendererPatches.dxmt(engine: engine).deletingLastPathComponent()
+    }
+
     private static func source(_ engine: InstalledEngine) -> URL {
-        engine.renderer("dxmt").appendingPathComponent("x86_64-windows/_d3d12.dll")
+        dxmtRoot(engine).appendingPathComponent("wine/x86_64-windows/_d3d12.dll")
     }
 
     /// The engine carries DXMT's DirectX 12 file.
@@ -27,14 +32,15 @@ enum DXMTD3D12 {
     static func folder(engine: InstalledEngine, log: LogFile? = nil) -> URL? {
         let fm = FileManager.default
         guard let attrs = try? fm.attributesOfItem(atPath: source(engine).path) else { return nil }
-        let stamp = "\((attrs[.size] as? NSNumber)?.int64Value ?? 0) \((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)\n"
+        let stamp = "\(dxmtRoot(engine).lastPathComponent) \((attrs[.size] as? NSNumber)?.int64Value ?? 0) \((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)\n"
         let wine = wineFolder(engine)
         let copy = wine.deletingLastPathComponent()
         if (try? String(contentsOf: copy.appendingPathComponent(markerName), encoding: .utf8)) == stamp { return wine }
         let stage = engine.rendererRoot.appendingPathComponent(".dxmt-d3d12-\(UUID().uuidString)", isDirectory: true)
         do {
             // FileManager clones on APFS: the copy takes no extra space and no time.
-            try fm.copyItem(at: engine.rendererRoot.appendingPathComponent("dxmt", isDirectory: true), to: stage)
+            try fm.copyItem(at: dxmtRoot(engine), to: stage)
+            try? fm.removeItem(at: stage.appendingPathComponent(".unwine-patch"))
             let win = stage.appendingPathComponent("wine/x86_64-windows", isDirectory: true)
             try fm.moveItem(at: win.appendingPathComponent("_d3d12.dll"), to: win.appendingPathComponent("d3d12.dll"))
             try stamp.write(to: stage.appendingPathComponent(markerName), atomically: true, encoding: .utf8)

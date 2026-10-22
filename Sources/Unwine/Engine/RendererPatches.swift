@@ -84,10 +84,69 @@ enum RendererPatches {
                edits: [plainNotShared64(0x42c76)]),
     ]
 
-    /// The DXVK folders Unwine makes fixed copies of, and the fixes each copy gets.
-    static let dxvkRenderers = ["d9vk", "dxvk3"]
+    // MARK: DXMT v0.80-244-g7c8dee1 (Sikarugir's Template 1.0.24)
+
+    /// DXMT's command context builds its compute pipelines while it is being made (ClearUAV does, in
+    /// its constructor), through its own `device_`, which was set only at the end of that constructor.
+    /// So the pipelines went to whatever the memory held: Age of Mythology closed at start with
+    /// "-[NSTaggedPointerString newComputePipelineStateWithDescriptor:...]: unrecognized selector".
+    /// DXMT fixed it on 30 Sep 2026 (3Shain/dxmt fb4515681d), 3 commits after this build. The fix sets
+    /// `device_` first: the constructor jumps to two short stops in the int3 padding between functions,
+    /// which store the device and do the instructions the jump replaced, then jumps back.
+    /// 32-bit: device_ is this+0xa598, the device is at 0xc(%ebp) and 0x10(%ebp), this is %edi.
+    /// 64-bit: device_ is this+0xc6a0, the device is %r8, this is %rcx. _d3d12.dll builds in the same code.
+    private static let deviceFirst32 = [
+        Edit(offset: 0xe2994, old: hex("8b5d0c8b7510"), new: hex("e979f0f1ff90")),
+        Edit(offset: 0x1a12, old: int3(14), new: hex("8b5d0c899f98a50000e942020000")),
+        Edit(offset: 0x1c62, old: int3(14), new: hex("8b751089b79ca50000e92a0d0e00")),
+    ]
+
+    private static let dxmtFixes: [Recipe] = [
+        Recipe(path: "wine/i386-windows/d3d11.dll",
+               cleanSHA256: "bc73ae05ff336c2d40bb7d4783aa79632f974140445aaebbc07ea49871d932aa",
+               patchedSHA256: "4655f60811c4c0a30302330eb56143007db138fe7e5aa754fbf08dc0669cce88",
+               edits: deviceFirst32),
+        Recipe(path: "wine/x86_64-windows/d3d11.dll",
+               cleanSHA256: "90bf11b791af80da3936fd02870331d397a9efd70f2c0b2172eb83e7c5a81185",
+               patchedSHA256: "0836f34cb225f66a9bc1fbd6e16351c15f9e75f3952c5e98a54e5d0d52d65a71",
+               edits: [Edit(offset: 0xf6027, old: hex("4c8949084c8d7110"), new: hex("e956b4f0ff909090")),
+                       Edit(offset: 0x1482, old: int3(12), new: hex("4c8981a0c60000e944080000")),
+                       Edit(offset: 0x1cd2, old: int3(13), new: hex("4c8949084c8d7110e950430f00"))]),
+        Recipe(path: "wine/x86_64-windows/_d3d12.dll",
+               cleanSHA256: "4bb4d0340feac706a005d44dae06bdb801bca13436892b4b02d488c2d6b750a9",
+               patchedSHA256: "456f84142ce1f33aa94ae81392cfcd8b4ec51cbef56dba7514557eee0538c374",
+               edits: [Edit(offset: 0xba377, old: hex("4c8949084c8d7110"), new: hex("e90671f4ff909090")),
+                       Edit(offset: 0x1482, old: int3(12), new: hex("4c8981a0c60000e9940e0000")),
+                       Edit(offset: 0x2322, old: int3(13), new: hex("4c8949084c8d7110e950800b00"))]),
+    ]
+
+    private static func hex(_ s: String) -> [UInt8] {
+        stride(from: 0, to: s.count, by: 2).map { UInt8(s.dropFirst($0).prefix(2), radix: 16)! }
+    }
+    private static func int3(_ count: Int) -> [UInt8] { [UInt8](repeating: 0xcc, count: count) }
+
+    /// DXMT builds from 30 Sep 2026 on (v0.80-247 and later) have the fix in their own source.
+    static func dxmtFixedUpstream(engine: InstalledEngine) -> Bool {
+        guard let text = try? String(contentsOf: engine.rendererRoot.appendingPathComponent("dxmt/version"), encoding: .utf8),
+              let m = text.firstMatch(of: #/v(\d+)\.(\d+)(?:-(\d+)-g)?/#),
+              let major = Int(m.1), let minor = Int(m.2) else { return false }
+        let commits = m.3.flatMap { Int($0) } ?? 0
+        return (major, minor) > (0, 80) || ((major, minor) == (0, 80) && commits >= 247)
+    }
+
+    /// DXMT's wine folder games should load: Unwine's fixed copy when ready, else the engine's own.
+    static func dxmt(engine: InstalledEngine) -> URL {
+        fixedDir("dxmt", engine: engine) ?? engine.renderer("dxmt")
+    }
+
+    /// The renderer folders Unwine makes fixed copies of, and the fixes each copy gets.
+    static let fixedRenderers = ["d9vk", "dxvk3", "dxmt"]
     private static func recipes(for name: String) -> [Recipe] {
-        name == "dxvk3" ? d3d9Fixes + d3d11Fixes : d3d9Fixes
+        switch name {
+        case "dxvk3": return d3d9Fixes + d3d11Fixes
+        case "dxmt": return dxmtFixes
+        default: return d3d9Fixes
+        }
     }
 
     /// renderer/<name>-unwine/wine when its fixed copy is ready, else nil (the game uses stock files).
@@ -221,7 +280,8 @@ enum RendererPatches {
 
     /// Makes the patched copies for this engine once. Cheap when they exist. Safe to call often.
     static func prepare(engine: InstalledEngine, log: LogFile) {
-        for name in dxvkRenderers where fixedDir(name, engine: engine) == nil {
+        for name in fixedRenderers where fixedDir(name, engine: engine) == nil {
+            if name == "dxmt" && dxmtFixedUpstream(engine: engine) { continue }     // nothing to fix
             prepareCopy(of: engine.rendererRoot.appendingPathComponent(name, isDirectory: true),
                         to: engine.rendererRoot.appendingPathComponent("\(name)-unwine", isDirectory: true),
                         recipes: recipes(for: name), log: log)
@@ -239,7 +299,7 @@ enum RendererPatches {
         // Only when every file is the exact build a recipe was made for.
         for r in recipes {
             guard (try? Downloader.sha256(of: source.appendingPathComponent(r.path))) == r.cleanSHA256 else {
-                log.line("\(source.lastPathComponent): not the DXVK build Unwine's fixes were made for, so its games use it unchanged")
+                log.line("\(source.lastPathComponent): not the \(layer(source)) build Unwine's fixes were made for, so its games use it unchanged")
                 return
             }
         }
@@ -250,12 +310,16 @@ enum RendererPatches {
             try marker(recipes).write(to: stage.appendingPathComponent(markerName), atomically: true, encoding: .utf8)
             try? fm.removeItem(at: copy)
             try fm.moveItem(at: stage, to: copy)
-            log.line("Made \(copy.lastPathComponent): DXVK's async shaders now also cover the game's main picture, and a texture the Mac cannot share no longer closes the game")
+            log.line("Made \(copy.lastPathComponent): " + (layer(source) == "DXMT"
+                ? "DXMT sets up its device before it builds its first shaders, so a game no longer closes at start"
+                : "DXVK's async shaders now also cover the game's main picture, and a texture the Mac cannot share no longer closes the game"))
         } catch {
             try? fm.removeItem(at: stage)
             log.line("Could not make \(copy.lastPathComponent): \(error.localizedDescription)")
         }
     }
+
+    private static func layer(_ folder: URL) -> String { folder.lastPathComponent == "dxmt" ? "DXMT" : "DXVK" }
 
     private static func prepareDriver(engine: InstalledEngine, log: LogFile) {
         let fm = FileManager.default

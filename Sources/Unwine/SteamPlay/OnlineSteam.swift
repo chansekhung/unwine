@@ -647,7 +647,7 @@ enum OnlineSteam {
         var notes: [String] = []
 
         // Steam's own windows (Chromium) draw only on DXMT. On D3DMetal they stay black.
-        env["WINEDLLPATH_DXMT"] = engine.renderer("dxmt").path
+        env["WINEDLLPATH_DXMT"] = RendererPatches.dxmt(engine: engine).path
         env["DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN"] = "1"
         // Unwine's copy of DXVK's DirectX 9 layer, when ready, like the default game profile.
         let d9vk = RendererPatches.fixedDir("d9vk", engine: engine) ?? engine.renderer("d9vk")
@@ -665,7 +665,7 @@ enum OnlineSteam {
                 let applied = apply(text, to: &env)
                 // Every program in this bottle shares one DXMT, Windows Steam's own windows too. Online
                 // mode keeps DXMT as it ships, without the experimental "DirectX 12 through DXMT" part.
-                if env["WINEDLLPATH_DXMT"] == DXMTD3D12.wineFolder(engine).path { env["WINEDLLPATH_DXMT"] = engine.renderer("dxmt").path }
+                if env["WINEDLLPATH_DXMT"] == DXMTD3D12.wineFolder(engine).path { env["WINEDLLPATH_DXMT"] = RendererPatches.dxmt(engine: engine).path }
                 // No Faster x87 math in Online mode: x87sidecar would attach to steam.exe and to the VAC
                 // game itself, and a ban is permanent. Unwine takes no risk with VAC.
                 if env.removeValue(forKey: "ROSETTA_X87_PATH") != nil {

@@ -348,7 +348,7 @@ enum Profiles {
         default: // .dxmt, .auto, or .d3dmetal without an import
             // Experimental: a DirectX 12 game with the switch on gets DXMT's own DirectX 12 part.
             let d3d12 = s.dxmtD3D12 && api == .dx12 ? DXMTD3D12.folder(engine: engine) : nil
-            export("WINEDLLPATH_DXMT", d3d12?.path ?? dir("dxmt"))
+            export("WINEDLLPATH_DXMT", d3d12?.path ?? RendererPatches.dxmt(engine: engine).path)
             export("DXMT_ALLOW_CROSS_PROCESS_SWAPCHAIN", "1")
             if s.metalFX { export("DXMT_ENABLE_NVEXT", "1") }
             // Bottles run without Retina mode unless the game's Sharp picture (or Steam's launch options,
