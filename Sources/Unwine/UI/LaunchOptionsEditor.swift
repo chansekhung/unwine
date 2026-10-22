@@ -57,7 +57,7 @@ struct LaunchOptionsEditor: View {
             if let words = LaunchOptions.words(arguments) {
                 note(words.isEmpty
                      ? "Options go after the program's name, as in a Windows shortcut. Put an option with spaces in quotes."
-                     : "The game starts with \(words.count == 1 ? "1 option" : "\(words.count) options"): \(words.joined(separator: "  ")).",
+                     : "The \(model.noun(game)) starts with \(words.count == 1 ? "1 option" : "\(words.count) options"): \(words.joined(separator: "  ")).",
                      warn: false)
             } else {
                 note("A quote is not closed. Close it, or the game does not start.", warn: true)
@@ -109,7 +109,7 @@ struct LaunchOptionsEditor: View {
                 .modifier(FieldLook())
                 .onSubmit(save)
             if rejected.isEmpty {
-                note("Tick the DLL that your mod loader puts next to the game. Wine then loads that file first, and its own copy only when the game folder has none.", warn: false)
+                note("Tick the DLL that your mod loader puts next to the \(model.noun(game)). Wine then loads that file first, and its own copy only when the \(model.noun(game))'s folder has none.", warn: false)
             } else {
                 note("These are not DLL names, so Unwine does not use them: \(rejected.joined(separator: ", ")).", warn: true)
             }
@@ -130,7 +130,7 @@ struct LaunchOptionsEditor: View {
 
     private var languagePicker: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Picker("Game language", selection: Binding(get: { saved.language },
+            Picker(model.isApp(game) ? "App language" : "Game language", selection: Binding(get: { saved.language },
                                                        set: { v in model.setLaunchOptions(game.id) { $0.language = v } })) {
                 ForEach(GameLanguage.allCases) { Text($0.title).tag($0) }
             }
@@ -152,13 +152,13 @@ struct LaunchOptionsEditor: View {
         if dirty {
             HStack(spacing: 8) {
                 Button("Save", action: save).buttonStyle(PrimaryButtonStyle())
-                    .help("Saves what you typed. It applies the next time the game starts.")
+                    .help("Saves what you typed. It applies the next time the \(model.noun(game)) starts.")
                 Button("Undo changes", action: load).buttonStyle(QuietButtonStyle())
                     .help("Goes back to what is saved")
                 Text("Not saved yet.").font(.system(size: 11)).foregroundStyle(Palette.warn)
             }
         } else {
-            note("These apply the next time the game starts. Reset settings does not change them.", warn: false)
+            note("These apply the next time the \(model.noun(game)) starts. Reset settings does not change them.", warn: false)
         }
     }
 

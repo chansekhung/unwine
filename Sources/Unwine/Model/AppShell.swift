@@ -111,6 +111,8 @@ extension AppModel {
     func add(_ urls: [URL]) {
         var folders: [URL] = []
         for url in urls {
+            // A Windows app's own Mac app (MacApps) asks for its app, with any files to open in it.
+            if url.scheme == "unwine" { openFromMacApp(url); continue }
             guard url.isFileURL else {
                 show("Unwine adds games from files on this Mac. Drop a game's folder or its .exe.", .problem)
                 continue

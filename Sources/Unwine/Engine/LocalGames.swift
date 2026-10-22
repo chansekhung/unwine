@@ -25,6 +25,20 @@ struct LocalGameRecord: Codable, Equatable, Sendable {
     var productRead: String? = nil
     /// A picture the user chose for the game: a file name in Unwine's Covers folder.
     var cover: String? = nil
+    /// Game or app, as the user set it. Nil: Unwine's guess from the program's files (GameAnalysis).
+    var kind: ProgramKind? = nil
+    /// File name extensions ("fem", "dxf") the program's Mac app opens from Finder, beyond the ones the
+    /// program registered in its bottle. Without a dot, lower case.
+    var fileTypes: [String] = []
+    /// The extensions the program registered in its bottle (its installer usually does), from the last
+    /// read of the bottle's registry. Nil: not read yet. Kept here, so each Unwine start builds the
+    /// Mac app with the same types without reading the registry again.
+    var registeredFileTypes: [String]? = nil
+    /// Registered extensions the user took away: the Mac app does not open these.
+    var excludedFileTypes: [String] = []
+    /// The program's own Mac app in ~/Applications/Unwine Apps, for Launchpad and the Dock. Nil: on for
+    /// apps, off for games.
+    var macApp: Bool? = nil
 
     var folder: URL { URL(fileURLWithPath: exePath).deletingLastPathComponent().standardizedFileURL }
     /// Where the game's own files start: the folder the user picked, else the program's folder.
@@ -48,7 +62,18 @@ extension LocalGameRecord {
         steamAppID = try? c.decodeIfPresent(Int.self, forKey: .steamAppID)
         productRead = try? c.decodeIfPresent(String.self, forKey: .productRead)
         cover = try? c.decodeIfPresent(String.self, forKey: .cover)
+        kind = try? c.decodeIfPresent(ProgramKind.self, forKey: .kind)
+        fileTypes = (try? c.decodeIfPresent([String].self, forKey: .fileTypes)) ?? []
+        registeredFileTypes = try? c.decodeIfPresent([String].self, forKey: .registeredFileTypes)
+        excludedFileTypes = (try? c.decodeIfPresent([String].self, forKey: .excludedFileTypes)) ?? []
+        macApp = try? c.decodeIfPresent(Bool.self, forKey: .macApp)
     }
+}
+
+/// What an added program is for. A game gets the game page (graphics, speed, Apple extras); an app gets
+/// the app page (runtimes, sharp text, Mac keys, file types, Launchpad).
+enum ProgramKind: String, Codable, Sendable {
+    case game, app
 }
 
 enum LocalGamesError: LocalizedError {
@@ -60,7 +85,7 @@ enum LocalGamesError: LocalizedError {
         // Adding it again would make a second entry with a new, empty bottle. The failed-start banner
         // and the game's page both have Locate….
         case .missing(let path): return "Its program is not in \(path) now. Press Locate… and pick it where it is now. Its bottle and saves stay."
-        case .bottle(let why): return "Unwine could not make the game's Windows bottle: \(why)"
+        case .bottle(let why): return "Unwine could not make its Windows bottle. \(why) Try again. If it fails again, the log says why."
         }
     }
 }
@@ -284,7 +309,7 @@ enum LocalGames {
     /// Returns when the game process has started; with `watchInstalls`, it returns the programs that
     /// were in the bottle just before (to find what an installer adds).
     @discardableResult
-    static func start(_ game: SteamGame, engine: InstalledEngine, profile: URL, arguments: [String] = [], log: LogFile,
+    static func start(_ game: SteamGame, engine: InstalledEngine, profile: URL, arguments: [String] = [], isApp: Bool = false, log: LogFile,
                       template: (@MainActor () async -> URL?)? = nil, watchInstalls: Bool = false,
                       phase: @escaping @MainActor (String) -> Void,
                       onExit: @escaping @Sendable (Int32) -> Void) async throws -> Set<String>? {
@@ -292,38 +317,9 @@ enum LocalGames {
             throw LocalGamesError.missing(game.localExe?.deletingLastPathComponent().path ?? game.name)
         }
         let pfx = prefix(game)
-        try Paths.ensure(game.compatData)
-
-        // A folder that is there without a registry may hold files: wineboot finishes it in place.
-        if !FileManager.default.fileExists(atPath: pfx.path), let template {
-            await phase(BottleTemplate.ready(engine) == nil ? "Setting up Windows once for your added games…" : "Making a Windows bottle for this game…")
-            if let source = await template() {
-                await phase("Making a Windows bottle for this game…")
-                do { try await BottleTemplate.clone(source, to: pfx, log: log) }
-                catch { log.line("Could not copy the bottle template, so Wine makes the bottle: \(error.localizedDescription)") }
-            }
-        }
-        if !FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) {
-            await phase("Making a Windows bottle for this game…")
-            log.line("Making the bottle for \(game.name)")
-            let boot = withoutX87(environment(engine: engine, prefix: pfx, profile: profile))
-            do {
-                try await Shell.run(engine.wine, ["wineboot", "--init"], env: boot, log: log)
-                try await Shell.run(engine.wineserver, ["-w"], env: boot, log: log, check: false)
-            } catch {
-                // A half-made bottle would be used as it is next time: it goes to the Trash.
-                _ = try? await Shell.run(engine.wineserver, ["-k"], env: boot, log: log, check: false)
-                try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
-                // The failed-start banner's Show logs opens this game's log.
-                throw LocalGamesError.bottle("Wine stopped while it set up the bottle. Press Play to try again. If it fails again, press Show logs: the game's log says why.")
-            }
-            guard FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) else {
-                try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
-                throw LocalGamesError.bottle("Wine made no bottle. Press Play to try again. If it fails again, press Show logs: the game's log says why.")
-            }
-            BottleFonts.ensure(prefix: pfx)
-        }
-
+        try await ensureBottle(game, engine: engine, profile: profile, log: log, isApp: isApp, template: template, phase: phase)
+        // Bottles made before Unwine 1.0.6 get the crash box turned off too. A cheap read when done.
+        if !isRunning(game) { BottleFonts.ensure(prefix: pfx, quietCrashes: true) }
         // Read the profile now: the user may have changed settings while the bottle was made.
         var env = environment(engine: engine, prefix: pfx, profile: profile)
         // The game's Display choices (and, for D3DMetal, Apple's DLSS files) go into the closed bottle
@@ -342,14 +338,27 @@ enum LocalGames {
         let bundle = game.compatData.appendingPathComponent(game.bottleID == nil ? "Game.app" : "Game-\(game.id).app", isDirectory: true)
         let loader: URL
         if isRunning(game) {
-            loader = GameModeBundle.matches(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name)
+            loader = GameModeBundle.matches(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name, isGame: !isApp)
                 ? GameModeBundle.loader(bundle) : engine.wine
         } else {
-            loader = GameModeBundle.ensure(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name,
+            loader = GameModeBundle.ensure(engine: engine, bundle: bundle, bundleID: bundleID(game), name: game.name, isGame: !isApp,
                                            icon: ArtCache.iconFile(game.id), log: log) ?? engine.wine
         }
-        env["WINELOADER"] = loader.path
+        // A closed bottle starts its Windows session first (wineboot --init), and wineboot looks up the
+        // Mac's own name (Name.local). macOS lets an app bundle do that only with Local Network access,
+        // so from the bundle the lookup waits 35 s and fails. Wine's own loader is not an app bundle and
+        // gets the answer at once: the session starts there, and the game joins it a moment later.
+        // The installer's look at the bottle comes first: the session's server waits only about 3 s for
+        // the game once the session is up.
         let before = watchInstalls ? installedPrograms(in: pfx) : nil
+        if loader != engine.wine, !isRunning(game) {
+            var session = withoutX87(env)
+            session["WINELOADER"] = engine.wine.path
+            let started = Date()
+            await startSession(engine: engine, env: session, cwd: pfx, log: log)
+            log.line(String(format: "Started the bottle's Windows session in %.1f s", Date().timeIntervalSince(started)))
+        }
+        env["WINELOADER"] = loader.path
         log.line("Starting \(exe.path) from \(loader == engine.wine ? "the engine" : "its Game Mode app")"
                  + (arguments.isEmpty ? "" : " with \(arguments.count) launch option\(arguments.count == 1 ? "" : "s")"))
         // Faster x87 math: Wine starts x87sidecar for each process the game starts (ROSETTA_X87_PATH),
@@ -362,6 +371,57 @@ enum LocalGames {
         }
         _ = try Shell.spawn(program, args, env: env, cwd: exe.deletingLastPathComponent(), log: log, onExit: onExit)
         return before
+    }
+
+    /// Starts the bottle's Windows session with a program that ends at once, and returns when it ends.
+    /// The session's services inherit its output and write to the game's log while they run (Detailed
+    /// logs shows their errors). Only the end of cmd is waited for, never the end of the output.
+    /// The session's server stays a few seconds for the game.
+    private static func startSession(engine: InstalledEngine, env: [String: String], cwd: URL, log: LogFile) async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            do { _ = try Shell.spawn(engine.wine, ["cmd", "/c", "exit"], env: env, cwd: cwd, log: log, onExit: { _ in done.resume() }) }
+            catch { done.resume() }
+        }
+    }
+
+    /// Makes the game's bottle when it has none: a clone of the engine's template from `template`
+    /// (which builds it once if needed), else with wineboot (about 25 s under Rosetta). `phase` names
+    /// each step for the waiting screen. Does nothing for a bottle that is there.
+    static func ensureBottle(_ game: SteamGame, engine: InstalledEngine, profile: URL, log: LogFile, isApp: Bool = false,
+                             template: (@MainActor () async -> URL?)?, phase: @escaping @MainActor (String) -> Void) async throws {
+        let pfx = prefix(game)
+        let making = "Making a Windows bottle for this \(isApp ? "app" : "game")…"
+        try Paths.ensure(game.compatData)
+
+        // A folder that is there without a registry may hold files: wineboot finishes it in place.
+        if !FileManager.default.fileExists(atPath: pfx.path), let template {
+            await phase(BottleTemplate.ready(engine) == nil ? "Setting up Windows once for your added games and apps…" : making)
+            if let source = await template() {
+                await phase(making)
+                do { try await BottleTemplate.clone(source, to: pfx, log: log) }
+                catch { log.line("Could not copy the bottle template, so Wine makes the bottle: \(error.localizedDescription)") }
+            }
+        }
+        if !FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) {
+            await phase(making)
+            log.line("Making the bottle for \(game.name)")
+            let boot = withoutX87(environment(engine: engine, prefix: pfx, profile: profile))
+            do {
+                try await Shell.run(engine.wine, ["wineboot", "--init"], env: boot, log: log)
+                try await Shell.run(engine.wineserver, ["-w"], env: boot, log: log, check: false)
+            } catch {
+                // A half-made bottle would be used as it is next time: it goes to the Trash.
+                _ = try? await Shell.run(engine.wineserver, ["-k"], env: boot, log: log, check: false)
+                try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
+                // The failed-start banner's Show logs opens this game's log.
+                throw LocalGamesError.bottle("Wine stopped while it set up the bottle.")
+            }
+            guard FileManager.default.fileExists(atPath: pfx.appendingPathComponent("system.reg").path) else {
+                try? FileManager.default.trashItem(at: pfx, resultingItemURL: nil)
+                throw LocalGamesError.bottle("Wine made no bottle.")
+            }
+            BottleFonts.ensure(prefix: pfx, quietCrashes: true)
+        }
     }
 
     /// Ends everything running in the game's bottle.
@@ -386,9 +446,12 @@ enum GameModeBundle {
     /// bundle is built. An icon that turns up later waits for the next build.
     private static let iconName = "game.icns"
 
-    static func info(bundleID: String, name: String, icon: Bool) -> Data {
+    /// An app's bundle says "productivity" and asks for no Game Mode: macOS gives Game Mode only to games.
+    static func info(bundleID: String, name: String, icon: Bool, isGame: Bool = true) -> Data {
         let safe = name.replacingOccurrences(of: "&", with: "&amp;").replacingOccurrences(of: "<", with: "&lt;")
         let iconKey = icon ? "\t<key>CFBundleIconFile</key>\n\t<string>\(iconName)</string>\n" : ""
+        let gameMode = isGame ? "true" : "false"
+        let category = isGame ? "public.app-category.games" : "public.app-category.productivity"
         return Data("""
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -405,11 +468,11 @@ enum GameModeBundle {
             \t<key>CFBundlePackageType</key>
             \t<string>APPL</string>
             \t<key>GCSupportsGameMode</key>
-            \t<true/>
+            \t<\(gameMode)/>
             \t<key>LSApplicationCategoryType</key>
-            \t<string>public.app-category.games</string>
+            \t<string>\(category)</string>
             \t<key>LSSupportsGameMode</key>
-            \t<true/>
+            \t<\(gameMode)/>
             \t<key>LSUIElement</key>
             \t<true/>
             \t<key>NSHighResolutionCapable</key>
@@ -432,7 +495,7 @@ enum GameModeBundle {
     }
 
     /// True when the bundle holds clones of this engine's files, its links and its Info.plist.
-    static func matches(engine: InstalledEngine, bundle: URL, bundleID: String, name: String) -> Bool {
+    static func matches(engine: InstalledEngine, bundle: URL, bundleID: String, name: String, isGame: Bool = true) -> Bool {
         let fm = FileManager.default
         let source = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
         let macOS = bundle.appendingPathComponent("Contents/MacOS", isDirectory: true)
@@ -440,7 +503,7 @@ enum GameModeBundle {
         let plist = try? Data(contentsOf: bundle.appendingPathComponent("Contents/Info.plist"))
         guard let want = try? fm.contentsOfDirectory(atPath: source.path), want.contains("wine"),
               let have = try? fm.contentsOfDirectory(atPath: macOS.path),
-              plist == info(bundleID: bundleID, name: name, icon: false) || plist == info(bundleID: bundleID, name: name, icon: true)
+              plist == info(bundleID: bundleID, name: name, icon: false, isGame: isGame) || plist == info(bundleID: bundleID, name: name, icon: true, isGame: isGame)
         else { return false }
         let all = links(engine)
         guard Set(have) == Set(want).union(all.compactMap { $0.path.hasPrefix("Contents/MacOS/") ? String($0.path.dropFirst(15)) : nil })
@@ -460,8 +523,8 @@ enum GameModeBundle {
     /// The bundle's loader, building the bundle first when it is missing or out of date. Nil when
     /// it cannot be built; the caller then starts Wine from the engine (no Game Mode).
     /// `icon` is the PNG of the game program's icon; the bundle gets it as an .icns when it is built.
-    static func ensure(engine: InstalledEngine, bundle: URL, bundleID: String, name: String, icon: URL? = nil, log: LogFile) -> URL? {
-        if matches(engine: engine, bundle: bundle, bundleID: bundleID, name: name) { return loader(bundle) }
+    static func ensure(engine: InstalledEngine, bundle: URL, bundleID: String, name: String, isGame: Bool = true, icon: URL? = nil, log: LogFile) -> URL? {
+        if matches(engine: engine, bundle: bundle, bundleID: bundleID, name: name, isGame: isGame) { return loader(bundle) }
         let fm = FileManager.default
         let source = engine.wineDir.appendingPathComponent("lib/wine/x86_64-unix", isDirectory: true)
         let stage = bundle.deletingLastPathComponent().appendingPathComponent(".bundle-\(UUID().uuidString)", isDirectory: true)
@@ -476,7 +539,7 @@ enum GameModeBundle {
                 hasIcon = ExeIcon.writeICNS(from: icon, to: resources.appendingPathComponent(iconName))
                 if !hasIcon { log.line("Could not make the Dock icon for \(name), so its app has none") }
             }
-            try info(bundleID: bundleID, name: name, icon: hasIcon).write(to: stage.appendingPathComponent("Contents/Info.plist"))
+            try info(bundleID: bundleID, name: name, icon: hasIcon, isGame: isGame).write(to: stage.appendingPathComponent("Contents/Info.plist"))
             for file in try fm.contentsOfDirectory(atPath: source.path) {
                 let from = source.appendingPathComponent(file), to = macOS.appendingPathComponent(file)
                 if clonefile(from.path, to.path, 0) != 0 { try fm.copyItem(at: from, to: to) }

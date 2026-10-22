@@ -71,6 +71,14 @@ cat > "$APP/Contents/Info.plist" <<PLIST
       <key>LSItemContentTypes</key><array><string>com.microsoft.windows-executable</string></array>
     </dict>
   </array>
+  <!-- A Windows app's own Mac app (in ~/Applications/Unwine Apps) hands Unwine "unwine://open?program=<id>&file=<path>". -->
+  <key>CFBundleURLTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleURLName</key><string>app.unwine.open</string>
+      <key>CFBundleURLSchemes</key><array><string>unwine</string></array>
+    </dict>
+  </array>
   <key>UnwineUpdateRepo</key><string>${UNWINE_UPDATE_REPO:-chansekhung/unwine}</string>
 </dict>
 </plist>

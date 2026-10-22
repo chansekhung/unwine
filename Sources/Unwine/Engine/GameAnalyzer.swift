@@ -35,6 +35,9 @@ struct GameAnalysis: Codable, Sendable, Equatable {
     var fingerprint: String? = nil
     /// How much of a 32-bit game's math is x87, read from its code. Nil for 64-bit games.
     var mathMix: MathMix? = nil
+    /// The program looks like an app (a tool with file dialogs, a .NET or MFC window app), not a game.
+    /// Nil on analyses made before Unwine 1.0.6. The user's own choice (LocalGameRecord.kind) wins.
+    var looksLikeApp: Bool? = nil
 
     /// False when a newer Unwine detects more than the one that made this, so it is worth redoing.
     var isCurrent: Bool { analyzerVersion == GameAnalyzer.version }
@@ -54,6 +57,7 @@ extension GameAnalysis {
         hasDLSS = (try? c.decodeIfPresent(Bool.self, forKey: .hasDLSS)) ?? false
         fingerprint = try? c.decodeIfPresent(String.self, forKey: .fingerprint)
         mathMix = try? c.decodeIfPresent(MathMix.self, forKey: .mathMix)
+        looksLikeApp = try? c.decodeIfPresent(Bool.self, forKey: .looksLikeApp)
     }
 }
 
@@ -92,7 +96,12 @@ private extension Character {
 enum GameAnalyzer {
     /// Bump when detection changes, so games analysed by an older Unwine are looked at again.
     /// 4: DLSS, and the fingerprint that replaced the 7-day timer. 5: the x87 share of 32-bit games.
-    static let version = 5
+    /// 6: game or app.
+    static let version = 6
+
+    /// Files that only games carry: store SDKs (Steam, GOG Galaxy, Epic Online Services).
+    private static let storeFiles: Set<String> = ["steam_api.dll", "steam_api64.dll", "steam_appid.txt", "galaxy.dll",
+                                                  "galaxy64.dll", "eossdk-win64-shipping.dll", "eossdk-win32-shipping.dll"]
 
     /// What changes when the game changes: Steam's build id (the appmanifest's "buildid") for a Steam
     /// game, the program's size and date for one added by its .exe. Nil when neither can be read.
@@ -219,6 +228,7 @@ enum GameAnalyzer {
         var hasGameInfo = false
         var hasShaderAPIDX9 = false
         var hasDLSS = false
+        var hasStoreSDK = false
         var pluginFolders: [String] = []    // paths of the "Plugins" folders seen, each ending in "/"
 
         let keys: [URLResourceKey] = [.fileSizeKey, .isDirectoryKey]
@@ -237,6 +247,7 @@ enum GameAnalyzer {
                 }
                 let ext = url.pathExtension.lowercased()
                 for marker in antiCheatMarkers where marker.matches(lower, extension: ext) { antiCheat.insert(marker.name) }
+                if level <= 4, storeFiles.contains(lower) { hasStoreSDK = true }
                 if ext == "exe" {
                     if skipExeWords.contains(where: { lower.contains($0) }) { continue }
                     if isInRedist(folders(above: url, level: level)) { continue }   // e.g. a .NET installer
@@ -330,8 +341,20 @@ enum GameAnalyzer {
             mathMix = X87Scan.scan([exe] + dlls)
         }
 
+        // Game or app, for a program the user added. Games carry a game engine, an anti-cheat, a store's
+        // SDK or game input and sound; apps open files with Windows' file dialogs, or are .NET, MFC or Qt
+        // window apps. A program with neither and no graphics API (a plain tool) is an app.
+        var looksLikeApp: Bool?
+        if let mainExe {
+            let mainImports = PEInspector.inspect(mainExe)?.imports ?? []
+            let gameInput = mainImports.contains { $0.hasPrefix("xinput") || $0.hasPrefix("dinput") || $0 == "dsound.dll" || $0 == "ddraw.dll" }
+            let windowApp = mainImports.contains { $0 == "comdlg32.dll" || $0.hasPrefix("mfc") || $0.hasPrefix("qt5widgets") || $0.hasPrefix("qt6widgets") }
+                || PEInspector.isDotNet(mainExe)
+            looksLikeApp = engine == nil && antiCheat.isEmpty && !hasStoreSDK && !gameInput && (windowApp || api == .unknown)
+        }
+
         let main = candidates.first.map { String($0.url.path.dropFirst(installDir.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/")) }
         return GameAnalysis(api: api, is64Bit: is64, mainExe: main, antiCheat: antiCheat.sorted(), engine: engine,
-                            analyzedAt: Date(), analyzerVersion: version, hasDLSS: hasDLSS, mathMix: mathMix)
+                            analyzedAt: Date(), analyzerVersion: version, hasDLSS: hasDLSS, mathMix: mathMix, looksLikeApp: looksLikeApp)
     }
 }

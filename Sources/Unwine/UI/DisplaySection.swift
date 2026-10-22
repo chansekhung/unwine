@@ -238,7 +238,7 @@ struct DetailedLogsControl: View {
                                                   set: { v in model.update(id) { $0.detailedLogs = v } }))
             settingNote((on
                 ? "On: the next start writes Wine's errors, and the notes of DXVK and DXMT, into the logs. Turn this off when you are done: the logs grow fast."
-                : "Off: the logs keep only the warnings and errors of DXVK and DXMT, and nothing from Wine. When a game fails, turn this on, press Play, then open Show logs.")
+                : "Off: the logs keep only the warnings and errors of DXVK and DXMT, and nothing from Wine. When a \(model.noun(game)) fails, turn this on, press \(model.startWord(game)), then open Show logs.")
                 // The runner's wrappers put back the levels that Steam's launch options set (Runner.restoreAskedLogs).
                 + (game.localExe == nil ? " A log level in Steam's launch options (WINEDEBUG, DXVK_LOG_LEVEL or DXMT_LOG_LEVEL) always wins." : "")
                 + (source.map { " This program shares the choice with \($0.name)." } ?? ""))

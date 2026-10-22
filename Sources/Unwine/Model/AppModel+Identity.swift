@@ -76,6 +76,8 @@ extension AppModel {
                 self.save()
                 // Highball may know the game now, and "Automatic" follows its advice.
                 self.writeProfile(for: id)
+                // The app's Mac app in Launchpad shows the icon too.
+                self.refreshMacApp(for: id)
             }
         }
     }

@@ -41,6 +41,21 @@ enum LibraryFilter: String, CaseIterable, Identifiable {
         case .attention: return "Shows the games with something to fix or to know first. Their pages say what."
         }
     }
+
+    /// The filters each half of the library offers. Apps all come from outside Steam, so Steam and
+    /// Added say nothing about them.
+    static func choices(for kind: LibraryKind) -> [LibraryFilter] {
+        kind == .apps ? [.all, .running, .attention] : allCases
+    }
+
+    func help(for kind: LibraryKind) -> String {
+        guard kind == .apps else { return help }
+        switch self {
+        case .running: return "Shows the apps that run now"
+        case .attention: return "Shows the apps with something to fix first, such as a runtime they need. Their pages say what."
+        default: return "Shows every app"
+        }
+    }
 }
 
 /// The library as the grid shows it: favourites on top, then the other games. Hidden games show
@@ -66,6 +81,17 @@ extension AppModel {
         set { stored.libraryFilter = newValue == .all ? nil : newValue.rawValue; save() }
     }
 
+    /// Games or Apps. With no app in the library, always Games: the switch shows only once there is one.
+    var libraryKind: LibraryKind {
+        get {
+            guard hasApps else { return .games }
+            // A library of apps only (no Steam, no added game) opens on Apps.
+            if let saved = stored.libraryKind.flatMap(LibraryKind.init(rawValue:)) { return saved }
+            return windowsGames.contains { kind(ofID: $0.id) == .game } ? .games : .apps
+        }
+        set { stored.libraryKind = newValue.rawValue; save() }
+    }
+
     func isFavourite(_ id: Int) -> Bool { stored.favourites.contains(id) }
     func isHidden(_ id: Int) -> Bool { stored.hiddenGames.contains(id) }
 
@@ -78,7 +104,7 @@ extension AppModel {
         if on { stored.hiddenGames.insert(game.id) } else { stored.hiddenGames.remove(game.id) }
         save()
         if on {
-            show("\(game.name) is hidden. \u{201C}Hidden games\u{201D} under the library shows it again.",
+            show("\(game.name) is hidden. \u{201C}Hidden \(noun(game))s\u{201D} under the library shows it again.",
                  action: .init("Undo") { [weak self] in self?.setHidden(false, game) })
         }
     }
@@ -86,11 +112,13 @@ extension AppModel {
     /// The games the grid shows for this search, with the saved filter and order.
     func shelves(search: String) -> LibraryShelves {
         let words = search.split(whereSeparator: \.isWhitespace).map(String.init)
-        let found = windowsGames.filter { g in words.allSatisfy { g.name.localizedStandardContains($0) } }
+        // Games and apps each have their own half of the library.
+        let want: ProgramKind = libraryKind == .apps ? .app : .game
+        let found = windowsGames.filter { g in kind(ofID: g.id) == want && words.allSatisfy { g.name.localizedStandardContains($0) } }
         var shelves = LibraryShelves()
         let shown = found.filter { !stored.hiddenGames.contains($0.id) }
         for f in LibraryFilter.allCases { shelves.counts[f] = f == .all ? shown.count : shown.filter { passes($0, f) }.count }
-        let filter = libraryFilter
+        let filter = LibraryFilter.choices(for: libraryKind).contains(libraryFilter) ? libraryFilter : .all
         for g in ordered(found.filter { passes($0, filter) }) {
             if stored.hiddenGames.contains(g.id) {
                 shelves.hidden.append(g)

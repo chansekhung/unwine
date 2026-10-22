@@ -159,9 +159,11 @@ enum Shell {
         process.standardOutput = pipe
         process.standardError = pipe
         process.standardInput = FileHandle.nullDevice
-        pipe.fileHandleForReading.readabilityHandler = { h in
+        // The handler holds the pipe: programs the process started (a Wine session's services) keep
+        // writing after it ends, and their lines reach the log until the last of them closes the pipe.
+        pipe.fileHandleForReading.readabilityHandler = { [pipe] h in
             let data = h.availableData
-            if data.isEmpty { h.readabilityHandler = nil; return }
+            if data.isEmpty { h.readabilityHandler = nil; _ = pipe; return }
             log.write(String(decoding: data, as: UTF8.self))
         }
         process.terminationHandler = { p in onExit?(p.terminationStatus) }

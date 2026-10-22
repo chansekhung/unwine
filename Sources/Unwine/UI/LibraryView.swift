@@ -45,7 +45,12 @@ struct LibraryView: View {
         }) { sheet in
             switch sheet {
             case .game(let id):
-                GameSheet(gameID: id).environment(model)
+                // Apps get the app page: runtimes, sharp text, Mac keys, file types and Launchpad.
+                if model.kind(ofID: id) == .app {
+                    AppSheet(gameID: id).environment(model)
+                } else {
+                    GameSheet(gameID: id).environment(model)
+                }
             case .settings:
                 SettingsView().environment(model)
             case .chooser(let folder, let programs):
@@ -94,9 +99,9 @@ struct LibraryView: View {
                 .buttonStyle(QuietButtonStyle())
                 .disabled(model.macSteamBlocked || model.steamMissing)
                 .help(model.steamMissing ? AppModel.steamMissingReason : model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens Mac Steam")
-            Button { model.pickingGame = true } label: { Label("Add game", systemImage: "plus") }
+            Button { model.pickingGame = true } label: { Label("Add", systemImage: "plus") }
                 .buttonStyle(QuietButtonStyle())
-                .help("Add a Windows game by its folder or its .exe (⌘O). You can also drop it on this window. It runs without Steam.")
+                .help("Add a Windows game or app by its folder or its .exe (⌘O). You can also drop it on this window. Unwine sorts games from apps by itself.")
             Button { model.openSettings() } label: { Image(systemName: "gearshape") }
                 .buttonStyle(QuietButtonStyle())
                 .help("Settings, updates and GPTK (⌘,)")
@@ -109,7 +114,7 @@ struct LibraryView: View {
     private var searchField: some View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass").foregroundStyle(Palette.muted)
-            TextField("Search games", text: $search)
+            TextField(model.libraryKind == .apps ? "Search apps" : "Search games", text: $search)
                 .textFieldStyle(.plain)
                 .focused($searchFocused)
                 // Return or the down arrow goes on to the first game, so the keyboard can open or play it.
@@ -129,7 +134,7 @@ struct LibraryView: View {
         .background(Capsule().fill(Color.white.opacity(0.07)))
         .overlay(Capsule().stroke(searchFocused ? Palette.accent : Palette.stroke))
         .frame(minWidth: 120, idealWidth: 220, maxWidth: 240)
-        .help("Find a game by its name (⌘F)")
+        .help(model.libraryKind == .apps ? "Find an app by its name (⌘F)" : "Find a game by its name (⌘F)")
     }
 
     private func focusFirstTile() {
@@ -248,11 +253,14 @@ struct LibraryView: View {
 
     private func filterBar(_ shelves: LibraryShelves) -> some View {
         HStack(spacing: 8) {
-            ForEach(LibraryFilter.allCases) { filter in
-                FilterChip(title: filter.title, count: shelves.counts[filter] ?? 0, selected: model.libraryFilter == filter) {
+            if model.hasApps { kindSwitch }
+            let kind = model.libraryKind
+            let shown = LibraryFilter.choices(for: kind).contains(model.libraryFilter) ? model.libraryFilter : .all
+            ForEach(LibraryFilter.choices(for: kind)) { filter in
+                FilterChip(title: filter.title, count: shelves.counts[filter] ?? 0, selected: shown == filter) {
                     model.libraryFilter = filter
                 }
-                .help(filter.help)
+                .help(filter.help(for: kind))
             }
             Spacer(minLength: 8)
             sortMenu
@@ -268,7 +276,8 @@ struct LibraryView: View {
             .pickerStyle(.inline)
             .labelsHidden()
         } label: {
-            Label("Sort: \(model.librarySort.title)", systemImage: "arrow.up.arrow.down")
+            Label("Sort: \(model.libraryKind == .apps && model.librarySort == .recent ? "Recently used" : model.librarySort.title)",
+                  systemImage: "arrow.up.arrow.down")
                 .font(.system(size: 12, weight: .medium))
         }
         .menuStyle(.borderlessButton)
@@ -277,13 +286,25 @@ struct LibraryView: View {
         .help("How the library orders your games")
     }
 
+    /// Games | Apps. It shows once the library has an app; each half keeps its own search and filters.
+    private var kindSwitch: some View {
+        Picker("Show", selection: Binding(get: { model.libraryKind }, set: { model.libraryKind = $0; search = "" })) {
+            ForEach(LibraryKind.allCases) { Text($0.title).tag($0) }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+        .fixedSize()
+        .help("Games and apps each have their own half of the library. Right-click a tile to move it to the other half.")
+        .padding(.trailing, 6)
+    }
+
     private func grid(_ shelves: LibraryShelves) -> some View {
         let rows = [shelves.favourites, shelves.games] + (showHidden ? [shelves.hidden] : [])
         return ScrollViewReader { proxy in
             ScrollView {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 22) {
                     shelf("Favourites", shelves.favourites, rows: rows)
-                    shelf(shelves.favourites.isEmpty ? nil : "Games", shelves.games, rows: rows)
+                    shelf(shelves.favourites.isEmpty ? nil : model.libraryKind.title, shelves.games, rows: rows)
                     if showHidden { shelf("Hidden", shelves.hidden, rows: rows, dimmed: true) }
                 }
                 .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { gridWidth = $0 }
@@ -337,11 +358,13 @@ struct LibraryView: View {
     @ViewBuilder private func hiddenFooter(_ count: Int) -> some View {
         if count > 0 {
             Button { showHidden.toggle() } label: {
-                Label(showHidden ? "Hidden games (\(count)) · Hide again" : "Hidden games (\(count)) · Show",
+                Label(showHidden ? "Hidden \(model.libraryKind == .apps ? "apps" : "games") (\(count)) · Hide again"
+                                 : "Hidden \(model.libraryKind == .apps ? "apps" : "games") (\(count)) · Show",
                       systemImage: showHidden ? "eye.slash" : "eye")
             }
             .buttonStyle(QuietButtonStyle())
-            .help(showHidden ? "Puts the hidden games away again" : "Shows the games you hid. Right-click one and choose Show in Library to bring it back.")
+            .help(showHidden ? "Puts the hidden \(model.libraryKind == .apps ? "apps" : "games") away again"
+                  : "Shows the \(model.libraryKind == .apps ? "apps" : "games") you hid. Right-click one and choose Show in Library to bring it back.")
             .frame(maxWidth: .infinity)
             .padding(.bottom, 24)
         }
@@ -383,22 +406,29 @@ struct LibraryView: View {
 
     /// The search or the filter left no game. Each way out is one click.
     private func noMatch(_ shelves: LibraryShelves) -> some View {
-        let filter = model.libraryFilter
+        let filter = LibraryFilter.choices(for: model.libraryKind).contains(model.libraryFilter) ? model.libraryFilter : .all
         let hidden = shelves.hidden.count
+        let apps = model.libraryKind == .apps
+        let noun = apps ? "app" : "game"
         let title: String, detail: String
         if !search.isEmpty {
-            title = "No game matches \u{201C}\(search)\u{201D}"
+            title = "No \(noun) matches \u{201C}\(search)\u{201D}"
             detail = filter != .all ? "Unwine looked only in \u{201C}\(filter.title)\u{201D}."
-                : hidden > 0 ? "Hidden games do not show in the results." : "Check the spelling, or type a part of the name."
+                : hidden > 0 ? "Hidden \(noun)s do not show in the results." : "Check the spelling, or type a part of the name."
         } else {
             switch filter {
-            case .running: title = "No game runs now"; detail = "Games show here while they run."
-            case .attention: title = "No game needs attention"; detail = "Every game is ready to play."
+            case .running: title = "No \(noun) runs now"; detail = apps ? "Apps show here while they run." : "Games show here while they run."
+            case .attention: title = "No \(noun) needs attention"; detail = apps ? "Every app is ready to open." : "Every game is ready to play."
             case .steam:
                 title = "No Steam games here"
                 detail = model.steamMissing ? AppModel.steamMissingReason : "Install a Windows game in Steam. It shows up here by itself."
             case .added: title = "No added games yet"; detail = "Add a Windows game by its folder or its .exe. It runs without Steam."
-            case .all: title = "All your games are hidden"; detail = "Hidden games stay in Unwine. Show them to bring one back."
+            case .all where hidden > 0: title = "All your \(noun)s are hidden"; detail = "Hidden \(noun)s stay in Unwine. Show them to bring one back."
+            case .all:
+                // This half is empty, the other one is not: the switch at the top goes there.
+                title = apps ? "No apps yet" : "No games yet"
+                detail = apps ? "Add a Windows app by its folder or its .exe. Unwine sorts it into Apps by itself."
+                              : "Install a Windows game in Steam, or add one by its folder or its .exe. Your apps are in Apps."
             }
         }
         return VStack(spacing: 14) {
@@ -412,11 +442,17 @@ struct LibraryView: View {
                     Button("Clear search") { search = ""; searchFocused = true }.buttonStyle(PrimaryButtonStyle())
                 }
                 if filter != .all {
-                    Button("Show all games") { model.libraryFilter = .all }
+                    Button("Show all \(noun)s") { model.libraryFilter = .all }
                         .buttonStyle(search.isEmpty ? AnyButtonStyle(PrimaryButtonStyle()) : AnyButtonStyle(QuietButtonStyle()))
                 }
                 if filter == .added && search.isEmpty {
                     Button("Add a game folder or .exe") { model.pickingGame = true }.buttonStyle(QuietButtonStyle())
+                }
+                if filter == .all && search.isEmpty && hidden == 0 {
+                    Button(apps ? "Show my games" : "Show my apps") { model.libraryKind = apps ? .games : .apps }
+                        .buttonStyle(PrimaryButtonStyle())
+                    Button(apps ? "Add an app" : "Add a game") { model.pickingGame = true }.buttonStyle(QuietButtonStyle())
+                        .help("Pick a Windows program's folder or .exe")
                 }
                 if filter == .steam && search.isEmpty && model.steamMissing {
                     Button("Get Steam") { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/about/")!) }
@@ -424,7 +460,7 @@ struct LibraryView: View {
                         .help("Opens Valve's page, where you download Steam for Mac")
                 }
                 if hidden > 0 {
-                    Button("Show hidden games (\(hidden))") { showHidden = true }
+                    Button("Show hidden \(noun)s (\(hidden))") { showHidden = true }
                         .buttonStyle(search.isEmpty && filter == .all ? AnyButtonStyle(PrimaryButtonStyle()) : AnyButtonStyle(QuietButtonStyle()))
                 }
             }
@@ -437,15 +473,15 @@ struct LibraryView: View {
         VStack(spacing: 16) {
             Spacer()
             UnwineMark(progress: 0.1, size: 80)
-            Text("No Windows games yet").font(.system(size: 20, weight: .semibold)).foregroundStyle(Palette.text)
+            Text("No Windows games or apps yet").font(.system(size: 20, weight: .semibold)).foregroundStyle(Palette.text)
             Text(model.steamMissing
-                 ? "Add a Windows game by its folder or its .exe. It runs without Steam. To play Steam games, get Steam first."
-                 : "Install any Windows game in Steam, like on a Steam Deck. It shows up here by itself, ready to tune.")
+                 ? "Add a Windows game or app by its folder or its .exe. It runs without Steam. To play Steam games, get Steam first."
+                 : "Install any Windows game in Steam, like on a Steam Deck. It shows up here by itself, ready to tune. Add Windows apps by their folder or .exe.")
                 .font(.system(size: 13)).foregroundStyle(Palette.muted).multilineTextAlignment(.center).frame(maxWidth: 420)
             HStack {
                 if model.steamMissing {
-                    Button("Add a game folder or .exe") { model.pickingGame = true }.buttonStyle(PrimaryButtonStyle())
-                        .help("For Windows games from outside Steam. They run without Steam.")
+                    Button("Add a game or app") { model.pickingGame = true }.buttonStyle(PrimaryButtonStyle())
+                        .help("Pick a Windows game's or app's folder or .exe. It runs without Steam.")
                     Button("Get Steam") { NSWorkspace.shared.open(URL(string: "https://store.steampowered.com/about/")!) }
                         .buttonStyle(QuietButtonStyle())
                         .help("Opens Valve's page, where you download Steam for Mac")
@@ -454,11 +490,11 @@ struct LibraryView: View {
                         .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens the store in Mac Steam")
                     Button("Open Steam") { model.openMacSteam() }.buttonStyle(QuietButtonStyle())
                         .disabled(model.macSteamBlocked).help(model.macSteamBlocked ? AppModel.macSteamBlockedReason : "Opens Mac Steam")
-                    Button("Add a game folder or .exe") { model.pickingGame = true }.buttonStyle(QuietButtonStyle())
-                        .help("For Windows games from outside Steam. They run without Steam.")
+                    Button("Add a game or app") { model.pickingGame = true }.buttonStyle(QuietButtonStyle())
+                        .help("Pick a Windows game's or app's folder or .exe. It runs without Steam.")
                 }
             }
-            Text("You can also drop a game's folder or .exe on this window.")
+            Text("You can also drop a game's or app's folder or .exe on this window.")
                 .font(.system(size: 11)).foregroundStyle(Palette.muted)
             Spacer()
         }
@@ -491,7 +527,7 @@ struct GameTile: View {
     @State private var hovering = false
     @State private var confirmQuit = false
 
-    private var busy: Bool { model.localStarting[game.id] != nil || model.localRunning.contains(game.id) }
+    private var busy: Bool { model.runState(of: game) != .idle }
     private var focused: Bool { focus.wrappedValue == game.id }
     private var favourite: Bool { model.isFavourite(game.id) }
     private var hidden: Bool { model.isHidden(game.id) }
@@ -533,7 +569,9 @@ struct GameTile: View {
             .animation(.easeOut(duration: 0.15), value: hovering)
             Text(game.name).font(.system(size: 13, weight: .semibold)).foregroundStyle(Palette.text).lineLimit(1)
             Text(subtitle).font(.system(size: 11)).foregroundStyle(Palette.muted).lineLimit(1)
-            Text(game.playedShort).font(.system(size: 11)).foregroundStyle(Palette.muted.opacity(0.8)).lineLimit(1)
+            // An app is opened, not played: a new one says so.
+            Text(model.isApp(game) && game.playedShort == "Not played yet" ? "Not opened yet" : game.playedShort)
+                .font(.system(size: 11)).foregroundStyle(Palette.muted.opacity(0.8)).lineLimit(1)
         }
         .opacity(dimmed ? 0.55 : 1)
         .contentShape(Rectangle())
@@ -551,7 +589,11 @@ struct GameTile: View {
         } message: {
             Text(AppModel.quitGameWarning)
         }
-        .task(id: game.state) { await model.analyze(game) }
+        .task(id: game.state) {
+            await model.analyze(game)
+            // An app's tile says when it needs a runtime, so its first look is right after its files are read.
+            if model.isApp(game), model.runtimeChecks[game.id] == nil { await model.checkRuntimes(game) }
+        }
         .help("Opens the page of \(game.name). Right-click for more.")
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(game.name)
@@ -559,7 +601,7 @@ struct GameTile: View {
         .accessibilityHint("Opens the game's page")
         .accessibilityAddTraits(.isButton)
         .accessibilityAction { open() }
-        .accessibilityAction(named: "Play") { model.playIfReady(game) }
+        .accessibilityAction(named: model.startWord(game)) { model.playIfReady(game) }
         .accessibilityAction(named: favourite ? "Remove from Favourites" : "Add to Favourites") { model.setFavourite(!favourite, game) }
         .accessibilityAction(named: hidden ? "Show in Library" : "Hide") { model.setHidden(!hidden, game) }
     }
@@ -605,15 +647,20 @@ struct GameTile: View {
             // While a start or a quit goes on, the step says which ("Closing …" is a quit, as in RunState).
             let step = model.localStarting[game.id]
             let closing = step?.hasPrefix("Closing") == true
-            if model.localRunning.contains(game.id) {
-                // The page's Quit game: it ends everything in the game's bottle at once.
-                Button { Task { await model.stopLocal(game) } } label: {
-                    Label(step == nil ? "Quit game" : closing ? "Quit game (closing now)" : "Quit game (the game is starting)", systemImage: "stop.fill")
+            let noun = model.noun(game), start = model.startWord(game)
+            if model.runtimeJob(inBottleOf: game) != nil {
+                // Quit would end Microsoft's installer, so neither Quit nor a start is offered.
+                Button { } label: { Label("\(start) (a runtime is installing)", systemImage: "play.fill") }
+                    .disabled(true)
+            } else if model.localRunning.contains(game.id) {
+                // The page's Quit: an app is asked to quit (it can ask to save), a game's bottle ends at once.
+                Button { Task { if model.isApp(game) { await model.quitApp(game) } else { await model.stopLocal(game) } } } label: {
+                    Label(step == nil ? "Quit \(noun)" : closing ? "Quit \(noun) (closing now)" : "Quit \(noun) (the \(noun) is starting)", systemImage: "stop.fill")
                 }
                 .disabled(step != nil)
             } else {
                 Button { model.play(game) } label: {
-                    Label(step == nil ? "Play" : closing ? "Play (the game is closing)" : "Play (the game is starting)", systemImage: "play.fill")
+                    Label(step == nil ? start : closing ? "\(start) (the \(noun) is closing)" : "\(start) (the \(noun) is starting)", systemImage: "play.fill")
                 }
                 .disabled(step != nil)
             }
@@ -640,6 +687,11 @@ struct GameTile: View {
         }
         Divider()
         if game.localExe != nil {
+            // Unwine's guess can be wrong: one click moves the program to the other half of the library.
+            let app = model.isApp(game)
+            Button { model.setKind(app ? .game : .app, for: game) } label: {
+                Label(app ? "Move to Games" : "Move to Apps", systemImage: app ? "gamecontroller" : "app.badge")
+            }
             Button { rename() } label: { Label("Rename…", systemImage: "pencil") }
             // The cover items wait while Unwine copies a picked picture.
             let copying = ArtState.shared.preparing.contains(game.id)
@@ -654,7 +706,9 @@ struct GameTile: View {
                 .disabled(copying)
             }
             Button(role: .destructive) { remove() } label: {
-                Label(busy ? "Remove from Unwine… (quit the game first)" : "Remove from Unwine…", systemImage: "trash")
+                Label(!busy ? "Remove from Unwine…"
+                      : model.runtimeJob(inBottleOf: game) != nil ? "Remove from Unwine… (a runtime is installing)"
+                      : "Remove from Unwine… (quit the \(model.noun(game)) first)", systemImage: "trash")
             }
             .disabled(busy)
         } else {
@@ -664,6 +718,8 @@ struct GameTile: View {
     }
 
     private var subtitle: String {
+        // An app's layer means little to its user. A runtime it needs shows as the tile's badge.
+        if model.isApp(game) { return [game.localExe.flatMap(LocalGames.role(of:)), "Windows app"].compactMap { $0 }.joined(separator: " · ") }
         let r = model.resolvedRenderer(for: game)
         let api = model.analysis(for: game)?.api.label
         return [game.localExe.flatMap(LocalGames.role(of:)), r.short, api].compactMap { $0 }.joined(separator: " · ")
@@ -710,10 +766,11 @@ struct GameTile: View {
                 .padding(8)
             } else if run != .running && hovering {
                 let blocker = game.localExe == nil ? model.steamPlayBlocker(game) : nil
-                Button { model.play(game) } label: { Label("Play", systemImage: "play.fill") }
+                Button { model.play(game) } label: { Label(model.startWord(game), systemImage: "play.fill") }
                     .buttonStyle(PrimaryButtonStyle())
                     .disabled(blocker != nil)
-                    .help(blocker ?? (game.localExe == nil ? "Starts in Steam with this game's settings" : "Starts the game without Steam"))
+                    .help(blocker ?? (game.localExe == nil ? "Starts in Steam with this game's settings"
+                                      : model.isApp(game) ? "Opens the app" : "Starts the game without Steam"))
                     .padding(12)
                     .transition(reduceMotion ? .opacity : .opacity.combined(with: .scale(scale: 0.9)))
             }

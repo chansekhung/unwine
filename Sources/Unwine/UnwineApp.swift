@@ -1,6 +1,14 @@
 import SwiftUI
 
+/// Unwine's start. A copy of Unwine inside a Windows app's own Mac app (MacApps) runs as that app's
+/// launcher; everything else is Unwine.
 @main
+enum UnwineMain {
+    static func main() {
+        if MacAppLauncher.isLauncher { MacAppLauncher.run() } else { UnwineApp.main() }
+    }
+}
+
 struct UnwineApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
@@ -30,7 +38,7 @@ struct UnwineApp: App {
                     .disabled(!model.showsLibrary)
             }
             CommandGroup(replacing: .newItem) {
-                Button(untilSetUp("Add Game…")) { model.requestAddGame() }
+                Button(untilSetUp("Add Game or App…")) { model.requestAddGame() }
                     .keyboardShortcut("o")
                     .disabled(!model.showsLibrary)
             }

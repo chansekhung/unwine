@@ -30,10 +30,12 @@ enum WineTool: String, CaseIterable, Identifiable, Sendable {
 enum BottleProgram: Sendable {
     case file(URL)
     case tool(WineTool)
+    /// A program with arguments: an app that runs already, asked to open more files.
+    case open(URL, [String])
 
     var title: String {
         switch self {
-        case .file(let url): return url.lastPathComponent
+        case .file(let url), .open(let url, _): return url.lastPathComponent
         case .tool(let tool): return tool.title
         }
     }
@@ -44,6 +46,8 @@ enum BottleProgram: Sendable {
         switch self {
         case .tool(let tool):
             return [tool.command]
+        case .open(let url, let arguments):
+            return [url.path] + arguments
         case .file(let url):
             switch url.pathExtension.lowercased() {
             case "msi": return ["msiexec", "/i", BottleTools.windowsPath(url)]
@@ -55,8 +59,10 @@ enum BottleProgram: Sendable {
 
     /// The folder the program starts in: its own, so it finds the files next to it.
     var folder: URL? {
-        if case .file(let url) = self { return url.deletingLastPathComponent() }
-        return nil
+        switch self {
+        case .file(let url), .open(let url, _): return url.deletingLastPathComponent()
+        case .tool: return nil
+        }
     }
 }
 

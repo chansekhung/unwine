@@ -38,6 +38,10 @@ struct StoredState: Codable {
     // Library and app shell (group d)
     var librarySort: String?                // how the library orders games (LibrarySort); nil = recently played
     var libraryFilter: String?              // which games the library shows (LibraryFilter); nil = all
+    var libraryKind: String?                // Games or Apps (LibraryKind); nil = games
+    var macAppKey: String?                  // the secret each app's Mac app sends with its unwine:// request
+    var kindsSaved = false                  // each added program's Games or Apps choice is saved on its record (1.0.6)
+    var appCheck: Set<Int> = []             // games added before 1.0.6 whose files are not read yet: one banner offers the apps among them
     var favourites: Set<Int> = []           // games in the Favourites shelf at the top of the library
     var hiddenGames: Set<Int> = []          // games the user hid; "Hidden games" under the grid shows them
     var withoutSteam = false                // setup finished without Mac Steam, for games added by their .exe
@@ -83,6 +87,10 @@ struct StoredState: Codable {
         // Library and app shell (group d)
         librarySort = try? c.decodeIfPresent(String.self, forKey: .librarySort)
         libraryFilter = try? c.decodeIfPresent(String.self, forKey: .libraryFilter)
+        libraryKind = try? c.decodeIfPresent(String.self, forKey: .libraryKind)
+        macAppKey = try? c.decodeIfPresent(String.self, forKey: .macAppKey)
+        kindsSaved = (try? c.decodeIfPresent(Bool.self, forKey: .kindsSaved)) ?? false
+        appCheck = (try? c.decodeIfPresent(Set<Int>.self, forKey: .appCheck)) ?? []
         favourites = (try? c.decodeIfPresent(Set<Int>.self, forKey: .favourites)) ?? []
         hiddenGames = (try? c.decodeIfPresent(Set<Int>.self, forKey: .hiddenGames)) ?? []
         withoutSteam = (try? c.decodeIfPresent(Bool.self, forKey: .withoutSteam)) ?? false
@@ -254,6 +262,21 @@ final class AppModel {
     var toolLogs: [Int: LogFile] = [:]              // one writer per Steam game's log of programs run in its bottle
     var bottleRuns: [String: Int] = [:]             // programs Unwine ran in a bottle (by its path) that still run
     var watchedBottles = Set<String>()              // added games' bottles (by path) whose session Unwine follows now
+
+    // Windows apps: Microsoft runtimes (group g). See AppModel+Runtimes.swift.
+    var runtimeChecks: [Int: RuntimeCheck] = [:]    // what each added program needs and what its bottle holds, from the last look
+    var runtimeJobs: [Int: RuntimeJob] = [:]        // a runtime installing into an added program's bottle now
+    var runtimeWarned: Set<Int> = []                // apps told once this run that a runtime is missing: the next Open starts them
+    var macAppPlaces: [Int: URL] = [:]              // each app's own Mac app in ~/Applications/Unwine Apps, once made
+    var macAppFailed = Set<Int>()                   // apps whose Mac app could not be made last time (their log says why)
+    @ObservationIgnored var macAppTasks: [Int: Task<Void, Never>] = [:]   // each Mac app's last renewal, run in order
+    @ObservationIgnored var folderAccessAsked = false                     // Unwine read the Mac's Documents folder once this run
+    @ObservationIgnored var endedByUnwine: Set<Int> = []                  // sessions Unwine ended itself (Quit, leftovers): no crash message
+    @ObservationIgnored var pendingOpenFiles: [Int: [URL]] = [:]          // files for an app that starts or opens others now
+    @ObservationIgnored var openDrains: [Int: Task<Void, Never>] = [:]    // the task that hands each app its waiting files
+    @ObservationIgnored var startScheduled: Set<Int> = []                 // starts asked for, in the moment before they run
+    @ObservationIgnored var appSuggestions: Set<Int> = []                 // games from before 1.0.6 that look like apps, for one banner
+    @ObservationIgnored var appSuggestionTask: Task<Void, Never>?
 
     // Steam game feedback, running state and Online mode (group c): what starts, runs and stops now.
     var steamStarting: [Int: [String]] = [:]    // Steam games starting now, with the words for the wait
@@ -723,7 +746,7 @@ final class AppModel {
 
     // MARK: Games
 
-    func settings(for id: Int) -> GameSettings { stored.games[id] ?? stored.defaults }
+    func settings(for id: Int) -> GameSettings { stored.games[id] ?? defaults(forID: id) }
 
     func analysis(for game: SteamGame) -> GameAnalysis? { stored.analyses[game.id] }
 
@@ -741,6 +764,11 @@ final class AppModel {
         stored.analyses[game.id] = result
         save()
         writeProfile(for: game.id)
+        // A game from before 1.0.6 stays a game. When its files look like an app's, one banner offers the move.
+        if stored.appCheck.remove(id) != nil {
+            save()
+            if guessedKind(id) == .app { suggestApp(id) }
+        }
     }
 
     func resolvedRenderer(for game: SteamGame) -> Renderer { renderer(for: game.id) }
@@ -1054,12 +1082,12 @@ final class AppModel {
         // The page turns Fresh bottle off while the game starts, runs or closes; a start the page
         // has not seen yet still stops here.
         if let why = bottleBusyReason(game) { banner = why; return }
-        guard !Runner.isPrefixRunning(pfx) else { banner = "\(game.name) is running. Quit the game first."; return }
+        guard !Runner.isPrefixRunning(pfx) else { banner = "\(game.name) is running. Quit the \(noun(game)) first."; return }
         guard FileManager.default.fileExists(atPath: pfx.path) else { banner = "\(game.name) has no Windows bottle yet."; return }
         if game.localExe != nil,
            let installed = stored.localGames.first(where: { LocalGames.isInside(URL(fileURLWithPath: $0.exePath), bottle: game.bottleID ?? game.id) }) {
             banner = installed.id == game.id
-                ? "\(game.name) is installed inside its own Windows bottle, so a fresh bottle would delete the game. The bottle stays."
+                ? "\(game.name) is installed inside its own Windows bottle, so a fresh bottle would delete the \(noun(game)). The bottle stays."
                 : "\(installed.name) is installed inside this Windows bottle, so a fresh bottle would delete it. The bottle stays. To start over anyway, remove \(installed.name) first."
             return
         }
@@ -1069,7 +1097,7 @@ final class AppModel {
                 try? FileManager.default.removeItem(at: game.compatData.appendingPathComponent(marker))
             }
             let shared = bottleSharers(of: game).map(\.name)
-            banner = "Windows bottle for \(game.name) moved to the Trash. \(game.localExe == nil ? "Steam" : "Unwine") builds a fresh one on next Play."
+            banner = "Windows bottle for \(game.name) moved to the Trash. \(game.localExe == nil ? "Steam" : "Unwine") builds a fresh one the next time you press \(startWord(game))."
                 + (shared.isEmpty ? "" : " \(shared.joined(separator: ", ")) shared it, so it starts fresh too.")
         } catch {
             banner = "Could not move the bottle to the Trash: \(error.localizedDescription)"
@@ -1108,13 +1136,20 @@ final class AppModel {
         let game = LocalGames.game(from: record)
         games = LocalGames.inLibraryOrder(games + [game])
         readLocalIdentities()       // the program's icon and Highball details, in the background
-        banner = LocalGames.looksLikeInstaller(exe)
-            ? "\(record.name) looks like an installer. Press Play to run it in a Windows bottle of its own. When it ends, its page offers the program it installed, in the same bottle."
+        let installer = LocalGames.looksLikeInstaller(exe)
+        banner = installer
+            ? "\(record.name) looks like an installer. Press its tile to run it in a Windows bottle of its own. When it ends, its page offers the program it installed, in the same bottle."
             : mate.map { m in LocalGames.isInside(exe, bottle: m.bottle)
                 ? "\(record.name) is in your library. It runs in the Windows bottle that \(m.name) installed it into."
                 : "\(record.name) is in your library. It shares a Windows bottle with \(m.name), so settings you make in one, such as in a launcher, reach the other." }
-                ?? "\(record.name) is in your library. Unwine is reading its files to pick the best settings."
-        Task { await analyze(game) }
+                ?? "\(record.name) is in your library. Unwine is reading its files to see if it is a game or an app…"
+        Task {
+            await analyze(game)
+            settleKind(game)
+            // Games or Apps: said once the files are read, with a one-click move when the guess is wrong.
+            // An installer and a program that shares a bottle have their own banner: the half that shows follows them.
+            if !installer, mate == nil { announceAdded(game) } else { libraryKind = isApp(game) ? .apps : .games }
+        }
         // The first Play then only copies a bottle: the template is made while the user looks around.
         warmBottleTemplate()
     }
@@ -1188,11 +1223,11 @@ final class AppModel {
     func removeNote(for game: SteamGame) -> String {
         if let mate = bottleSharers(of: game).first {
             let installed = LocalGames.isInside(URL(fileURLWithPath: mate.exePath), bottle: game.bottleID ?? game.id)
-            return "The game's own files stay in \(game.installDir.path). Its Windows bottle stays too, because \(mate.name) \(installed ? "is installed in it" : "uses it")."
+            return "The \(noun(game))'s own files stay in \(game.installDir.path). Its Windows bottle stays too, because \(mate.name) \(installed ? "is installed in it" : "uses it")."
         }
         return game.installDir.path.hasPrefix(game.compatData.path)
             ? "This game was installed inside its Windows bottle, so the game itself goes to the Trash with the bottle."
-            : "The game's own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the game kept inside it, goes to the Trash."
+            : "The \(noun(game))'s own files stay in \(game.installDir.path). Its Windows bottle, with any settings and saves the \(noun(game)) kept inside it, goes to the Trash."
     }
 
     /// The other added games that use this game's Windows bottle, or whose program an installer put
@@ -1211,7 +1246,7 @@ final class AppModel {
     /// game stays in the library, so no bottle is ever left behind without a game.
     func removeLocalGame(_ game: SteamGame) {
         guard game.localExe != nil else { return }
-        guard !localRunning.contains(game.id), localStarting[game.id] == nil else { banner = "\(game.name) is running. Quit it first."; return }
+        if let why = bottleBusyReason(game) { banner = why; return }
         let sharers = bottleSharers(of: game)
         if sharers.isEmpty {
             if FileManager.default.fileExists(atPath: game.compatData.path) {
@@ -1240,6 +1275,7 @@ final class AppModel {
         for file in [gameLog, LogFile.previous(of: gameLog)] { try? FileManager.default.removeItem(at: file) }
         installedPrograms[game.id] = nil
         games.removeAll { $0.id == game.id }
+        refreshMacApp(for: game.id)     // its Mac app leaves Launchpad
         banner = sharers.isEmpty
             ? "\(game.name) is out of your library. Its files stay in \(game.installDir.path)."
             : "\(game.name) is out of your library. Its Windows bottle stays, because \(sharers[0].name) uses it too."
@@ -1247,17 +1283,27 @@ final class AppModel {
 
     /// Points an added game at another program, or at its program's new place (moved folder, other
     /// drive), keeping its bottle and saves. The game folder follows when the whole game moved.
-    func relocateLocalGame(_ id: Int, exe: URL) {
+    /// With `reguess`, the entry became another program (an installer's entry now starts what it
+    /// installed): Unwine guesses again whether it is a game or an app.
+    func relocateLocalGame(_ id: Int, exe: URL, reguess: Bool = false) {
         guard let i = stored.localGames.firstIndex(where: { $0.id == id }) else { return }
         stored.localGames[i].rootPath = LocalGames.movedRoot(of: stored.localGames[i], to: exe)?.path
         stored.localGames[i].exePath = exe.path
-        stored.analyses[id] = nil
+        if reguess { stored.localGames[i].kind = nil; stored.localGames[i].macApp = nil }
+        // The last reading stays until the new one lands, so the page and the half do not jump meanwhile.
+        stored.analyses[id]?.analyzerVersion = nil
         installedPrograms[id] = nil     // the entry has its program now
         save()
         readLocalIdentities()       // the moved program's icon and name are read again
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
         banner = "\(stored.localGames[i].name) now starts \(exe.lastPathComponent) from \(exe.deletingLastPathComponent().path)."
-        if let g = games.first(where: { $0.id == id }) { Task { await analyze(g) } }
+        if let g = games.first(where: { $0.id == id }) {
+            Task {
+                await analyze(g)
+                if reguess { settleKind(g); announceAdded(g) }
+                if isApp(g) { await checkRuntimes(g) }      // the page's own look runs only when it opens
+            }
+        }
     }
 
     func renameLocalGame(_ id: Int, to name: String) {
@@ -1266,6 +1312,7 @@ final class AppModel {
         stored.localGames[i].name = clean
         save()
         if let g = games.firstIndex(where: { $0.id == id }) { games[g] = LocalGames.game(from: stored.localGames[i]) }
+        refreshMacApp(for: id)      // the Mac app in Launchpad takes the new name
     }
 
     func localLog(_ id: Int) -> LogFile {
@@ -1275,26 +1322,60 @@ final class AppModel {
         return log
     }
 
-    private func playLocal(_ game: SteamGame) async {
+    /// Starts an added game or app. `files` are Mac files to open in it (from its Mac app, or Finder):
+    /// they go after its launch options as Windows paths. A start from its Mac app brings Unwine to the
+    /// front only when something goes wrong, with the program's page open on the problem.
+    func playLocal(_ game: SteamGame, files: [URL] = [], fromMacApp: Bool = false) async {
         guard let engine else { banner = "Unwine's engine is not set up yet."; return }
         guard localStarting[game.id] == nil else { return }
-        if localRunning.contains(game.id) { banner = "\(game.name) is already running."; return }
-        guard let arguments = LaunchOptions.words(launchOptions(for: game.id).arguments) else {
-            banner = "\(game.name) did not start: a quote in its launch options is not closed. Open its page to fix them."
+        // A start from the program's Mac app comes back to Unwine, where the banner says why it waits.
+        if runtimeJob(inBottleOf: game) != nil {
+            show("A runtime is installing in \(game.name)'s bottle. \(startWord(game)) it when the install is done.")
+            if fromMacApp { bringUnwineForward(to: game) }
             return
         }
+        if localRunning.contains(game.id) { banner = "\(game.name) is already running."; return }
+        guard let options = LaunchOptions.words(launchOptions(for: game.id).arguments) else {
+            banner = "\(game.name) did not start: a quote in its launch options is not closed. Open its page to fix them."
+            if fromMacApp { bringUnwineForward(to: game) }
+            return
+        }
+        let arguments = options + files.map(BottleTools.windowsPath)
         localStarting[game.id] = "Getting \(game.name) ready…"
-        defer { localStarting[game.id] = nil }
+        defer { localStarting[game.id] = nil; StartPanel.hide(game.id) }
+        // Unwine stays behind for a start from the Mac app, so a small panel shows the wait.
+        if fromMacApp { StartPanel.show(game, model: self) }
+        // An app that cannot start without a Microsoft runtime gets the one-click install first, not
+        // Windows' error box. A second Open starts it anyway, for when Unwine's reading is wrong.
+        if isApp(game), !runtimeWarned.contains(game.id) {
+            // Looked at each time: a runtime may have come in by another way (the app's own setup).
+            await checkRuntimes(game)
+            if let need = missingRuntimes(game).first(where: { $0.required && WindowsRuntime.pinned($0.runtime).works }) {
+                runtimeWarned.insert(game.id)
+                let runtime = WindowsRuntime.pinned(need.runtime)
+                show("\(game.name) needs \(runtime.title) to start. Its Windows bottle does not have it yet. Open it again to try without it.", .problem,
+                     action: .init("Install it") { [weak self] in Task { await self?.installRuntime(need.runtime, for: game) } })
+                localLog(game.id).line("Did not start: \(need.reason) Offered \(runtime.title).")
+                if fromMacApp { bringUnwineForward(to: game) }
+                return
+            }
+        }
         // The first start waits for the file check, so the settings fit the game. A launcher runs
         // with its game's settings, because the game it starts inherits them.
         let source = settingsSource(for: game).flatMap { s in games.first { $0.id == s.id } } ?? game
-        if stored.analyses[source.id] == nil { await analyze(source) }
+        if stored.analyses[source.id]?.isCurrent != true { await analyze(source) }
+        settleKind(game)
         writeProfile(for: source.id)
         let log = localLog(game.id)
         if source.id != game.id { log.line("\(game.name) starts with the settings of \(source.name), so the game it opens gets them") }
         let exited = ExitFlag()
+        await askFolderAccess(for: game)
+        // Where this run's lines start in the log: a crash later is looked for only in them.
+        let logMark = SteamRunLog.end(of: log.url)
+        endedByUnwine.remove(game.id)
         do {
-            let before = try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: source.id), arguments: arguments, log: log,
+            let before = try await LocalGames.start(game, engine: engine, profile: Profiles.file(for: source.id), arguments: arguments,
+                                                    isApp: isApp(game), log: log,
                                                     template: { [weak self] in await self?.bottleTemplate() },
                                                     watchInstalls: game.localExe.map(LocalGames.looksLikeInstaller) ?? false,
                                                     phase: { [weak self] words in self?.localStarting[game.id] = words },
@@ -1318,9 +1399,19 @@ final class AppModel {
             }
             if ended {
                 localRunning.remove(game.id)
-                show("\(game.name) closed before it showed a window. Its log says why.", .problem,
-                     action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
+                // An app that needs a Microsoft runtime stops at once without it: the banner offers the runtime.
+                if isApp(game) { await checkRuntimes(game) }
+                if let need = missingRuntimes(game).first(where: \.required) {
+                    let runtime = WindowsRuntime.pinned(need.runtime)
+                    show("\(game.name) closed before it showed a window. It needs \(runtime.title), which its Windows bottle does not have yet.", .problem,
+                         action: runtime.works ? .init("Install it") { [weak self] in Task { await self?.installRuntime(need.runtime, for: game) } }
+                                               : .init("Show logs") { [weak self] in self?.showLogs(of: game) })
+                } else {
+                    show("\(game.name) closed before it showed a window. Its log says why.", .problem,
+                         action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
+                }
                 log.line("The game closed before it showed a window")
+                if fromMacApp { bringUnwineForward(to: game) }
                 await offerInstalledPrograms(game, before: before)
             } else {
                 if !shown {
@@ -1328,7 +1419,7 @@ final class AppModel {
                          action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
                 }
                 // Until the bottle closes: playtime, the display kept awake, and leftovers closed.
-                Task { await self.watchLocalSession(game, exited: exited, installsBefore: before, since: launched) }
+                Task { await self.watchLocalSession(game, exited: exited, installsBefore: before, since: launched, logMark: logMark) }
             }
         } catch {
             // A program that moved: Locate… keeps the game's bottle and saves.
@@ -1337,12 +1428,16 @@ final class AppModel {
                  action: moved ? .init("Locate…") { [weak self] in self?.locateLocalGame(game) }
                                : .init("Show logs") { [weak self] in self?.showLogs(of: game) })
             log.line("start failed: \(error)")
+            if fromMacApp { bringUnwineForward(to: game) }
         }
         await refreshSteam()
     }
 
     func stopLocal(_ game: SteamGame) async {
         guard let engine else { return }
+        // The end of everything in the bottle would cut Microsoft's installer short.
+        if runtimeJob(inBottleOf: game) != nil { banner = Self.runtimeInstallingReason; return }
+        endedByUnwine.insert(game.id)     // the session's end is no crash
         localStarting[game.id] = "Closing \(game.name)…"
         defer { localStarting[game.id] = nil }
         await LocalGames.stop(game, engine: engine, log: localLog(game.id))

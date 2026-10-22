@@ -6,7 +6,8 @@ import Foundation
 /// the same way. A new engine gets a new template, because Wine updates a bottle made by another one.
 enum BottleTemplate {
     /// Bump when the way the template is made changes, so older templates are made again.
-    static let format = 1
+    /// 2: Wine's crash box is off (BottleFonts.ensure).
+    static let format = 2
 
     static var folder: URL { LocalGames.root.appendingPathComponent("BottleTemplates", isDirectory: true) }
     static func home(_ engine: InstalledEngine) -> URL { folder.appendingPathComponent(engine.folder, isDirectory: true) }
@@ -65,7 +66,7 @@ enum BottleTemplate {
             throw LocalGamesError.bottle("Wine stopped while it made the bottle template.")
         }
         guard complete(pfx) else { throw LocalGamesError.bottle("Wine made no complete bottle template.") }
-        BottleFonts.ensure(prefix: pfx)
+        BottleFonts.ensure(prefix: pfx, quietCrashes: true)
         try JSONEncoder().encode(Record(engineFolder: engine.folder, format: format))
             .write(to: stage.appendingPathComponent("template.json"), options: .atomic)
         let home = home(engine)

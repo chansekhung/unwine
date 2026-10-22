@@ -151,7 +151,7 @@ extension AppModel {
         if game.localExe != nil {
             let bottle = game.bottleID ?? game.id
             let busy = stored.localGames.contains { $0.bottle == bottle && (localRunning.contains($0.id) || localStarting[$0.id] != nil) }
-            return busy ? "Quit the game first" : nil
+            return busy ? "Quit the \(noun(game)) first" : nil
         }
         if gameRunning { return "A game is running. Quit it first." }
         if online.inUse { return "Windows Steam is open. Quit it first." }
@@ -161,7 +161,7 @@ extension AppModel {
     /// Deletes one game's saved shaders. Returns the bytes freed, or nil when the game runs.
     func clearShaderCache(_ folders: [URL], of game: SteamGame) async -> Int64? {
         if let why = shaderClearBlocker(for: game) { banner = why; return nil }
-        guard !Runner.isPrefixRunning(LocalGames.prefix(game)) else { banner = "\(game.name) is running. Quit the game first."; return nil }
+        guard !Runner.isPrefixRunning(LocalGames.prefix(game)) else { banner = "\(game.name) is running. Quit the \(noun(game)) first."; return nil }
         let freed = await Task.detached(priority: .utility) { ShaderCache.clear(folders) }.value
         log.line("Cleared \(DiskUse.text(freed)) of saved shaders for \(game.name)")
         storageReport = nil     // the totals in Storage changed
@@ -189,8 +189,8 @@ extension AppModel {
             return list
         }
         if game.localExe != nil {
-            return [LogSource(id: "game", title: "Game", url: game.runLog,
-                              empty: "This game has no log yet. It starts the first time you press Play."), unwine]
+            return [LogSource(id: "game", title: isApp(game) ? "App" : "Game", url: game.runLog,
+                              empty: "This \(noun(game)) has no log yet. It starts the first time you press \(startWord(game))."), unwine]
         }
         var list = [LogSource(id: "game", title: "Game start", url: game.runLog,
                               empty: "Steam writes this log when it starts the game through Unwine. Press Play, then open the logs again."),

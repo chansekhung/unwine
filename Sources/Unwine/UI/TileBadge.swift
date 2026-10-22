@@ -8,7 +8,7 @@ struct TileBadge: Comparable {
     /// or an added game's bottle shows its words at the bottom of the tile instead, so `starting` is for
     /// a start whose words show elsewhere: a game Unwine starts in Windows Steam (the Online mode card).
     enum Kind: Int {
-        case starting, running, missingFile, blocked, otherTool, onlineMode
+        case starting, running, missingFile, needsRuntime, blocked, otherTool, onlineMode
     }
 
     let kind: Kind
@@ -21,7 +21,7 @@ struct TileBadge: Comparable {
         switch kind {
         case .starting, .onlineMode: return Palette.glow
         case .running: return Palette.ok
-        case .missingFile, .otherTool: return Palette.warn
+        case .missingFile, .needsRuntime, .otherTool: return Palette.warn
         case .blocked: return Palette.error
         }
     }
@@ -46,7 +46,22 @@ extension AppModel {
         }
         if let exe = game.localExe, !FileManager.default.fileExists(atPath: exe.path) {
             list.append(TileBadge(kind: .missingFile, text: "File missing", icon: "questionmark.folder",
-                                  reason: "Unwine cannot find \(exe.lastPathComponent). If the game moved, or its drive is not connected, right-click it and choose Locate…. Its bottle and saves stay."))
+                                  reason: "Unwine cannot find \(exe.lastPathComponent). If the \(noun(game)) moved, or its drive is not connected, right-click it and choose Locate…. Its bottle and saves stay."))
+        }
+        let missing = missingRuntimes(game).filter(\.required)
+        if let need = missing.first(where: { WindowsRuntime.pinned($0.runtime).works }) {
+            let title = WindowsRuntime.pinned(need.runtime).title
+            list.append(TileBadge(kind: .needsRuntime, text: "Needs runtime", icon: "shippingbox",
+                                  reason: "\(game.name) needs \(title) to start. Open its page and press Install. It comes from Microsoft."))
+        } else if let reason = runtimeChecks[game.id]?.unoffered.first, isApp(game) {
+            list.append(TileBadge(kind: .needsRuntime, text: "May not start", icon: "shippingbox",
+                                  reason: reason, needsAttention: false))
+        } else if let need = missing.first {
+            // Nothing to install: Wine cannot show this part yet. Said once, not as a thing to fix.
+            let title = WindowsRuntime.pinned(need.runtime).title
+            list.append(TileBadge(kind: .needsRuntime, text: "Partly works", icon: "shippingbox",
+                                  reason: "\(game.name) uses \(title), which does not work in Wine yet (WineHQ bug 58921). The app may open, but the parts that use it can stay empty.",
+                                  needsAttention: false))
         }
         if game.localExe == nil, let tool = mappings[game.id], tool != Runner.toolName {
             list.append(TileBadge(kind: .otherTool, text: "Not using Unwine", icon: "hand.point.right.fill",

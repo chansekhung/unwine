@@ -21,9 +21,17 @@ enum RunState: Equatable {
 extension AppModel {
     func runState(of game: SteamGame) -> RunState {
         if game.localExe != nil {
+            // A runtime that installs is a wait of its own: the tile and the page say what it is.
+            if let job = runtimeJob(inBottleOf: game) {
+                return .starting(["Installing \(WindowsRuntime.pinned(job.runtime).title)…", "It comes from Microsoft"])
+            }
             if let step = localStarting[game.id] {
-                return step.hasPrefix("Closing") ? .closing([step, "Ending the game's programs…"])
-                                                 : .starting([step, "Windows games start slowly on a Mac", "The game's window opens soon"])
+                let app = isApp(game)
+                // A question from macOS stays in view until it is answered.
+                if step.hasPrefix("macOS asks") { return .starting([step]) }
+                return step.hasPrefix("Closing") ? .closing([step, app ? "Ending the app's programs…" : "Ending the game's programs…"])
+                                                 : .starting([step, app ? "Windows apps start slowly on a Mac" : "Windows games start slowly on a Mac",
+                                                              app ? "The app's window opens soon" : "The game's window opens soon"])
             }
             return localRunning.contains(game.id) ? .running : .idle
         }
@@ -48,8 +56,9 @@ extension AppModel {
     func bottleBusyReason(_ game: SteamGame) -> String? {
         switch runState(of: game) {
         case .idle: return nil
-        case .starting: return "\(game.name) is starting. Wait for its window, then quit the game first."
-        case .running: return "\(game.name) is running. Quit the game first."
+        case .starting where runtimeJob(inBottleOf: game) != nil: return Self.runtimeInstallingReason
+        case .starting: return "\(game.name) is starting. Wait for its window, then quit the \(noun(game)) first."
+        case .running: return "\(game.name) is running. Quit the \(noun(game)) first."
         case .closing: return "\(game.name) is closing. Wait a moment."
         }
     }

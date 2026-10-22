@@ -29,6 +29,9 @@ extension AppModel {
     func startAddedGames() {
         // The profiles take each game's launch options from here.
         LaunchOptions.publish(stored.launchOptions)
+        saveKinds()
+        // Each app's Mac app in Launchpad: renewed when Unwine changed, gone when its program did.
+        refreshAllMacApps()
         // start() picks the engine next. Then the template for new added games is made if it is
         // missing, and an added game that was already running is followed again.
         Task {
@@ -118,7 +121,7 @@ extension AppModel {
     /// helper). The tile would show "running" and block Play. A process that may still be starting
     /// is never a leftover: one under two minutes old, or under ten that keeps the CPU busy. The game
     /// behind a launcher can take that long under Rosetta to show its first window.
-    func watchLocalSession(_ game: SteamGame, exited: ExitFlag, installsBefore: Set<String>?, since started: Date) async {
+    func watchLocalSession(_ game: SteamGame, exited: ExitFlag, installsBefore: Set<String>?, since started: Date, logMark: UInt64? = nil) async {
         let pfx = LocalGames.prefix(game)
         // Programs that share a bottle share one session.
         guard watchedBottles.insert(pfx.path).inserted else { return }
@@ -165,18 +168,46 @@ extension AppModel {
             if now.timeIntervalSince(since) >= 30, let engine {
                 let log = localLog(game.id)
                 log.line("The game's process ended, and its bottle ran on for 30 s with no window. Closing what was left.")
+                endedByUnwine.insert(game.id)
                 await LocalGames.stop(game, engine: engine, log: log)
                 banner = "\(game.name) ended, but some of its programs stayed open without a window. Unwine closed them."
                 quietSince = nil
             }
         }
         if let activity { ProcessInfo.processInfo.endActivity(activity) }
+        // Wine's crash box is off in these bottles, so Unwine says when the program crashed, with its log.
+        let log = localLog(game.id)
+        if let logMark, endedByUnwine.remove(game.id) == nil,
+           await Task.detached(priority: .utility, operation: { Self.crashed(in: log.url, since: logMark) }).value {
+            log.line("The \(noun(game)) crashed. Wine's report is above.")
+            show("\(game.name) quit unexpectedly. Its log says why.", .problem,
+                 action: .init("Show logs") { [weak self] in self?.showLogs(of: game) })
+            bringUnwineForward(to: game)
+        }
+        endedByUnwine.remove(game.id)
         // The last part of a minute counts when it is half a minute or more.
         addPlaytime(game.id, minutes: Int((Date().timeIntervalSince(started) / 60).rounded()) - credited)
         await offerInstalledPrograms(game, before: installsBefore)
+        // An installer the app ran may have put runtimes and file types in its bottle.
+        if isApp(game) {
+            await checkRuntimes(game)
+            await readRegisteredFileTypes(game)
+        }
         await refreshSteam()
         // The template is not made while a game runs.
         warmBottleTemplate()
+    }
+
+    /// Wine wrote its crash report in this run's part of the log. Wine prints "starting debugger" (or
+    /// "wine: Unhandled …") for a crash also while its crash box is off. Reads at most the last 4 MB.
+    nonisolated static func crashed(in log: URL, since mark: UInt64) -> Bool {
+        guard let file = try? FileHandle(forReadingFrom: log) else { return false }
+        defer { try? file.close() }
+        let size = (try? file.seekToEnd()) ?? 0
+        let start = size < mark ? 0 : max(mark, size > 4_000_000 ? size - 4_000_000 : 0)
+        guard (try? file.seek(toOffset: start)) != nil, let data = try? file.readToEnd() else { return false }
+        let text = String(decoding: data, as: UTF8.self)
+        return text.contains("starting debugger") || text.contains("wine: Unhandled ")
     }
 
     // MARK: After an installer
@@ -206,7 +237,7 @@ extension AppModel {
         if let role = LocalGames.role(of: exe) { name += " · \(role)" }
         stored.localGames[i].name = uniqueLocalName(name, exe: exe, except: id)
         installedPrograms[id] = nil
-        relocateLocalGame(id, exe: exe)
+        relocateLocalGame(id, exe: exe, reguess: true)
         banner = "\(old) is now \(stored.localGames[i].name). It starts \(exe.lastPathComponent), which the installer put in its Windows bottle. The bottle and its saves stay."
     }
 
@@ -269,7 +300,8 @@ extension AppModel {
         if engine == nil { return "Unwine's engine is not set up yet." }
         if bottleToolStarting[game.id] != nil { return "A program is starting in this bottle. Wait a moment." }
         if game.localExe != nil {
-            if localStarting[game.id] != nil { return "Wait until the game has started." }
+            if runtimeJob(inBottleOf: game) != nil { return Self.runtimeInstallingReason }
+            if localStarting[game.id] != nil { return "Wait until the \(noun(game)) has started." }
         } else {
             if let tool = mappings[game.id], tool != Runner.toolName { return "Steam runs this game with another tool (\(tool)), so its bottle is not Unwine's." }
             // NotProton stops every program in the bottle as the game starts, and Quit game ends them all.
@@ -322,7 +354,11 @@ extension AppModel {
                                 onExit: { [weak self] status in
                                     log.line("\(title) ended with status \(status)")
                                     ended.set(status)
-                                    Task { @MainActor in self?.bottleRuns[key, default: 1] -= 1 }
+                                    Task { @MainActor in
+                                        self?.bottleRuns[key, default: 1] -= 1
+                                        // A setup run in the bottle (vc_redist) may have put a runtime in.
+                                        await self?.recheckRuntimes(ofBottle: game)
+                                    }
                                 })
             bottleRuns[key, default: 0] += 1
         } catch {
@@ -338,8 +374,21 @@ extension AppModel {
         }
         // A program with no window (a silent patch) says how it went here, as the waiting line goes.
         if !shown {
+            // An app that runs already got the files from its second start: some apps end that start
+            // with a code other than 0. The app's window comes forward, with no problem banner.
+            if case .open = program, ended.status != nil, let pid = before.first {
+                bringToFront(pid)
+                await refreshSteam()
+                return
+            }
             switch ended.status {
-            case 0?: banner = "\(title) ran in the Windows bottle of \(game.name) and finished."
+            case 0?:
+                // A second start of an app hands its files to the app that runs, then ends: that app comes forward.
+                if case .open = program {
+                    if let pid = before.first { bringToFront(pid) }
+                } else {
+                    banner = "\(title) ran in the Windows bottle of \(game.name) and finished."
+                }
             case _?:
                 // The programs run in a bottle write to the game's log (added game) or its tools log (Steam game).
                 let source = game.localExe == nil ? "tools" : "game"
@@ -349,6 +398,13 @@ extension AppModel {
             }
         }
         await refreshSteam()
+    }
+
+    /// Looks again at the runtimes of every added app that uses this bottle.
+    func recheckRuntimes(ofBottle game: SteamGame) async {
+        guard game.localExe != nil else { return }
+        let mates = bottleSharers(of: game).compactMap { r in games.first { $0.id == r.id } }
+        for g in [game] + mates where isApp(g) { await checkRuntimes(g) }
     }
 
     /// Asks for a program (.exe, .msi, .bat or .cmd), then runs it in the game's bottle.
@@ -378,6 +434,7 @@ extension AppModel {
     /// Points the game at another .exe. The bottle and its saves stay. An installer's entry looks in
     /// its bottle's C: drive first, and takes the name of the program it installed there.
     func changeLocalProgram(_ game: SteamGame) {
+        if let why = bottleBusyReason(game) { banner = why; return }
         let drive = game.compatData.appendingPathComponent("pfx/drive_c", isDirectory: true)
         let installer = game.localExe.map(LocalGames.looksLikeInstaller) == true && FileManager.default.fileExists(atPath: drive.path)
         guard let url = FilePicker.pick(message: "Pick the program that \(game.name) starts. Its Windows bottle and saves stay.",
@@ -392,6 +449,7 @@ extension AppModel {
     /// Finds a moved or missing program again, starting the search where it was.
     func locateLocalGame(_ game: SteamGame) {
         guard let exe = game.localExe else { return }
+        if let why = bottleBusyReason(game) { banner = why; return }
         var dir = exe.deletingLastPathComponent()
         while !FileManager.default.fileExists(atPath: dir.path), dir.pathComponents.count > 1 { dir.deleteLastPathComponent() }
         guard let url = FilePicker.pick(message: "Unwine cannot find \(exe.lastPathComponent). Pick it where it is now. Its Windows bottle and saves stay.",

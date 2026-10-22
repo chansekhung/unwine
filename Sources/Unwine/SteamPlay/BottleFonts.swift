@@ -39,27 +39,48 @@ enum BottleFonts {
     }()
 
     private static let section = #"[Software\\Wine\\Fonts\\Replacements]"#
+    private static let debuggerSection = #"[Software\\Wine\\WineDbg]"#
 
-    /// Adds the stand-ins to a closed bottle's user.reg, keeping any the user or a game set. Edits the
-    /// text file directly (no Wine process), and only while the bottle's server is not running,
-    /// because Wine writes user.reg back when its server quits. Returns true when the file changed.
+    /// Adds the stand-ins to a closed bottle's user.reg, keeping any the user or a game set. With
+    /// `quietCrashes` (bottles of added programs), it also turns off Wine's crash box ("Program Error"),
+    /// as Online mode does: a program that crashes ends, its log has the details, and Unwine says so
+    /// with Show logs. Edits the text file directly (no Wine process), and only while the bottle's server
+    /// is not running, because Wine writes user.reg back when its server quits. Returns true when the
+    /// file changed.
     @discardableResult
-    static func ensure(prefix: URL) -> Bool {
+    static func ensure(prefix: URL, quietCrashes: Bool = false) -> Bool {
         let file = prefix.appendingPathComponent("user.reg")
         guard var text = try? String(contentsOf: file, encoding: .utf8) else { return false }
         let missing = replacements.filter { !text.contains("\n\"\($0.windows)\"=") }
-        guard !missing.isEmpty else { return false }
+        // winedbg makes its section by itself, empty, the first time a program crashes: a section with
+        // no ShowCrashDialog value still gets it. A value the user set stays.
+        let debugger = text.range(of: debuggerSection)
+        let debuggerBody = debugger.map { r -> Substring in
+            let rest = text[r.upperBound...]
+            return rest[..<(rest.range(of: "\n[")?.lowerBound ?? rest.endIndex)]
+        }
+        let crashBox = quietCrashes && debuggerBody?.contains("\"ShowCrashDialog\"=") != true
+        guard !missing.isEmpty || crashBox else { return false }
         let lines = missing.map { r -> String in
             // REG_MULTI_SZ in Wine's text format: str(7), names separated and ended by \0.
             "\"\(r.windows)\"=str(7):\"" + r.mac.map { $0 + "\\0" }.joined() + "\""
         }
-        if let range = text.range(of: section) {
+        let stamp = Int(Date().timeIntervalSince1970)
+        if !lines.isEmpty, let range = text.range(of: section) {
             // Into the existing section, right after its header line.
             let lineEnd = text[range.upperBound...].firstIndex(of: "\n") ?? text.endIndex
             text.insert(contentsOf: "\n" + lines.joined(separator: "\n"), at: lineEnd)
-        } else {
+        } else if !lines.isEmpty {
             if !text.hasSuffix("\n") { text += "\n" }
-            text += "\n\(section) \(Int(Date().timeIntervalSince1970))\n" + lines.joined(separator: "\n") + "\n"
+            text += "\n\(section) \(stamp)\n" + lines.joined(separator: "\n") + "\n"
+        }
+        // A bottle where the user set the crash box keeps their choice: only a missing key is added.
+        if crashBox, let header = text.range(of: debuggerSection) {
+            let lineEnd = text[header.upperBound...].firstIndex(of: "\n") ?? text.endIndex
+            text.insert(contentsOf: "\n\"ShowCrashDialog\"=dword:00000000", at: lineEnd)
+        } else if crashBox {
+            if !text.hasSuffix("\n") { text += "\n" }
+            text += "\n\(debuggerSection) \(stamp)\n\"ShowCrashDialog\"=dword:00000000\n"
         }
         // Checked again right before the write: a game may have started meanwhile.
         guard !OnlineSteam.serverIsAlive(prefix) else { return false }

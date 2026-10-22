@@ -17,6 +17,18 @@ enum PEInspector {
         return Info(is64Bit: image.is64Bit, imports: image.imports(in: file))
     }
 
+    /// The functions a program takes by name from each of `dlls` (lower-case DLL names).
+    static func importedFunctions(_ url: URL, from dlls: Set<String>) -> [String: Set<String>] {
+        guard let file = RandomAccessFile(url), let image = Image(file) else { return [:] }
+        return image.importedFunctions(in: file, from: dlls)
+    }
+
+    /// The function names a DLL exports. Nil when the file is not a Windows program.
+    static func exportedNames(_ url: URL) -> Set<String>? {
+        guard let file = RandomAccessFile(url), let image = Image(file) else { return nil }
+        return image.exportedNames(in: file)
+    }
+
     /// The bytes of a 32-bit program's code sections, for `X87Scan`, without the padding the file adds
     /// after them. Nil for 64-bit programs, .NET programs and files that are not Windows programs.
     /// Reads at most `limit` bytes.
@@ -37,6 +49,20 @@ enum PEInspector {
     static func isDotNet(_ url: URL) -> Bool {
         guard let file = RandomAccessFile(url), let image = Image(file) else { return false }
         return image.isDotNet
+    }
+
+    /// The .NET runtime version a .NET program was built for, from its metadata ("v4.0.30319" for
+    /// .NET Framework 4, "v2.0.50727" for 2.0 to 3.5). Nil for programs that are not .NET.
+    static func dotNetRuntime(_ url: URL) -> String? {
+        guard let file = RandomAccessFile(url), let image = Image(file), image.isDotNet,
+              let clr = image.fileOffset(ofRVA: image.directories[14].rva, fileSize: file.size),
+              let header = file.read(16, at: clr), let metaRVA = le32(header, 8),
+              let meta = image.fileOffset(ofRVA: metaRVA, fileSize: file.size),
+              // The metadata root: "BSJB", two version numbers, a reserved word, then the version text.
+              let root = file.read(16 + 256, at: meta), le32(root, 0) == 0x424A_5342,
+              let length = le32(root, 12), length > 0, length <= 255 else { return nil }
+        let text = root[16..<min(16 + length, root.count)].prefix { $0 != 0 }
+        return String(bytes: text, encoding: .ascii)
     }
 
     /// What a program says about itself in its resources: its name and its icon.
@@ -483,6 +509,66 @@ enum PEInspector {
             return names
         }
 
+        /// The functions taken by name from each of `wanted` (lower-case DLL names). Functions taken
+        /// by number have no name to compare, so they are left out.
+        func importedFunctions(in file: RandomAccessFile, from wanted: Set<String>) -> [String: Set<String>] {
+            var result: [String: Set<String>] = [:]
+            let strings = StringReader(file)
+            let width = is64Bit ? 8 : 4
+            func names(thunks rva: Int) -> Set<String> {
+                var found = Set<String>()
+                guard rva != 0, let at = fileOffset(ofRVA: rva, fileSize: file.size), let table = file.read(4096 * width, at: at) else { return found }
+                for index in 0..<(table.count / width) {
+                    let o = index * width
+                    guard let low = PEInspector.le32(table, o), let high = width == 8 ? PEInspector.le32(table, o + 4) : 0 else { break }
+                    if low == 0 && high == 0 { break }
+                    // The top bit says "by number"; otherwise the low part is the RVA of a hint and a name.
+                    let byNumber = width == 8 ? high & 0x8000_0000 != 0 : low & 0x8000_0000 != 0
+                    if !byNumber, let name = string(atRVA: low + 2, in: file, using: strings, lowercased: false) { found.insert(name) }
+                }
+                return found
+            }
+            if directories.count > 1, let table = descriptors(directory: 1, size: 20, in: file) {
+                for index in 0..<min(512, table.count / 20) {
+                    let o = index * 20
+                    guard let lookup = PEInspector.le32(table, o), let nameRVA = PEInspector.le32(table, o + 12),
+                          let thunk = PEInspector.le32(table, o + 16) else { break }
+                    if nameRVA == 0 && thunk == 0 { break }
+                    guard let dll = string(atRVA: nameRVA, in: file, using: strings), wanted.contains(dll) else { continue }
+                    // The lookup table keeps the names; some linkers leave it out and only the address table has them.
+                    result[dll, default: []].formUnion(names(thunks: lookup != 0 ? lookup : thunk))
+                }
+            }
+            if directories.count > 13, let table = descriptors(directory: 13, size: 32, in: file) {
+                for index in 0..<min(512, table.count / 32) {
+                    let o = index * 32
+                    guard let attributes = PEInspector.le32(table, o), let nameRVA = PEInspector.le32(table, o + 4),
+                          let lookup = PEInspector.le32(table, o + 16) else { break }
+                    if nameRVA == 0 { break }
+                    guard attributes & 1 == 1, let dll = string(atRVA: nameRVA, in: file, using: strings), wanted.contains(dll) else { continue }
+                    result[dll, default: []].formUnion(names(thunks: lookup))
+                }
+            }
+            return result
+        }
+
+        /// The names in the export table (directory 0), as written.
+        func exportedNames(in file: RandomAccessFile) -> Set<String> {
+            var names = Set<String>()
+            guard !directories.isEmpty, directories[0].rva != 0,
+                  let at = fileOffset(ofRVA: directories[0].rva, fileSize: file.size), let head = file.read(40, at: at),
+                  let count = PEInspector.le32(head, 24), let listRVA = PEInspector.le32(head, 32),
+                  let listAt = fileOffset(ofRVA: listRVA, fileSize: file.size),
+                  let list = file.read(min(count, 20_000) * 4, at: listAt) else { return names }
+            let strings = StringReader(file)
+            for index in 0..<(list.count / 4) {
+                if let rva = PEInspector.le32(list, index * 4), let name = string(atRVA: rva, in: file, using: strings, lowercased: false) {
+                    names.insert(name)
+                }
+            }
+            return names
+        }
+
         /// The first 512 descriptors of a directory, read in one go.
         private func descriptors(directory index: Int, size: Int, in file: RandomAccessFile) -> [UInt8]? {
             let entry = directories[index]
@@ -490,9 +576,9 @@ enum PEInspector {
             return file.read(512 * size, at: offset)
         }
 
-        private func string(atRVA rva: Int, in file: RandomAccessFile, using strings: StringReader) -> String? {
+        private func string(atRVA rva: Int, in file: RandomAccessFile, using strings: StringReader, lowercased: Bool = true) -> String? {
             guard let offset = fileOffset(ofRVA: rva, fileSize: file.size), let text = strings.read(at: offset), !text.isEmpty else { return nil }
-            return text.lowercased()
+            return lowercased ? text.lowercased() : text
         }
     }
 
@@ -506,7 +592,8 @@ enum PEInspector {
         init(_ file: RandomAccessFile) { self.file = file }
 
         func read(at offset: Int) -> String? {
-            let maxLength = 256
+            // C++ names carry their types, so a long one passes 256 bytes.
+            let maxLength = 1024
             let covered = offset >= start && offset + maxLength <= start + window.count
             if !covered, !(offset >= start && start + window.count >= file.size) {
                 guard let fresh = file.read(4096, at: offset) else { return nil }
