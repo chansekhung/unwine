@@ -22,7 +22,7 @@ How to keep this list. The build reads it, so follow these rules.
    commands to tag and publish.
 -->
 
-## 1.0.6 · not released yet
+## 1.0.6 · 2026-10-23
 
 - **Windows apps, not only games.** Add a Windows app the same way as a game: press Add, or drop its folder or .exe on the window. Unwine reads its files and puts it in Games or Apps by itself. If it guesses wrong, one click moves it. Games you added before stay in Games. If some of them look like apps, one message offers to move them.
 - **Games | Apps.** The library has a switch at the top once you add an app. Each half has its own search and filters.
