@@ -25,6 +25,7 @@ How to keep this list. The build reads it, so follow these rules.
 ## 1.0.6 · not released yet
 
 - **Fix for a crash at start in DirectX 10 and 11 games.** DXMT (the layer that draws these games with Metal) used its device before it set it up. Then a game could close at start, Age of Mythology too. Unwine now fixes this in its own copy of DXMT. DXMT itself fixed it on 30 Sep 2026, so newer DXMT builds do not need the copy.
+- **Find in GeForce NOW.** Some games have kernel anti-cheat (it runs in the core of Windows), for example Ricochet in new Call of Duty games. No Wine tool on a Mac can load it, so online play does not work. Their page now says so and has a button for cloud play. The button opens GeForce NOW (NVIDIA's cloud gaming service) at the game when its list has the game. Unwine sends only that game's name to NVIDIA, and only when you click. Valorant and other Riot Vanguard games have no known cloud option, so their page says that.
 
 ## 1.0.5 · 2026-10-21
 

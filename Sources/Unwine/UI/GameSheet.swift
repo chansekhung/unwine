@@ -14,6 +14,7 @@ struct GameSheet: View {
     @State private var newName = ""
     @State private var pickingInstalled = false
     @State private var installedList: [(url: URL, size: Int64)] = []   // kept while the chooser closes
+    @State private var findingInCloud = false
 
     private var game: SteamGame? { model.games.first { $0.id == gameID } }
 
@@ -146,10 +147,7 @@ struct GameSheet: View {
                         NoticeRow(color: Palette.warn, icon: "nosign",
                                   text: "The publisher blocks this game on macOS, so it will not run here. No compatibility layer changes that, CrossOver included.")
                     }
-                    if case .blocked(let names) = advice.online {
-                        NoticeRow(color: Palette.warn, icon: "shield.lefthalf.filled",
-                                  text: "Uses \(names.joined(separator: ", ")). Online play with this anti-cheat does not work on any Mac Wine tool, CrossOver too. Offline modes may work.")
-                    }
+                    if case .blocked(let names) = advice.online { cloudPlayRow(game, anticheat: names) }
                     if !isLocal && !usesDecant && (mappedElsewhere || neverRun) {
                         NoticeRow(color: Palette.warn, icon: "hand.point.right.fill",
                                   text: mappedElsewhere
@@ -638,6 +636,58 @@ struct GameSheet: View {
         case .info: return Palette.glow
         case .warning: return Palette.warn
         case .fix: return Palette.ok
+        }
+    }
+
+    // MARK: Cloud play
+
+    /// Kernel anti-cheat stops every Wine tool, so the page points to cloud play. Riot Vanguard stops
+    /// cloud play too, and then the row says so with no button.
+    private func cloudPlayRow(_ game: SteamGame, anticheat names: [String]) -> some View {
+        let blocked = "\(game.name) has kernel anti-cheat (\(names.joined(separator: ", "))). It runs in the core of Windows, and no Wine tool on a Mac can load it, CrossOver included."
+        let noCloud = GeForceNow.refusesCloud(names)
+        return NoticeRow(color: Palette.warn, icon: "shield.lefthalf.filled",
+                         text: blocked + (noCloud
+                            ? " Vanguard also does not run on virtual machines (the shared computers that cloud gaming uses), so there is no known cloud option for this game."
+                            : " Offline modes may work. Cloud play is the way to play online: a computer in a data center runs the game and streams it to this Mac.")) {
+            if findingInCloud {
+                HStack(spacing: 8) {
+                    UnwineMark(progress: nil, size: 18)
+                    PhaseWords(words: ["Asking GeForce NOW…", "Looking for the game…"])
+                        .font(.system(size: 12)).foregroundStyle(Palette.glow).lineLimit(1)
+                }
+            } else if !noCloud {
+                Button { findInGeForceNow(game) } label: { Label("Find in GeForce NOW", systemImage: "cloud") }
+                    .buttonStyle(QuietButtonStyle())
+                    .help("Looks for this game in GeForce NOW's game list, then opens the GeForce NOW \(GeForceNow.app == nil ? "website" : "app") at it. Unwine sends only this game's name to NVIDIA. GeForce NOW is NVIDIA's cloud gaming service and needs an NVIDIA account.")
+            }
+        }
+    }
+
+    /// Opens GeForce NOW at the game when its list has the game, else at its start page. A failed
+    /// lookup still opens GeForce NOW: the user can search there.
+    private func findInGeForceNow(_ game: SteamGame) {
+        findingInCloud = true
+        Task {
+            let steam = game.localExe == nil
+            let found: GeForceNow.Match?
+            let reached: Bool
+            do {
+                found = try await GeForceNow.find(steamAppID: steam ? game.id : nil, title: game.name)
+                reached = true
+            } catch {
+                found = nil
+                reached = false
+            }
+            findingInCloud = false
+            NSWorkspace.shared.open(GeForceNow.page(found))
+            if let found {
+                model.show("GeForce NOW opens at \(found.title).", .success)
+            } else {
+                model.show((reached ? "Unwine did not find \(steam ? "the Steam version of " : "")\(game.name) in GeForce NOW's game list."
+                                    : "Unwine could not get GeForce NOW's game list.")
+                           + " GeForce NOW opens at its start page. Search for the game there.")
+            }
         }
     }
 
