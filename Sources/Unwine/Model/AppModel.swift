@@ -1903,6 +1903,8 @@ final class AppModel {
         })
         // A new engine that waited for power or a normal network goes ahead as soon as it may.
         if stored.deferredEngine != nil, updateDeferralReason == nil { due.insert(.engine) }
+        // A held engine gets its new look as soon as Unwine itself updated, not up to 20 hours later.
+        if let held = stored.heldEngine, held.since != appUpdater.currentVersion { due.insert(.engine) }
         if !due.isEmpty { await checkForUpdates(due, automatic: true) }
     }
 

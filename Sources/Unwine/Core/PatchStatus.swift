@@ -95,11 +95,11 @@ enum PatchStatus {
         // KosmicKrisp loads on macOS 26 and later only. Before that, MoltenVK draws, and the fix has no use.
         let modern = ProcessInfo.processInfo.isOperatingSystemAtLeast(OperatingSystemVersion(majorVersion: 26, minorVersion: 0, patchVersion: 0))
         let vkOn = modern && RendererPatches.vulkanICD(engine: engine).lastPathComponent == "kosmickrisp_unwine_icd.json"
-        let driver = engine.frameworks.appendingPathComponent(RendererPatches.vulkanBudget.path)
+        let driver = engine.frameworks.appendingPathComponent(RendererPatches.vulkanDriverFile)
         let vkWhy = vkOn ? UnwineFix.Kind.vulkanMemory.effect
             : !modern ? "Not needed: on this macOS, games use MoltenVK. KosmicKrisp needs macOS 26 or newer."
             : !has(driver) ? "This engine has no KosmicKrisp driver."
-            : explain && (try? Downloader.sha256(of: driver)) == RendererPatches.vulkanBudget.cleanSHA256
+            : explain && RendererPatches.vulkanBudgets.contains(where: { $0.cleanSHA256 == (try? Downloader.sha256(of: driver)) })
                 ? "Unwine could not make its fixed copy. Quit and open Unwine to try again."
                 : newBuild
         out.append(UnwineFix(kind: .vulkanMemory, on: vkOn, why: vkWhy))

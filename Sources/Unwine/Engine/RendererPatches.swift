@@ -84,6 +84,24 @@ enum RendererPatches {
                edits: [plainNotShared64(0x42c76)]),
     ]
 
+    // MARK: DXVK 3.1.1_1 (Sikarugir's gplasync build, Template 1.0.26 and later)
+
+    /// The same async back-buffer edits, at the same offsets: DxvkContext::updateRenderTargets did not
+    /// change. This build fixed the shared-texture crash itself. It logs "Failed to create shared
+    /// resource: VK_KHR_EXTERNAL_MEMORY_WIN32 not supported" and goes on with a plain texture, so it
+    /// needs no plainNotShared edits (checked on 26 Nov 2026 with Direct3D 9Ex and 11 test programs,
+    /// 32 and 64-bit: none closed). Its d3d11.dll and dxgi.dll stay as they ship.
+    private static let d3d9FixesGPLAsync: [Recipe] = [
+        Recipe(path: "wine/i386-windows/d3d9.dll",
+               cleanSHA256: "f78f85f2416cedb61e81b9977a3e88c06a1949e19212a8803edb593c14631784",
+               patchedSHA256: "64d83864160541603051848590b369651a547db69a377a598b839ca60efa9c13",
+               edits: asyncBackBuffer32),
+        Recipe(path: "wine/x86_64-windows/d3d9.dll",
+               cleanSHA256: "4a7b4be87363530d33c611fac2dcdd71ee0587c4f09761208a328623e476f8f4",
+               patchedSHA256: "b6c74247e0f55a50c4cebc77795f6b8718d19d45e0cffcd12867340be040b2d3",
+               edits: asyncBackBuffer64),
+    ]
+
     // MARK: DXMT v0.80-244-g7c8dee1 (Sikarugir's Template 1.0.24)
 
     /// DXMT's command context builds its compute pipelines while it is being made (ClearUAV does, in
@@ -139,20 +157,22 @@ enum RendererPatches {
         fixedDir("dxmt", engine: engine) ?? engine.renderer("dxmt")
     }
 
-    /// The renderer folders Unwine makes fixed copies of, and the fixes each copy gets.
+    /// The renderer folders Unwine makes fixed copies of, and for each folder the fixes of every build
+    /// Unwine knows: a copy gets the set whose files are the engine's own.
     static let fixedRenderers = ["d9vk", "dxvk3", "dxmt"]
-    private static func recipes(for name: String) -> [Recipe] {
+    private static func recipeSets(for name: String) -> [[Recipe]] {
         switch name {
-        case "dxvk3": return d3d9Fixes + d3d11Fixes
-        case "dxmt": return dxmtFixes
-        default: return d3d9Fixes
+        case "dxvk3": return [d3d9Fixes + d3d11Fixes, d3d9FixesGPLAsync]
+        case "dxmt": return [dxmtFixes]
+        default: return [d3d9Fixes, d3d9FixesGPLAsync]
         }
     }
 
     /// renderer/<name>-unwine/wine when its fixed copy is ready, else nil (the game uses stock files).
     static func fixedDir(_ name: String, engine: InstalledEngine) -> URL? {
         let copy = engine.rendererRoot.appendingPathComponent("\(name)-unwine", isDirectory: true)
-        guard (try? String(contentsOf: copy.appendingPathComponent(markerName), encoding: .utf8)) == marker(recipes(for: name)) else { return nil }
+        guard let made = try? String(contentsOf: copy.appendingPathComponent(markerName), encoding: .utf8),
+              recipeSets(for: name).contains(where: { marker($0) == made }) else { return nil }
         return copy.appendingPathComponent("wine", isDirectory: true)
     }
 
@@ -249,11 +269,19 @@ enum RendererPatches {
     /// 16 KiB pages, so KosmicKrisp reported a quarter of the real free memory (about 1.3 GiB of 18).
     /// DXVK then treated normal play as memory pressure: it kept freeing and moving memory. The fix
     /// multiplies by 16 KiB ('imulq (%rcx),%rdx' becomes 'shlq $14,%rdx'). Every Apple chip uses 16 KiB.
-    static let vulkanBudget = Recipe(
-        path: "libvulkan_kosmickrisp.dylib",
-        cleanSHA256: "34e50544998477671ba2ee5a288ebd0855128b0da92e671370abeadc505dbfe3",
-        patchedSHA256: "70b24b82d244e6c127f5df65ef38469ba8ffaaae25a7707a6c57a39e6f85a259",
-        edits: [Edit(offset: 0x2b3a6c, old: [0x48, 0x0f, 0xaf, 0x11], new: [0x48, 0xc1, 0xe2, 0x0e])])
+    /// Mesa 26.3 (Template 1.0.24), then Mesa 27.0 (Template 1.0.26 and later), where
+    /// os_get_available_system_memory has the same code at another place.
+    static let vulkanBudgets = [
+        Recipe(path: vulkanDriverFile,
+               cleanSHA256: "34e50544998477671ba2ee5a288ebd0855128b0da92e671370abeadc505dbfe3",
+               patchedSHA256: "70b24b82d244e6c127f5df65ef38469ba8ffaaae25a7707a6c57a39e6f85a259",
+               edits: [Edit(offset: 0x2b3a6c, old: [0x48, 0x0f, 0xaf, 0x11], new: [0x48, 0xc1, 0xe2, 0x0e])]),
+        Recipe(path: vulkanDriverFile,
+               cleanSHA256: "85a6525637778fc9d3c9eb20fbdb2cddb45cad09b5e719ef97c263dae7a1ef5b",
+               patchedSHA256: "bb7c33271ae2098164413d531acf695fc7df35bed7592e7128b5dea5ff8517ac",
+               edits: [Edit(offset: 0x2a97cc, old: [0x48, 0x0f, 0xaf, 0x11], new: [0x48, 0xc1, 0xe2, 0x0e])]),
+    ]
+    static let vulkanDriverFile = "libvulkan_kosmickrisp.dylib"
 
     private static let patchedDriver = "libvulkan_kosmickrisp-unwine.dylib"
     private static let patchedICD = "kosmickrisp_unwine_icd.json"
@@ -269,7 +297,8 @@ enum RendererPatches {
         }
         let fixed = icd.appendingPathComponent(patchedICD)
         if FileManager.default.fileExists(atPath: fixed.path),
-           (try? String(contentsOf: engine.frameworks.appendingPathComponent(patchedDriver + ".unwine"), encoding: .utf8)) == marker([vulkanBudget]) {
+           let made = try? String(contentsOf: engine.frameworks.appendingPathComponent(patchedDriver + ".unwine"), encoding: .utf8),
+           vulkanBudgets.contains(where: { marker([$0]) == made }) {
             return fixed
         }
         let kosmic = icd.appendingPathComponent("kosmickrisp_mesa_icd.json")
@@ -284,7 +313,7 @@ enum RendererPatches {
             if name == "dxmt" && dxmtFixedUpstream(engine: engine) { continue }     // nothing to fix
             prepareCopy(of: engine.rendererRoot.appendingPathComponent(name, isDirectory: true),
                         to: engine.rendererRoot.appendingPathComponent("\(name)-unwine", isDirectory: true),
-                        recipes: recipes(for: name), log: log)
+                        recipeSets: recipeSets(for: name), log: log)
         }
         if windowsDir("i386-windows", engine: engine) != windowsCopy(engine: engine) { prepareWindowsCopy(engine: engine, log: log) }
         prepareDriver(engine: engine, log: log)
@@ -293,15 +322,20 @@ enum RendererPatches {
     private static let markerName = ".unwine-patch"
     private static func marker(_ recipes: [Recipe]) -> String { recipes.map(\.patchedSHA256).joined(separator: "\n") + "\n" }
 
-    private static func prepareCopy(of source: URL, to copy: URL, recipes: [Recipe], log: LogFile) {
+    private static func prepareCopy(of source: URL, to copy: URL, recipeSets: [[Recipe]], log: LogFile) {
         let fm = FileManager.default
         guard fm.fileExists(atPath: source.path) else { return }
-        // Only when every file is the exact build a recipe was made for.
-        for r in recipes {
-            guard (try? Downloader.sha256(of: source.appendingPathComponent(r.path))) == r.cleanSHA256 else {
-                log.line("\(source.lastPathComponent): not the \(layer(source)) build Unwine's fixes were made for, so its games use it unchanged")
-                return
-            }
+        // Only when every file is the exact build a set was made for. Each file is read once.
+        var shas: [String: String] = [:]
+        func sha(_ path: String) -> String? {
+            if let known = shas[path] { return known }
+            let value = try? Downloader.sha256(of: source.appendingPathComponent(path))
+            shas[path] = value
+            return value
+        }
+        guard let recipes = recipeSets.first(where: { $0.allSatisfy { sha($0.path) == $0.cleanSHA256 } }) else {
+            log.line("\(source.lastPathComponent): not a \(layer(source)) build Unwine's fixes were made for, so its games use it unchanged")
+            return
         }
         let stage = copy.deletingLastPathComponent().appendingPathComponent(".\(copy.lastPathComponent)-\(UUID().uuidString)", isDirectory: true)
         do {
@@ -323,12 +357,14 @@ enum RendererPatches {
 
     private static func prepareDriver(engine: InstalledEngine, log: LogFile) {
         let fm = FileManager.default
-        let source = engine.frameworks.appendingPathComponent(vulkanBudget.path)
+        let source = engine.frameworks.appendingPathComponent(vulkanDriverFile)
         let target = engine.frameworks.appendingPathComponent(patchedDriver)
         let markerFile = engine.frameworks.appendingPathComponent(patchedDriver + ".unwine")
         let icd = engine.runtime.appendingPathComponent("Resources/vulkan/icd.d", isDirectory: true)
-        guard (try? String(contentsOf: markerFile, encoding: .utf8)) != marker([vulkanBudget]) || !fm.fileExists(atPath: icd.appendingPathComponent(patchedICD).path) else { return }
-        guard fm.fileExists(atPath: source.path), (try? Downloader.sha256(of: source)) == vulkanBudget.cleanSHA256 else {
+        let made = try? String(contentsOf: markerFile, encoding: .utf8)
+        guard !vulkanBudgets.contains(where: { marker([$0]) == made }) || !fm.fileExists(atPath: icd.appendingPathComponent(patchedICD).path) else { return }
+        let sha = fm.fileExists(atPath: source.path) ? try? Downloader.sha256(of: source) : nil
+        guard let vulkanBudget = vulkanBudgets.first(where: { $0.cleanSHA256 == sha }) else {
             if fm.fileExists(atPath: source.path) { log.line("KosmicKrisp: not the build Unwine's memory fix was made for, so it runs unchanged") }
             return
         }
