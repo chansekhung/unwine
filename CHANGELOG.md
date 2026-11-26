@@ -22,6 +22,10 @@ How to keep this list. The build reads it, so follow these rules.
    commands to tag and publish.
 -->
 
+## 1.0.7 · 2026-11-26
+
+- **Newer graphics parts for everyone.** Unwine now has its fixes for Template 1.0.27, the part of the engine with DXVK (DirectX 9 to 11 on Vulkan) and the KosmicKrisp Vulkan driver. Before, Unwine stayed on Template 1.0.24, because 3 of its fixes did not fit the new files. Now Unwine switches to 1.0.27 by itself after your games close. The new DXVK fixes the shared-picture crash itself (Romance of the Three Kingdoms XIV), so Unwine leaves those files as they are.
+
 ## 1.0.6 · 2026-10-23
 
 - **Windows apps, not only games.** Add a Windows app the same way as a game: press Add, or drop its folder or .exe on the window. Unwine reads its files and puts it in Games or Apps by itself. If it guesses wrong, one click moves it. Games you added before stay in Games. If some of them look like apps, one message offers to move them.
