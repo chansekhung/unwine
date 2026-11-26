@@ -77,8 +77,11 @@ Mac Steam, and it runs through Unwine's free engine, like Proton on a Steam Deck
 
 - An Apple Silicon Mac with macOS 15 or newer, Rosetta, and Mac Steam for Steam games. Added games
   run without Steam.
-- Steam Play switched on in Mac Steam, as described by the
-  [NotProton project](https://github.com/NotProtonNot/NotProton). Unwine never changes Steam.app.
+- Steam Play in Mac Steam. Mac Steam has no switch for it, so Unwine turns it on when you press
+  Turn on Steam Play (in setup, or in Settings): it adds the open add-on from the
+  [NotProton project](https://github.com/NotProtonNot/NotProton) to Steam.app and signs Steam again for
+  this Mac. It keeps a copy of Valve's Steam.app first, and Undo in Settings puts it back. Valve's terms
+  do not allow changes to Steam. Valve has not acted against this add-on, but it can.
 
 ## Honest limits
 

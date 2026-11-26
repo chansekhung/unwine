@@ -98,7 +98,7 @@ struct SettingsView: View {
                     group("Steam") {
                         row("Steam Play", stateText)
                         row("Steam version", model.steamMissing ? "Not installed" : model.steamVersion ?? "Unknown")
-                        Text("Unwine's tool shows in Steam as \u{201C}\(Runner.toolDisplay)\u{201D}. Unwine never changes Steam.app.")
+                        Text("Unwine's tool shows in Steam as \u{201C}\(Runner.toolDisplay)\u{201D}. Unwine changes Steam.app only when you turn on Steam Play here, and keeps a copy of Valve's Steam.app for Undo.")
                             .font(.system(size: 11)).foregroundStyle(Palette.muted)
                         HStack(spacing: 8) {
                             // Set up without Steam: Restart Steam is off and says why, and this is the next step.
@@ -107,7 +107,15 @@ struct SettingsView: View {
                                     .buttonStyle(QuietButtonStyle())
                                     .help("Opens Valve's page, where you download Steam for Mac")
                             }
+                            if !model.steamMissing {
+                                switch model.steamPlayAddOn {
+                                case .missing: TurnOnSteamPlayButton(primary: false)
+                                case .behind: TurnOnSteamPlayButton(title: "Update Steam Play", primary: false)
+                                case .current: EmptyView()
+                                }
+                            }
                             RestartSteamButton(primary: false)
+                            if model.steamPlayAddOn != .missing && model.steamPlaySwitchWords == nil { UndoSteamPlayButton() }
                             Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }
                                 .buttonStyle(QuietButtonStyle())
                         }
@@ -180,7 +188,7 @@ struct SettingsView: View {
                     group("Logs") { LogsSection() }
 
                     group("Moving to a new Mac") {
-                        Text("1. Copy Unwine.dmg to the new Mac and drag Unwine to Applications.\n2. Open Unwine and run setup again (it downloads the engine once).\n3. Steam Play must be on in the new Mac's Steam.\n4. Your games come back with Steam: copy the Steam library folder, or let Steam download them.")
+                        Text("1. Copy Unwine.dmg to the new Mac and drag Unwine to Applications.\n2. Open Unwine and run setup again (it downloads the engine once).\n3. In setup, press Turn on Steam Play for the new Mac's Steam.\n4. Your games come back with Steam: copy the Steam library folder, or let Steam download them.")
                             .font(.system(size: 12)).foregroundStyle(Palette.text.opacity(0.9))
                         Button("Show Unwine's folder") { NSWorkspace.shared.activateFileViewerSelecting([Paths.support]) }.buttonStyle(QuietButtonStyle())
                     }

@@ -191,9 +191,20 @@ struct LibraryView: View {
         case .outdated:
             NoticeCard(icon: "exclamationmark.triangle.fill", color: Palette.warn,
                        title: "Steam updated, and Steam Play does not match it yet",
-                       text: "Your games stay installed. Steam Play's add-on needs a newer build from NotProton's project. Unwine already pulled in its newest matching files.") {
-                RestartSteamButton()
+                       text: model.steamPlayAddOn == .behind
+                        ? "Your games stay installed. Unwine has a newer Steam Play add-on than the one in Steam.app. Update Steam Play puts it in."
+                        : "Your games stay installed. Steam Play's add-on needs a newer build from NotProton's project. Unwine already pulled in its newest matching files.") {
+                if model.steamPlayAddOn == .behind { TurnOnSteamPlayButton(title: "Update Steam Play") }
+                RestartSteamButton(primary: model.steamPlayAddOn != .behind)
                 Button("NotProton releases") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton/releases")!) }
+                    .buttonStyle(QuietButtonStyle())
+            }
+        case .off where (model.steamPlayAddOn == .missing && !model.steamMissing) || model.steamPlaySwitchWords != nil:
+            NoticeCard(icon: "hand.point.right.fill", color: Palette.warn,
+                       title: "Steam Play is off in Steam",
+                       text: "Mac Steam has no Steam Play switch. Unwine can turn it on, so your Windows games start through Unwine from Mac Steam.") {
+                TurnOnSteamPlayButton()
+                Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }
                     .buttonStyle(QuietButtonStyle())
             }
         case .off where model.steamRunning || model.steamRestartWords != nil:     // stays through a restart

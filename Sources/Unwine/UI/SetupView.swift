@@ -109,12 +109,17 @@ struct SetupView: View {
             Button("Choose file…") { pickingGPTK = true }.buttonStyle(QuietButtonStyle())
             Button("Skip") { model.skipGPTK(); Task { await model.runSetup() } }.buttonStyle(QuietButtonStyle())
         case (.steam, .needsUser):
-            if !model.steamRunning && model.steamRestartWords == nil {
+            if model.steamPlayAddOn == .missing || model.steamPlaySwitchWords != nil {
+                TurnOnSteamPlayButton()     // Mac Steam has no switch of its own
+            } else if !model.steamRunning && model.steamRestartWords == nil {
                 Button("Open Steam") { MacSteam.start() }.buttonStyle(PrimaryButtonStyle())
             } else {
                 RestartSteamButton()     // stays through a restart, with its words, while Steam is closed
             }
             Button("Check again") { Task { await model.refreshSteam(); model.checkSteamConnection() } }.buttonStyle(QuietButtonStyle())
+            Button("Skip for now") { Task { await model.useWithoutSteam() } }.buttonStyle(QuietButtonStyle())
+                .disabled(model.steamPlaySwitchWords != nil)
+                .help("Opens the library for Windows games and apps you add yourself, and for Online mode. You can turn on Steam Play later in Settings.")
             Button("How Steam Play works") { NSWorkspace.shared.open(URL(string: "https://github.com/NotProtonNot/NotProton#readme")!) }
                 .buttonStyle(QuietButtonStyle())
         case (_, .failed):

@@ -172,14 +172,15 @@ private struct SteamSnapshot: Sendable {
     var games: [SteamGame]
     var runnerInUse: Bool
     var online: OnlineStatus
+    var addOn: SteamPlaySwitch.AddOn
 
-    static func read() -> SteamSnapshot {
+    static func read(kitAddOn: URL?) -> SteamSnapshot {
         let mappings = MacSteam.compatMappings()
         let mapped = Set(mappings.filter { $0.value == Runner.toolName }.keys)
         return SteamSnapshot(installed: MacSteam.isInstalled, running: MacSteam.isRunning, play: MacSteam.steamPlayState(),
                              version: MacSteam.clientVersion(), mappings: mappings,
                              games: SteamLibrary.scan(unwineMapped: mapped), runnerInUse: Runner.isInUse(),
-                             online: OnlineStatus.read())
+                             online: OnlineStatus.read(), addOn: SteamPlaySwitch.addOnState(kitAddOn: kitAddOn))
     }
 }
 
@@ -208,6 +209,9 @@ final class AppModel {
     var steamInstalled = MacSteam.isInstalled
     var steamRunning = false
     var steamPlay: MacSteam.SteamPlayState = .off
+    var steamPlayAddOn: SteamPlaySwitch.AddOn = .missing     // whether Steam.app loads the add-on, and which one
+    var steamPlaySwitchWords: [String]?          // phase words while Unwine turns Steam Play on or undoes it
+    var steamPlaySwitchBlocked = false           // macOS App Management stopped the last try
     var steamVersion: String?
     var games: [SteamGame] = []
     var mappings: [Int: String] = [:]
@@ -464,10 +468,12 @@ final class AppModel {
         guard !refreshing else { return }
         refreshing = true
         defer { refreshing = false }
-        let snap = await Task.detached(priority: .utility) { SteamSnapshot.read() }.value
+        let kitAddOn = steamPlayKitAddOn
+        let snap = await Task.detached(priority: .utility) { SteamSnapshot.read(kitAddOn: kitAddOn) }.value
         steamInstalled = snap.installed
         steamRunning = snap.running
         steamPlay = snap.play
+        steamPlayAddOn = snap.addOn
         steamVersion = snap.version
         mappings = snap.mappings
         games = LocalGames.inLibraryOrder(snap.games + stored.localGames.map(LocalGames.game(from:)))
@@ -647,7 +653,7 @@ final class AppModel {
         // Set up without Steam: the library opens for games added by their .exe. Steam Play needs
         // nothing more from Unwine later, because the Steam tool is built already.
         if stored.withoutSteam && steamPlay != .on {
-            steps[.steam] = .done(MacSteam.isInstalled ? "Skipped for now. Turn on Steam Play in Steam to play Steam games."
+            steps[.steam] = .done(MacSteam.isInstalled ? "Skipped for now. Turn on Steam Play in Settings to play Steam games."
                                                        : "Skipped for now. Install Steam to play Steam games.")
             if isReady && steps[.mac]?.isDone == true && steps[.runner]?.isDone == true {
                 stored.setupComplete = true
@@ -665,9 +671,9 @@ final class AppModel {
         case .outdated:
             steps[.steam] = .needsUser("Steam updated, and Steam Play does not match it yet.")
         case .off:
-            steps[.steam] = .needsUser(steamRunning
-                ? "Steam does not list Unwine yet. Restart Steam after Steam Play is on."
-                : "Open Steam. Unwine checks again by itself.")
+            steps[.steam] = .needsUser(steamPlayAddOn == .missing
+                ? "Mac Steam has no Steam Play switch. Unwine can turn it on for you."
+                : steamRunning ? "Steam does not list Unwine yet. Restart Steam." : "Open Steam. Unwine checks again by itself.")
         }
     }
 
@@ -682,11 +688,23 @@ final class AppModel {
         steamRestartWords = ["Closing Steam…"]
         defer { steamRestartWords = nil }
         guard await MacSteam.quit() else { banner = "Steam did not close. Close it yourself, then open it again."; return }
+        steamRestartWords = ["Opening Steam again…"]
+        let (open, ready) = await startSteamAndWait(words: \.steamRestartWords)
+        await refreshSteam()
+        if !stored.setupComplete { checkSteamConnection() }
+        if !ready {
+            banner = open ? "Steam is open, but Steam Play did not answer within a minute. If Steam does not list Unwine, restart Steam again."
+                          : "Steam did not open within a minute. It can be updating itself. Unwine keeps checking."
+        }
+    }
+
+    /// Opens Steam and waits up to a minute for it, and for its Steam Play add-on to report back.
+    /// `words` shows each phase. Returns whether Steam opened and whether it got ready in time.
+    private func startSteamAndWait(words: ReferenceWritableKeyPath<AppModel, [String]?>) async -> (open: Bool, ready: Bool) {
         // The add-on writes its lines for the new start after this point of its log.
         let mark = MacSteam.addOnLogEnd(), addOn = MacSteam.hasAddOn
-        steamRestartWords = ["Opening Steam again…"]
         MacSteam.start()
-        var open = false, ready = false
+        var open = false
         let start = Date()
         while Date().timeIntervalSince(start) < 60 {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -695,16 +713,89 @@ final class AppModel {
             }.value
             if look.running, !open {
                 open = true
-                if addOn { steamRestartWords = ["Waiting for Steam Play…"] }
+                if addOn { self[keyPath: words] = ["Waiting for Steam Play…"] }
             }
-            if look.running, !addOn || look.settled { ready = true; break }
+            if look.running, !addOn || look.settled { return (true, true) }
         }
+        return (open, false)
+    }
+
+    // MARK: Steam Play switch
+
+    /// The Steam Play add-on in Unwine's newest Steam Play kit, the one Steam.app should load.
+    var steamPlayKitAddOn: URL? {
+        let fm = FileManager.default
+        if let v = stored.kitVersion {
+            let file = SteamPlayPaths.kit.appendingPathComponent("kit-\(v)/notproton.dylib")
+            if fm.fileExists(atPath: file.path) { return file }
+        }
+        let kits = (try? fm.contentsOfDirectory(at: SteamPlayPaths.kit, includingPropertiesForKeys: nil)) ?? []
+        return kits.filter { $0.lastPathComponent.hasPrefix("kit-") }
+            .sorted { LooseVersion(String($0.lastPathComponent.dropFirst(4))) > LooseVersion(String($1.lastPathComponent.dropFirst(4))) }
+            .map { $0.appendingPathComponent("notproton.dylib") }
+            .first { fm.fileExists(atPath: $0.path) }
+    }
+
+    /// Why Steam Play cannot be turned on or undone now, or nil when it can.
+    var steamPlaySwitchBlocker: String? {
+        if steamMissing { return "Install Steam first." }
+        if steamPlaySwitchWords != nil || steamRestartWords != nil { return "Unwine is working on Steam now." }
+        if let name = startingSteamGame { return "\(name) is starting in Steam. Close the game first." }
+        if gameRunning || busyGame != nil { return "Close your game first. Steam closes for this." }
+        if macSteamBlocked { return Self.macSteamBlockedReason }
+        return nil
+    }
+
+    /// Turns Steam Play on in Mac Steam, or updates its add-on: Steam closes, Unwine changes Steam.app
+    /// (see SteamPlaySwitch), and Steam opens again. Unwine waits until Steam Play reports back.
+    func turnOnSteamPlay() async {
+        if let why = steamPlaySwitchBlocker { banner = why; return }
+        guard let addOn = steamPlayKitAddOn else { banner = SteamPlaySwitch.SwitchError.noAddOn.localizedDescription; return }
+        steamPlaySwitchBlocked = false
+        steamPlaySwitchWords = ["Closing Steam…"]
+        defer { steamPlaySwitchWords = nil }
+        guard await MacSteam.quit() else { banner = "Steam did not close. Close it yourself, then try again."; return }
+        steamPlaySwitchWords = ["Keeping a copy of Steam…", "Adding the Steam Play add-on…", "Signing Steam for this Mac…"]
+        do {
+            try await SteamPlaySwitch.enable(addOn: addOn, log: log)
+        } catch {
+            steamPlaySwitchBlocked = (error as? SteamPlaySwitch.SwitchError) == .blocked
+            log.line("Steam Play switch: \(error.localizedDescription)")
+            banner = error.localizedDescription
+            MacSteam.start()        // Steam as it was
+            await refreshSteam()
+            return
+        }
+        steamPlaySwitchWords = ["Opening Steam…"]
+        let (open, ready) = await startSteamAndWait(words: \.steamPlaySwitchWords)
         await refreshSteam()
         if !stored.setupComplete { checkSteamConnection() }
         if !ready {
-            banner = open ? "Steam is open, but Steam Play did not answer within a minute. If Steam does not list Unwine, restart Steam again."
+            banner = open ? "Steam is open, but Steam Play did not answer within a minute. Restart Steam once more."
                           : "Steam did not open within a minute. It can be updating itself. Unwine keeps checking."
+        } else if steamPlay == .on {
+            banner = "Steam Play is on. Steam lists Unwine as a compatibility tool."
         }
+    }
+
+    /// Undo: Valve's Steam.app comes back from Unwine's copy. Steam Play is off after that.
+    func undoSteamPlay() async {
+        if let why = steamPlaySwitchBlocker { banner = why; return }
+        steamPlaySwitchBlocked = false
+        steamPlaySwitchWords = ["Closing Steam…"]
+        defer { steamPlaySwitchWords = nil }
+        guard await MacSteam.quit() else { banner = "Steam did not close. Close it yourself, then try again."; return }
+        steamPlaySwitchWords = ["Putting back Valve's Steam…"]
+        do {
+            try await SteamPlaySwitch.disable(log: log)
+            banner = "Steam is back as Valve made it. Steam Play is off."
+        } catch {
+            steamPlaySwitchBlocked = (error as? SteamPlaySwitch.SwitchError) == .blocked
+            log.line("Steam Play undo: \(error.localizedDescription)")
+            banner = error.localizedDescription
+        }
+        MacSteam.start()
+        await refreshSteam()
     }
 
     // MARK: GPTK 4
