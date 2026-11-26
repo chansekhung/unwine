@@ -22,6 +22,12 @@ How to keep this list. The build reads it, so follow these rules.
    commands to tag and publish.
 -->
 
+## 1.0.8 · 2026-11-26
+
+- **Turn on Steam Play.** Mac Steam has no Steam Play switch, so setup could not go on. Now setup has a Turn on Steam Play button. Unwine says what changes first: it adds NotProton's open add-on to Steam.app, tells Steam to load it, and signs Steam again for this Mac. Before that, it keeps a copy of Valve's Steam.app. Undo Steam Play in Settings puts the copy back. If macOS stops the change, Unwine says how to allow it in App Management.
+- **Update Steam Play.** When Unwine has a newer add-on than the one in Steam.app, Settings and the library show Update Steam Play.
+- **Skip for now** on setup's Steam step. The library opens for Windows games and apps you add yourself, and for Online mode. You can turn on Steam Play later in Settings.
+
 ## 1.0.7 · 2026-11-26
 
 - **Newer graphics parts for everyone.** Unwine now has its fixes for Template 1.0.27, the part of the engine with DXVK (DirectX 9 to 11 on Vulkan) and the KosmicKrisp Vulkan driver. Before, Unwine stayed on Template 1.0.24, because 3 of its fixes did not fit the new files. Now Unwine switches to 1.0.27 by itself after your games close. The new DXVK fixes the shared-picture crash itself (Romance of the Three Kingdoms XIV), so Unwine leaves those files as they are.
